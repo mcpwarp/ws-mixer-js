@@ -1,0 +1,42 @@
+name: conformance
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  fixture-matrix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - run: npm ci
+      - run: npm run build
+      # spec.pin does not resolve until ws-mixer-spec is pushed to GitHub --
+      # until then this step (and the run below) fail; see
+      # docs/MIGRATION.md section 6 step 15.
+      - run: npm run fetch-spec
+      # .spec is its own Go module and this repo has no go.mod at all, so
+      # `go run "$PWD/.spec/..."` fails outright -- cd into .spec and run it
+      # there, on its own module, passing absolute paths back into this repo.
+      - name: run conformance runner (js, fixture mode)
+        run: |
+          repo="$PWD"
+          (cd .spec && go run ./conformance/runner \
+            --spec-root "$repo/.spec" \
+            --adapter "js=$repo/conformance/adapter/run" \
+            --sdk js --mode fixture \
+            --counts "$repo/conformance/COUNTS.json" \
+            --report "$repo/build/conformance.xml")
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: conformance-report
+          path: build/conformance.xml

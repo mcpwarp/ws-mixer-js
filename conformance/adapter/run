@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Uniform adapter entry point for the conformance runner's generic adapter
+# contract (docs/CONFORMANCE.md section 6, buildGenericAdapter): every
+# adapter is a directory containing an executable `run`. CI builds dist/
+# itself before invoking the runner; this shim also builds it on demand so a
+# developer can point the runner straight at this directory without a
+# separate `npm run build` step first.
+set -euo pipefail
+dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+root="$(cd "$dir/../.." && pwd)"
+if [ ! -f "$root/dist/index.js" ]; then
+  (cd "$root" && npm run build >&2)
+fi
+exec node "$dir/adapter.mjs"

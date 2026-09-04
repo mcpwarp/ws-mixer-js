@@ -1,0 +1,59 @@
+{
+  "name": "@mcpwarp/ws-mixer",
+  "version": "0.3.0",
+  "sideEffects": false,
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
+  "description": "ws-mixer.v1 client SDK: N byte streams over one WebSocket, JS/TypeScript client.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mcpwarp/ws-mixer-js.git"
+  },
+  "homepage": "https://github.com/mcpwarp/ws-mixer-js#readme",
+  "bugs": {
+    "url": "https://github.com/mcpwarp/ws-mixer-js/issues"
+  },
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "prepublishOnly": "node scripts/check-registry.mjs && npm run build",
+    "build": "tsup && npm run build:types",
+    "build:types": "tsc src/index.ts --target ES2022 --module NodeNext --moduleResolution NodeNext --strict --declaration --emitDeclarationOnly --stripInternal --esModuleInterop --skipLibCheck --outDir dist --rootDir src",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "fetch-spec": "node scripts/fetch-spec.mjs",
+    "fetch-goserver": "node scripts/fetch-goserver.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/ws": "^8.5.13",
+    "ajv": "^8.20.0",
+    "tsup": "^8.3.5",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}

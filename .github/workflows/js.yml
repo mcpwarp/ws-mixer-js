@@ -1,0 +1,50 @@
+name: js
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - run: npm ci
+      # spec.pin/goserver.pin do not resolve until ws-mixer-spec / ws-mixer-go
+      # are pushed to GitHub -- until then these two steps fail and the job
+      # is expected to be red; see docs/MIGRATION.md section 6 step 15.
+      - run: npm run fetch-spec
+      - run: npm run fetch-goserver
+      - run: npm test
+        env:
+          GOTOOLCHAIN: auto

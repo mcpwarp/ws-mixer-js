@@ -1,0 +1,7 @@
+{
+  "comment": "Checked-in floor on passing (SDK, fixture) cells for this repo's own conformance job, split from the monorepo's single conformance/COUNTS.json per docs/MIGRATION.md section 2.5 -- this repo only runs the js-server/js-client columns (it has no server role and no pair-mode adapter). See ws-mixer-spec's conformance/runner main.go checkCounts for how a floor here is enforced against a `--sdk js` run.",
+  "floors": {
+    "js-server": 0,
+    "js-client": 24
+  }
+}
