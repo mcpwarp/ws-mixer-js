@@ -78,6 +78,24 @@ const DELIVERY_QUEUE_MIN = 128;
 /** Added on top of maxStreams when that alone would exceed DELIVERY_QUEUE_MIN, mirroring deliveryQueueMargin. */
 const DELIVERY_QUEUE_MARGIN = 64;
 
+/**
+ * Clamps a would-be WS close code to one actually legal to send on the wire
+ * -- 1000, or 4000-4999, pass through unchanged; anything else (an
+ * application-layer error code >= 0x1000_0000 is a legal RESET code,
+ * errors.ts, but was never a legal *connection*-close code) is clamped to
+ * INTERNAL_ERROR's mapped code (4002) instead, mirroring go/wsmixer's
+ * wsCloseCode (conn.go). `ws`'s Sender.close() throws a RangeError for an
+ * out-of-range code rather than sending nothing, which this file's own
+ * catch would otherwise turn into `ws.terminate()` -- a bare 1006 abnormal
+ * closure that tells the peer nothing at all. `error{}` (sent separately,
+ * unclamped) still carries the real code either way, and the *reported*
+ * `wsCode` (the 'close' event below, DisconnectReason) stays the real
+ * 4000+code too -- only the bytes actually put on the wire are clamped.
+ */
+function wireCloseCode(wsCode: number): number {
+  return wsCode === 1000 || (wsCode >= 4000 && wsCode <= 4999) ? wsCode : 4000 + ErrorCode.INTERNAL_ERROR;
+}
+
 interface OutboxItem {
   chunk: Uint8Array;
   resolve: () => void;
@@ -131,7 +149,10 @@ export declare interface MixerConn {
   on(event: "pong", listener: (info: { id: number; rttMs: number }) => void): this;
   on(event: "error", listener: (err: WsMixerError) => void): this;
   on(event: "fatal", listener: (err: WsMixerError) => void): this;
-  on(event: "close", listener: (info: { wsCode: number; errorCode?: number; message: string }) => void): this;
+  on(
+    event: "close",
+    listener: (info: { wsCode: number; errorCode?: number; message: string; closeReason?: string }) => void,
+  ): this;
   /** Fires when a `'stream'`/`'app'`/`'drain'` listener throws or rejects; delivery continues with the next queued event regardless (see stats().handlerErrors). */
   on(event: "handlerError", listener: (info: { event: string; error: Error }) => void): this;
 }
@@ -516,14 +537,17 @@ export class MixerConn extends EventEmitter {
         return;
       }
       case "error":
-        // Item 1: same pre-welcome gate as drain/ping/app above.
-        if (!this.handshakeDone) {
-          throw new ConnError(ErrorCode.PROTOCOL_ERROR, "error received before welcome completed the handshake");
-        }
-        // Record the error and close immediately -- mirrors Go's
-        // handlePeerError (dispatch.go): a peer that sends error MUST NOT
-        // get another error back, and there is nothing to wait for (OVERVIEW.md
-        // section 2.7: "it logs, surfaces and closes").
+        // The normative pre-welcome rejection shape (OVERVIEW.md section
+        // 3.4's Authenticate hook, WIRE.md section 2.7/2.10 step 12): the
+        // server MAY reject `hello` with `error{code,message}` + close
+        // *before* ever sending `welcome` -- confirmed by
+        // spec/fixtures/sequences/auth_failure.json (error{UNAUTHORIZED} +
+        // close 4011, no welcome). Unlike drain/ping/app/hello above, this is
+        // never a protocol violation on the peer's part even pre-welcome, so
+        // it always routes to handlePeerError -- which never replies with
+        // another error{} (WIRE.md section 2.7) and closes with 4000+code --
+        // surfacing the peer's own code/message to the handshake rejection
+        // instead of masking it as a local PROTOCOL_ERROR.
         this.handlePeerError(msg.code, msg.message, msg.stream_id);
         return;
       case "app":
@@ -873,11 +897,20 @@ export class MixerConn extends EventEmitter {
 
   /**
    * Shared teardown: WS close `4000 + code`, reject everything outstanding,
-   * emit `'fatal'`/`'error'` (guarded) then `'close'`. `sendErrorFrame`
-   * controls whether an `error{code,message}` control frame is sent first --
-   * true for a locally-detected failure (fail()), false when the peer
-   * already sent its own `error` and OVERVIEW.md section 2.7 forbids
-   * replying with another one (handlePeerError()).
+   * emit `'fatal'`/`'error'` (guarded) then `'close'`, synchronously and in
+   * that order every time. `sendErrorFrame` controls whether an
+   * `error{code,message}` control frame is sent first -- true for a
+   * locally-detected failure (fail()), false when the peer already sent its
+   * own `error` and OVERVIEW.md section 2.7 forbids replying with another
+   * one (handlePeerError()). Either way `this.closed` is set *before*
+   * `ws.close()` is called, so the peer's echo of this close (or any close
+   * frame it happens to send around the same time) is ignored by
+   * onSocketClose below rather than reported as `closeReason` -- per
+   * CLIENT-SDK.md's `closeReason` row, an outgoing reason this side sent is
+   * never legitimate `closeReason` data, and there is nothing to gain by
+   * waiting for the peer's own close frame here: OVERVIEW.md section 2.7
+   * already allows closing on `error` "without reading the close frame that
+   * followed".
    */
   private teardownConn(err: WsMixerError, sendErrorFrame: boolean, streamErrorFactory?: (streamId: number) => WsMixerError): void {
     if (this.closed) return;
@@ -898,7 +931,7 @@ export class MixerConn extends EventEmitter {
     const wsCode = closeCode(err.code);
     const reason = truncateUtf8(err.message, 123);
     try {
-      this.ws.close(wsCode, reason);
+      this.ws.close(wireCloseCode(wsCode), reason);
     } catch {
       this.ws.terminate?.();
     }
@@ -910,6 +943,12 @@ export class MixerConn extends EventEmitter {
     // still learns why via onDisconnect(reason) instead of an uncaught throw.
     const evt = fatal ? "fatal" : "error";
     if (this.listenerCount(evt) > 0) this.emit(evt, err);
+    // closeReason is deliberately absent here in both branches: this side
+    // initiated the close (either directly, or -- sendErrorFrame:false, from
+    // handlePeerError -- reacting to error{} without reading whatever close
+    // frame the peer sends behind it, per OVERVIEW.md section 2.7). Only
+    // onSocketClose, for a close frame this side actually *received*, ever
+    // has a real closeReason to report.
     this.emit("close", { wsCode, errorCode: err.code, message: err.message });
   }
 
@@ -974,14 +1013,28 @@ export class MixerConn extends EventEmitter {
     this.fail(new WsMixerError(ErrorCode.NO_ERROR, "client closing"));
   }
 
+  /**
+   * A close frame this side actually *received* from `ws`'s 'close' event.
+   * `code`/`reason` here are always the peer's, per `ws`'s own contract
+   * (`receiverOnConclude` in `ws/lib/websocket.js` only ever updates
+   * `_closeCode`/`_closeMessage` from a frame it parsed off the wire, never
+   * from what this side sent via `.close()`) -- so whenever `this.closed` is
+   * already `true`, this is a close frame arriving after teardownConn()
+   * already ran and reported (never our own echoed close winning a race),
+   * and is correctly ignored rather than folded in after the fact.
+   */
   private onSocketClose(code: number, reason: Buffer): void {
     if (this.closed) return;
     this.closed = true;
     this.stopTimers();
-    const err = new WsMixerError(ErrorCode.INTERNAL_ERROR, reason.toString() || `socket closed with code ${code}`);
+    const reasonStr = reason.toString();
+    const err = new WsMixerError(ErrorCode.INTERNAL_ERROR, reasonStr || `socket closed with code ${code}`, {
+      wsCode: code,
+      closeReason: reasonStr || undefined,
+    });
     this.rejectOutstanding(err);
     if (!this.handshakeDone) this.emit("__handshake_failed_internal", err);
-    this.emit("close", { wsCode: code, message: reason.toString() });
+    this.emit("close", { wsCode: code, message: reasonStr, closeReason: reasonStr || undefined });
   }
 
   private onSocketError(err: Error): void {

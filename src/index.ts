@@ -7,6 +7,7 @@ export type {
   DisconnectReason,
   DisconnectPhase,
   DisconnectPayload,
+  CloseOptions,
 } from "./client.js";
 
 export { MixerConn } from "./conn.js";

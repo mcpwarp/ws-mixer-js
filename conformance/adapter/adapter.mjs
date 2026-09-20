@@ -293,7 +293,7 @@ const CODE_NAMES = {
   0: "NO_ERROR", 1: "PROTOCOL_ERROR", 2: "INTERNAL_ERROR", 3: "FLOW_CONTROL_ERROR",
   4: "FRAME_SIZE_ERROR", 5: "STREAM_CLOSED", 6: "REFUSED_STREAM", 7: "CANCEL",
   8: "STREAM_LIMIT", 9: "ENHANCE_YOUR_CALM", 10: "UNSUPPORTED", 11: "UNAUTHORIZED",
-  12: "GOING_AWAY", 13: "KEEPALIVE_TIMEOUT",
+  12: "GOING_AWAY", 13: "KEEPALIVE_TIMEOUT", 14: "APPLICATION_CLOSE",
 };
 function codeNameOf(code) {
   return CODE_NAMES[code] ?? "INTERNAL_ERROR";
@@ -352,12 +352,24 @@ async function handleCommand(cmd) {
         // triggers MixerClient's own infinite background retry loop against
         // a raw actor that only ever accepts one connection -- silently
         // hanging the test instead of failing fast. A scenario that actually
-        // wants reconnect (drain_reconnect) opts in explicitly via
-        // connect.reconnect.enabled.
+        // wants reconnect (drain_reconnect, application_close) opts in
+        // explicitly via connect.reconnect.enabled.
         const reconnectCmd = cmd.reconnect;
         const reconnect =
           reconnectCmd && reconnectCmd.enabled
-            ? { maxAttempts: reconnectCmd.maxAttempts ?? Infinity }
+            ? {
+                maxAttempts: reconnectCmd.maxAttempts ?? Infinity,
+                // baseMs/capMs (docs/CONFORMANCE.md's connect command):
+                // override the SDK's default base/cap backoff, e.g. so
+                // application_close's connected-phase 4014 (which now starts
+                // its reconnect at the cap, WIRE.md section 2.9) doesn't wait
+                // up to the SDK's 60s default cap and blow the runner's
+                // fixed per-step await timeout. Absent or non-positive ->
+                // the SDK's own defaults (undefined is dropped by
+                // ReconnectOptions, never forwarded as 0/negative).
+                ...(reconnectCmd.baseMs > 0 ? { base: reconnectCmd.baseMs } : {}),
+                ...(reconnectCmd.capMs > 0 ? { cap: reconnectCmd.capMs } : {}),
+              }
             : { maxAttempts: 0 };
         let connectedOnce = false;
         const client = await connect(cmd.url, {
@@ -388,8 +400,14 @@ async function handleCommand(cmd) {
             // tear them all down rather than leaking their queue entries
             // forever (mirrors the Go adapter's teardownAllStreams).
             teardownAllStreams();
-            const e = { event: "disconnected", message: info.message, fatal: info.fatal };
+            // phase is always present (docs/CONFORMANCE.md section 5's
+            // `disconnected` field table); close_reason only when a reason
+            // was actually received from the peer -- never re-truncated or
+            // normalised, and never this side's own echoed reason (see
+            // CLIENT-SDK.md's closeReason row).
+            const e = { event: "disconnected", phase: info.phase, message: info.message, fatal: info.fatal };
             if (info.wsCode !== undefined) e.ws_code = info.wsCode;
+            if (info.closeReason) e.close_reason = info.closeReason;
             if (info.protocolError) {
               e.error_code = info.code;
               e.error_name = info.name;
@@ -487,8 +505,32 @@ async function handleCommand(cmd) {
 
     case "close": {
       if (!state.client) return cmdErr(seq, "close before connection established");
+      // A NON-ZERO numeric `code` (docs/CONFORMANCE.md's `close` command:
+      // `code`, `message`, both roles) is an application-initiated close
+      // (CLIENT-SDK.md's "Application close" row) -- MixerClient.close()'s
+      // opts.code performs the error{}+WS-close+socket sequence directly,
+      // immediately, with no drain. An absent code, or `code: 0`
+      // (NO_ERROR -- e.g. graceful_close.json), is the ordinary graceful
+      // path: plain `client.close()`, drain{client_requested} -> grace ->
+      // error{NO_ERROR} -> close 1000 (WIRE.md section 2.10 step 14). `0` is
+      // deliberately NOT routed through opts.code: MixerClient.close({code:
+      // 0}) would skip the drain entirely, and this pair scenario is the
+      // only place that sequence gets exercised at all.
+      const opts = cmd.code !== undefined && cmd.code !== 0 ? { code: cmd.code, message: cmd.message } : undefined;
+      try {
+        // close() validates opts.code SYNCHRONOUSLY (a RangeError for an
+        // out-of-range code throws before any Promise even exists), so this
+        // must be inside the try -- a bare `.catch()` on its return value
+        // only ever sees an async rejection, and handleCommand is `void`'d
+        // by its caller (main()'s `rl.on("line", ...)`), so an uncaught
+        // synchronous throw here would surface only as an unhandled
+        // rejection and kill the whole adapter process instead of a normal
+        // command-error reply.
+        state.client.close(opts).catch(() => {});
+      } catch (e) {
+        return cmdErr(seq, "close: " + (e && e.message ? e.message : String(e)));
+      }
       ack(seq);
-      state.client.close().catch(() => {});
       return;
     }
 

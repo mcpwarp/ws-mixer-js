@@ -234,3 +234,60 @@ test("teardownStream/teardownAllStreams clear every bookkeeping map for their id
   assert.equal(state.streams.size, 0);
   assert.equal(state.streamQueues.size, 0);
 });
+
+test("close: an out-of-range code (MixerClient.close()'s synchronous RangeError) replies with a command error, not an unhandled rejection", async () => {
+  resetState();
+  let closeCalledWith = "not called";
+  // Mirrors MixerClient.close()'s real behavior: opts.code is validated
+  // SYNCHRONOUSLY, throwing before any Promise even exists -- the case this
+  // test exists for is that throw escaping handleCommand's "close" case
+  // uncaught, which (handleCommand is void'd by its caller) would surface
+  // only as an unhandled rejection and kill the whole adapter process.
+  state.client = {
+    close(opts) {
+      if (opts && opts.code !== undefined && (!Number.isInteger(opts.code) || opts.code < 0 || opts.code > 999)) {
+        throw new RangeError(`ws-mixer: close() code must be an integer in [0, 999]; got ${opts.code}`);
+      }
+      closeCalledWith = opts;
+      return Promise.resolve();
+    },
+  };
+
+  const events = await withCapturedStdout(async () => {
+    await handleCommand({ cmd: "close", seq: 1, code: 99999 });
+  });
+
+  assert.equal(events.length, 1);
+  assert.equal(events[0].event, "error");
+  assert.equal(events[0].seq, 1);
+  assert.match(events[0].message, /^close: /);
+  assert.equal(closeCalledWith, "not called"); // never reached a real close attempt
+
+  state.client = null;
+});
+
+test("close: code 0 (NO_ERROR) takes the graceful path -- plain client.close(), not an application-initiated close({code:0})", async () => {
+  resetState();
+  let closeCalledWith = "not called";
+  state.client = {
+    close(opts) {
+      closeCalledWith = opts;
+      return Promise.resolve();
+    },
+  };
+
+  const events = await withCapturedStdout(async () => {
+    await handleCommand({ cmd: "close", seq: 1, code: 0, message: "conformance graceful_close" });
+  });
+
+  assert.equal(events.length, 1);
+  assert.equal(events[0].event, "ack");
+  assert.equal(events[0].seq, 1);
+  // Graceful path: client.close() called with no opts at all (drain then
+  // close), not client.close({code:0, ...}) (which would skip the drain --
+  // spec/conformance/scenarios/graceful_close.json is the only pair
+  // scenario exercising WIRE.md section 2.10 step 14's drain sequence).
+  assert.equal(closeCalledWith, undefined);
+
+  state.client = null;
+});

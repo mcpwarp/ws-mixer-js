@@ -21,9 +21,10 @@ export const ErrorCode = {
   UNAUTHORIZED: 0x0b,
   GOING_AWAY: 0x0c,
   KEEPALIVE_TIMEOUT: 0x0d,
-  // 0x0e is reserved (left free for an application-level close reason) and
-  // intentionally has no constant here: codeName renders it INTERNAL_ERROR
-  // like any other unassigned code.
+  // Connection-level only, never emitted by ws-mixer itself: exists for the
+  // application above to close a connection for its own reason, carried in
+  // error.message / the WS close reason (WS close 4014).
+  APPLICATION_CLOSE: 0x0e,
 } as const;
 
 export type ErrorCodeValue = (typeof ErrorCode)[keyof typeof ErrorCode];
@@ -43,6 +44,7 @@ const codeNames: Record<number, string> = {
   [ErrorCode.UNAUTHORIZED]: "UNAUTHORIZED",
   [ErrorCode.GOING_AWAY]: "GOING_AWAY",
   [ErrorCode.KEEPALIVE_TIMEOUT]: "KEEPALIVE_TIMEOUT",
+  [ErrorCode.APPLICATION_CLOSE]: "APPLICATION_CLOSE",
 };
 
 const namesToCode: Record<string, number> = Object.fromEntries(
@@ -74,12 +76,26 @@ export class WsMixerError extends Error {
   override name: string = "WsMixerError";
   readonly fatal: boolean;
   readonly streamId?: number;
+  /**
+   * The peer's observed WS close-frame code, set only when this error was
+   * built from an actually-observed close frame (e.g. MixerConn.onSocketClose)
+   * rather than a locally-raised protocol violation.
+   */
+  readonly wsCode?: number;
+  /** The peer's observed WS close-frame reason, verbatim, under the same condition as `wsCode`. */
+  readonly closeReason?: string;
 
-  constructor(code: number, message: string, opts?: { fatal?: boolean; streamId?: number }) {
+  constructor(
+    code: number,
+    message: string,
+    opts?: { fatal?: boolean; streamId?: number; wsCode?: number; closeReason?: string },
+  ) {
     super(message);
     this.code = code;
     this.fatal = opts?.fatal ?? false;
     this.streamId = opts?.streamId;
+    this.wsCode = opts?.wsCode;
+    this.closeReason = opts?.closeReason;
   }
 
   get codeName(): string {

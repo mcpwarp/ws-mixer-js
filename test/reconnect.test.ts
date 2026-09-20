@@ -1672,3 +1672,701 @@ describe("MixerClient item 2: unexpected-response cleans up req/res instead of l
     await client.close();
   });
 });
+
+// --- closeReason: the peer's WS close-frame reason, received from the peer -
+// only, never this side's own outgoing reason (CLIENT-SDK.md's closeReason
+// row) --------------------------------------------------------------------
+
+describe("MixerClient closeReason", () => {
+  it("connected phase: peer closes 4009 with a reason and no error{} carries that reason as closeReason", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    const disconnects: DisconnectPayload[] = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: "t",
+      _wsFactory: makeFactory(sockets),
+      onDisconnect: (r) => disconnects.push(r),
+    });
+
+    const started = client.start();
+    started.catch(() => {});
+    await connectSocket(sockets, 0);
+    await started;
+
+    sockets[0]!.serverClose(4000 + ErrorCode.ENHANCE_YOUR_CALM, "excessive load; back off");
+    await tick();
+
+    expect(disconnects).toHaveLength(1);
+    expect(disconnects[0]).toMatchObject({
+      wsCode: 4000 + ErrorCode.ENHANCE_YOUR_CALM,
+      closeReason: "excessive load; back off",
+    });
+
+    await client.close();
+  });
+
+  it("connected phase: peer sends error{code:9} then closes -- errorCode/name/message as today, closeReason absent (this side closes on error{} without reading the close frame that follows)", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    const disconnects: DisconnectPayload[] = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: "t",
+      _wsFactory: makeFactory(sockets),
+      onDisconnect: (r) => disconnects.push(r),
+    });
+
+    const started = client.start();
+    started.catch(() => {});
+    const s0 = await connectSocket(sockets, 0);
+    await started;
+
+    s0.push(
+      encodeData(
+        0,
+        encodeControl({ t: "error", code: ErrorCode.ENHANCE_YOUR_CALM, message: "too many stream-0 messages" } as ControlMessage),
+      ),
+    );
+    await tick();
+
+    expect(disconnects).toHaveLength(1);
+    expect(disconnects[0]).toMatchObject({
+      wsCode: 4000 + ErrorCode.ENHANCE_YOUR_CALM,
+      errorCode: ErrorCode.ENHANCE_YOUR_CALM,
+      errorName: "ENHANCE_YOUR_CALM",
+      message: "too many stream-0 messages",
+    });
+    // Never this side's own outgoing error{} message/close reason echoed
+    // back as if it were something the peer told us.
+    expect(disconnects[0]!.closeReason).toBeUndefined();
+
+    await client.close();
+  });
+
+  it("the error{}+close disconnect above is reported synchronously -- no timer needs to elapse to observe it", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    const disconnects: DisconnectPayload[] = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: "t",
+      _wsFactory: makeFactory(sockets),
+      onDisconnect: (r) => disconnects.push(r),
+    });
+
+    const started = client.start();
+    started.catch(() => {});
+    const s0 = await connectSocket(sockets, 0);
+    await started;
+
+    s0.push(
+      encodeData(
+        0,
+        encodeControl({ t: "error", code: ErrorCode.GOING_AWAY, message: "shutting down" } as ControlMessage),
+      ),
+    );
+    // No `await tick()`, no `vi.advanceTimersByTimeAsync(...)` -- teardownConn
+    // emits 'close' in the same synchronous call as dispatching the error{}
+    // control frame, so this must already be populated.
+    expect(disconnects).toHaveLength(1);
+    expect(disconnects[0]).toMatchObject({ wsCode: 4000 + ErrorCode.GOING_AWAY, errorCode: ErrorCode.GOING_AWAY });
+
+    await client.close();
+  });
+
+  it("abnormal closure (1006, no close frame) leaves closeReason absent", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    const disconnects: DisconnectPayload[] = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: "t",
+      _wsFactory: makeFactory(sockets),
+      onDisconnect: (r) => disconnects.push(r),
+    });
+
+    const started = client.start();
+    started.catch(() => {});
+    await connectSocket(sockets, 0);
+    await started;
+
+    sockets[0]!.serverClose(1006, "");
+    await tick();
+
+    expect(disconnects).toHaveLength(1);
+    expect(disconnects[0]!.wsCode).toBe(1006);
+    expect(disconnects[0]!.closeReason).toBeUndefined();
+
+    await client.close();
+  });
+
+  it("a self-initiated client.close() never reports the fake socket's own echoed reason as closeReason", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    const disconnects: DisconnectPayload[] = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: "t",
+      _wsFactory: makeFactory(sockets),
+      onDisconnect: (r) => disconnects.push(r),
+    });
+
+    const started = client.start();
+    started.catch(() => {});
+    await connectSocket(sockets, 0);
+    await started;
+
+    await client.close();
+    await tick();
+
+    expect(disconnects).toHaveLength(1);
+    // FakeSocket.close() always echoes back whatever this side passed to
+    // ws.close() (its own "client closing" reason) -- teardownConn's own
+    // 'close' emission already happened, synchronously, before that echo, so
+    // it must never surface as closeReason.
+    expect(disconnects[0]!.closeReason).toBeUndefined();
+  });
+
+  it("handshake phase: a bare close (no error{}) after the upgrade but before welcome is phase 'handshake', not a timeout", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    const disconnects: DisconnectPayload[] = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: "t",
+      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      reconnect: { base: 10, cap: 100 },
+      onDisconnect: (r) => disconnects.push(r),
+    });
+
+    const started = client.start();
+    started.catch(() => {});
+    await tick();
+    sockets[0]!.open();
+    await tick();
+
+    // The peer closes right after the 101 upgrade, well within the hello
+    // timeout, with no ws-mixer error{} ever sent.
+    sockets[0]!.serverClose(4000 + ErrorCode.ENHANCE_YOUR_CALM, "rejecting: over the session cap");
+    await tick();
+
+    expect(disconnects).toHaveLength(1);
+    expect(disconnects[0]).toMatchObject({
+      phase: "handshake",
+      wsCode: 4000 + ErrorCode.ENHANCE_YOUR_CALM,
+      closeReason: "rejecting: over the session cap",
+      fatal: false,
+    });
+    expect(disconnects[0]!.message).not.toMatch(/no welcome within/);
+
+    await client.close();
+  });
+});
+
+// --- handshake-phase fatal classification: a bare close carrying a --------
+// ws-mixer wire code must classify (and go fatal for 4010/4011) the same way
+// a connected-phase one already does, instead of trusting onSocketClose's
+// generic INTERNAL_ERROR placeholder ----------------------------------------
+
+describe("MixerClient handshake-phase close classification", () => {
+  it("bare close 4010 (UNSUPPORTED) before welcome is fatal: no reconnect scheduled, start() rejects", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    const disconnects: DisconnectPayload[] = [];
+    const fatalEvents: unknown[] = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: "t",
+      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      onDisconnect: (r) => disconnects.push(r),
+    });
+    client.on("fatal", (e) => fatalEvents.push(e));
+
+    const started = client.start();
+    started.catch(() => {});
+    await tick();
+    sockets[0]!.open();
+    await tick();
+    sockets[0]!.serverClose(4000 + ErrorCode.UNSUPPORTED, "version mismatch");
+    await tick();
+    await vi.advanceTimersByTimeAsync(120000); // give a buggy implementation every chance to retry
+
+    await expect(started).rejects.toBeTruthy();
+    expect(sockets.length).toBe(1); // never retried
+    expect(fatalEvents).toHaveLength(1);
+    expect(disconnects).toHaveLength(1);
+    expect(disconnects[0]).toMatchObject({
+      phase: "handshake",
+      wsCode: 4000 + ErrorCode.UNSUPPORTED,
+      errorCode: ErrorCode.UNSUPPORTED,
+      errorName: "UNSUPPORTED",
+      fatal: true,
+    });
+  });
+
+  it("bare close 4011 (UNAUTHORIZED) before welcome is fatal, same as a connected-phase 4011 -- no refresh-retry mechanism at this layer", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    const disconnects: DisconnectPayload[] = [];
+    const fatalEvents: unknown[] = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: "t",
+      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      onDisconnect: (r) => disconnects.push(r),
+    });
+    client.on("fatal", (e) => fatalEvents.push(e));
+
+    const started = client.start();
+    started.catch(() => {});
+    await tick();
+    sockets[0]!.open();
+    await tick();
+    sockets[0]!.serverClose(4000 + ErrorCode.UNAUTHORIZED, "token rejected");
+    await tick();
+    await vi.advanceTimersByTimeAsync(120000);
+
+    await expect(started).rejects.toBeTruthy();
+    expect(sockets.length).toBe(1); // never retried: no refresh-retry at the WS-close layer
+    expect(fatalEvents).toHaveLength(1);
+    expect(disconnects).toHaveLength(1);
+    expect(disconnects[0]).toMatchObject({
+      phase: "handshake",
+      wsCode: 4000 + ErrorCode.UNAUTHORIZED,
+      errorCode: ErrorCode.UNAUTHORIZED,
+      errorName: "UNAUTHORIZED",
+      fatal: true,
+    });
+  });
+
+  it("bare close 4009 (ENHANCE_YOUR_CALM) before welcome is still non-fatal, normal reconnect", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    const disconnects: DisconnectPayload[] = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: "t",
+      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      reconnect: { base: 10, cap: 100 },
+      onDisconnect: (r) => disconnects.push(r),
+    });
+
+    const started = client.start();
+    started.catch(() => {});
+    await tick();
+    sockets[0]!.open();
+    await tick();
+    sockets[0]!.serverClose(4000 + ErrorCode.ENHANCE_YOUR_CALM, "too many attempts");
+    await tick();
+
+    expect(disconnects).toHaveLength(1);
+    expect(disconnects[0]).toMatchObject({
+      phase: "handshake",
+      wsCode: 4000 + ErrorCode.ENHANCE_YOUR_CALM,
+      errorCode: ErrorCode.ENHANCE_YOUR_CALM,
+      errorName: "ENHANCE_YOUR_CALM",
+      fatal: false,
+    });
+
+    await client.close();
+  });
+});
+
+// --- locally-generated wsCode for a handshake failure this side raised -----
+// itself (no close frame observed): CLIENT-SDK.md's "Handshake-phase close"
+// row -- the welcome timeout carries wsCode 4001, no closeReason -----------
+
+describe("MixerClient handshake failures raised locally carry their own wsCode", () => {
+  it("the hello/welcome timeout reports wsCode 4001 (PROTOCOL_ERROR) and no closeReason", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    const disconnects: DisconnectPayload[] = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: "t",
+      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      reconnect: { base: 10, cap: 100 },
+      onDisconnect: (r) => disconnects.push(r),
+    });
+
+    const started = client.start();
+    started.catch(() => {});
+    await tick();
+    sockets[0]!.open();
+    await tick();
+    await vi.advanceTimersByTimeAsync(10000); // DEFAULT_HELLO_TIMEOUT_MS
+    await tick();
+
+    expect(disconnects).toHaveLength(1);
+    expect(disconnects[0]).toMatchObject({
+      phase: "handshake",
+      wsCode: 4000 + ErrorCode.PROTOCOL_ERROR,
+      errorCode: ErrorCode.PROTOCOL_ERROR,
+      fatal: false,
+    });
+    expect(disconnects[0]!.closeReason).toBeUndefined();
+
+    await client.close();
+  });
+});
+
+// --- the normative pre-welcome rejection: error{code,message}+close before -
+// welcome (OVERVIEW.md section 3.4's Authenticate hook,
+// spec/fixtures/sequences/auth_failure.json) -- NOT a protocol violation,
+// surfaces with the peer's own code, and the client sends no reply --------
+
+describe("MixerClient pre-welcome error{} rejection (auth_failure.json shape)", () => {
+  it("error{11 UNAUTHORIZED} before welcome: fatal, wsCode 4011, the server's message, no reply sent, no reconnect, start() rejects", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    const disconnects: DisconnectPayload[] = [];
+    const fatalEvents: unknown[] = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: "stale-or-revoked-token",
+      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      onDisconnect: (r) => disconnects.push(r),
+    });
+    client.on("fatal", (e) => fatalEvents.push(e));
+
+    const started = client.start();
+    started.catch(() => {});
+    await tick();
+    sockets[0]!.open();
+    await tick();
+    sockets[0]!.push(
+      encodeData(
+        0,
+        encodeControl({
+          t: "error",
+          code: ErrorCode.UNAUTHORIZED,
+          message: "token invalid: signature verification failed",
+        } as ControlMessage),
+      ),
+    );
+    await tick();
+    await vi.advanceTimersByTimeAsync(120000); // give a buggy implementation every chance to retry
+
+    await expect(started).rejects.toBeTruthy();
+    expect(sockets.length).toBe(1); // never retried
+    expect(fatalEvents).toHaveLength(1);
+    expect(disconnects).toHaveLength(1);
+    expect(disconnects[0]).toMatchObject({
+      phase: "handshake",
+      wsCode: 4000 + ErrorCode.UNAUTHORIZED,
+      errorCode: ErrorCode.UNAUTHORIZED,
+      errorName: "UNAUTHORIZED",
+      message: "token invalid: signature verification failed",
+      fatal: true,
+    });
+    expect(disconnects[0]!.closeReason).toBeUndefined();
+
+    // WIRE.md section 2.7: a peer that receives `error` MUST NOT reply with
+    // its own -- assert directly on what actually went out over the wire.
+    const errorReplies = sockets[0]!.sent
+      .map((frame) => {
+        try {
+          const decoded = decodeFrame(frame);
+          if (decoded.streamId !== 0 || decoded.type !== FrameType.DATA) return null;
+          return JSON.parse(Buffer.from(decoded.payload).toString("utf8")) as { t: string };
+        } catch {
+          return null;
+        }
+      })
+      .filter((m): m is { t: string } => !!m && m.t === "error");
+    expect(errorReplies).toHaveLength(0);
+  });
+
+  it("error{10 UNSUPPORTED} before welcome: fatal", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    const disconnects: DisconnectPayload[] = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: "t",
+      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      onDisconnect: (r) => disconnects.push(r),
+    });
+
+    const started = client.start();
+    started.catch(() => {});
+    await tick();
+    sockets[0]!.open();
+    await tick();
+    sockets[0]!.push(
+      encodeData(0, encodeControl({ t: "error", code: ErrorCode.UNSUPPORTED, message: "unsupported version" } as ControlMessage)),
+    );
+    await tick();
+    await vi.advanceTimersByTimeAsync(120000);
+
+    await expect(started).rejects.toBeTruthy();
+    expect(sockets.length).toBe(1); // never retried
+    expect(disconnects).toHaveLength(1);
+    expect(disconnects[0]).toMatchObject({
+      phase: "handshake",
+      wsCode: 4000 + ErrorCode.UNSUPPORTED,
+      errorCode: ErrorCode.UNSUPPORTED,
+      errorName: "UNSUPPORTED",
+      fatal: true,
+    });
+    expect(disconnects[0]!.closeReason).toBeUndefined();
+  });
+
+  it("error{9 ENHANCE_YOUR_CALM} before welcome: non-fatal, normal backoff, wsCode 4009", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    const disconnects: DisconnectPayload[] = [];
+    const reconnecting: Array<{ attempt: number; delayMs: number; cause: string }> = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: "t",
+      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      reconnect: { base: 10, cap: 100 },
+      onDisconnect: (r) => disconnects.push(r),
+    });
+    client.on("reconnecting", (info) => reconnecting.push(info));
+
+    const started = client.start();
+    started.catch(() => {});
+    await tick();
+    sockets[0]!.open();
+    await tick();
+    sockets[0]!.push(
+      encodeData(0, encodeControl({ t: "error", code: ErrorCode.ENHANCE_YOUR_CALM, message: "too many attempts" } as ControlMessage)),
+    );
+    await tick();
+
+    expect(disconnects).toHaveLength(1);
+    expect(disconnects[0]).toMatchObject({
+      phase: "handshake",
+      wsCode: 4000 + ErrorCode.ENHANCE_YOUR_CALM,
+      errorCode: ErrorCode.ENHANCE_YOUR_CALM,
+      errorName: "ENHANCE_YOUR_CALM",
+      fatal: false,
+    });
+    expect(disconnects[0]!.closeReason).toBeUndefined();
+    expect(reconnecting).toHaveLength(1); // normal backoff was actually scheduled
+
+    await client.close();
+  });
+});
+
+// --- application-initiated close: CLIENT-SDK.md's "Application close" row -
+
+describe("MixerClient close({ code, message })", () => {
+  it("performs error{code,message} + WS close 4000+code (message truncated to 123 bytes), no drain, no reconnect", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    const disconnects: DisconnectPayload[] = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: "t",
+      _wsFactory: makeFactory(sockets),
+      onDisconnect: (r) => disconnects.push(r),
+    });
+
+    const started = client.start();
+    started.catch(() => {});
+    const s0 = await connectSocket(sockets, 0);
+    await started;
+
+    const longMessage = "x".repeat(200);
+    await client.close({ code: ErrorCode.APPLICATION_CLOSE, message: longMessage });
+
+    const errorFrames = s0.sent
+      .map((frame) => {
+        try {
+          const decoded = decodeFrame(frame);
+          if (decoded.streamId !== 0 || decoded.type !== FrameType.DATA) return null;
+          return JSON.parse(Buffer.from(decoded.payload).toString("utf8")) as { t: string; code?: number; message?: string };
+        } catch {
+          return null;
+        }
+      })
+      .filter((m): m is { t: string; code?: number; message?: string } => !!m && m.t === "error");
+    expect(errorFrames).toHaveLength(1);
+    expect(errorFrames[0]!.code).toBe(ErrorCode.APPLICATION_CLOSE);
+    expect(errorFrames[0]!.message).toBe(longMessage); // error{} carries the message untruncated
+
+    expect(s0.closedWith?.code).toBe(4000 + ErrorCode.APPLICATION_CLOSE);
+    expect(s0.closedWith?.reason).toBe(longMessage.slice(0, 123)); // WS close reason IS truncated (ascii here, so char count == byte count)
+
+    expect(client.currentState()).toBe("closed");
+    expect(disconnects).toHaveLength(1);
+    expect(disconnects[0]!.fatal).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(120000);
+    expect(sockets.length).toBe(1); // never reconnected
+  });
+
+  it("truncates a multi-byte reason to <=123 UTF-8 bytes on a character boundary (no lone surrogate / U+FFFD)", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    const client = new MixerClient("wss://x/tunnel", { token: "t", _wsFactory: makeFactory(sockets) });
+
+    const started = client.start();
+    started.catch(() => {});
+    const s0 = await connectSocket(sockets, 0);
+    await started;
+
+    // "é" (U+00E9) is 2 UTF-8 bytes: 100 of them is 200 bytes, well past the
+    // 123-byte close-reason limit, and not evenly divisible into it (123 is
+    // odd) -- truncateUtf8's character-boundary walk has to actually back
+    // off from a mid-character byte, not just slice(0, 123).
+    const multiByteMessage = "é".repeat(100);
+    await client.close({ code: ErrorCode.APPLICATION_CLOSE, message: multiByteMessage });
+
+    const reason = s0.closedWith?.reason ?? "";
+    const reasonBytes = new TextEncoder().encode(reason);
+    expect(reasonBytes.length).toBeLessThanOrEqual(123);
+    expect(reason).not.toContain("�"); // no lossy replacement character: a clean character-boundary cut
+    expect(reason).toBe("é".repeat(Math.floor(reasonBytes.length / 2))); // every "é" in the result is whole
+  });
+
+  it("defaults to today's graceful drain-then-close when no code is given", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    const client = new MixerClient("wss://x/tunnel", { token: "t", _wsFactory: makeFactory(sockets) });
+
+    const started = client.start();
+    started.catch(() => {});
+    const s0 = await connectSocket(sockets, 0);
+    await started;
+
+    await client.close();
+    await tick();
+
+    // Unchanged from before opts.code existed: NO_ERROR, WS close 1000.
+    expect(s0.closedWith?.code).toBe(1000);
+  });
+
+  it("throws a RangeError synchronously for an out-of-range code, before touching either connection", () => {
+    const client = new MixerClient("wss://x/tunnel", { token: "t" });
+    expect(() => client.close({ code: 1000 })).toThrow(RangeError);
+    expect(() => client.close({ code: -1 })).toThrow(RangeError);
+    expect(() => client.close({ code: 1.5 })).toThrow(RangeError);
+  });
+
+  it("close({code:14}) while the handshake is still in flight (mid-dial): the app's code/message reach the wire; no report and no redial, matching the pre-existing no-args close() behaviour in this window", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    const disconnects: DisconnectPayload[] = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: "t",
+      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      onDisconnect: (r) => disconnects.push(r),
+    });
+
+    const started = client.start();
+    started.catch(() => {});
+    await tick();
+    sockets[0]!.open();
+    await tick();
+    // hello sent, no welcome yet -- MixerConn exists as dialingConn, not yet promoted to conn.
+
+    await client.close({ code: ErrorCode.APPLICATION_CLOSE, message: "APP-BYE" });
+    await tick();
+
+    const errorFrames = sockets[0]!.sent
+      .map((frame) => {
+        try {
+          const decoded = decodeFrame(frame);
+          if (decoded.streamId !== 0 || decoded.type !== FrameType.DATA) return null;
+          return JSON.parse(Buffer.from(decoded.payload).toString("utf8")) as { t: string; code?: number; message?: string };
+        } catch {
+          return null;
+        }
+      })
+      .filter((m): m is { t: string; code?: number; message?: string } => !!m && m.t === "error");
+    // The app's code/message, not the hard-coded NO_ERROR/"client closing"
+    // dialingConn.fail() used before this fix.
+    expect(errorFrames).toHaveLength(1);
+    expect(errorFrames[0]!.code).toBe(ErrorCode.APPLICATION_CLOSE);
+    expect(errorFrames[0]!.message).toBe("APP-BYE");
+    expect(sockets[0]!.closedWith?.code).toBe(4000 + ErrorCode.APPLICATION_CLOSE);
+
+    // A dialingConn never became `conn` (connectOnce's catch and wireConn's
+    // own 'close' handler both treat it as "already handled elsewhere" and
+    // stay silent once `this.closing` is set) -- this is pre-existing
+    // behaviour, identical to the no-args close() mid-handshake case (see
+    // the sibling "close() during an in-flight dial" test above); opts.code
+    // does not change it, only which code/message actually reach the wire.
+    expect(disconnects).toHaveLength(0);
+
+    expect(client.currentState()).toBe("closed");
+    await vi.advanceTimersByTimeAsync(120000);
+    expect(sockets.length).toBe(1); // never reconnected
+  });
+});
+
+// --- 0x0e APPLICATION_CLOSE: connection-level, non-fatal, starts at cap ---
+
+describe("MixerClient 0x0e APPLICATION_CLOSE", () => {
+  it("error{code:14,message} then close 4014 is named APPLICATION_CLOSE, non-fatal, and starts backoff at the cap (not at base) -- WIRE.md section 2.9: 4014 always follows welcome, so plain backoff would never climb", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, "random").mockReturnValue(1); // pin full-jitter's sample to its ceiling
+    const sockets: FakeSocket[] = [];
+    const disconnects: DisconnectPayload[] = [];
+    const reconnecting: Array<{ attempt: number; delayMs: number; cause: string }> = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: "t",
+      _wsFactory: makeFactory(sockets),
+      reconnect: { base: 1000, cap: 60000 },
+      onDisconnect: (r) => disconnects.push(r),
+    });
+    client.on("reconnecting", (info) => reconnecting.push(info));
+
+    const started = client.start();
+    started.catch(() => {});
+    const s0 = await connectSocket(sockets, 0);
+    await started;
+
+    s0.push(
+      encodeData(
+        0,
+        encodeControl({ t: "error", code: ErrorCode.APPLICATION_CLOSE, message: "application says goodbye" } as ControlMessage),
+      ),
+    );
+    await tick();
+
+    expect(disconnects).toHaveLength(1);
+    expect(disconnects[0]).toMatchObject({
+      wsCode: 4000 + ErrorCode.APPLICATION_CLOSE,
+      errorCode: ErrorCode.APPLICATION_CLOSE,
+      errorName: "APPLICATION_CLOSE",
+      message: "application says goodbye",
+      fatal: false,
+    });
+    expect(disconnects[0]!.protocolError).toBeFalsy();
+    expect(reconnecting).toHaveLength(1);
+    // Math.random pinned to 1: a first-attempt normal backoff would ceiling
+    // at base*2^1 = 2000ms; starting "at the cap" instead ceilings at 60000ms.
+    expect(reconnecting[0]!.delayMs).toBe(60000);
+
+    await vi.advanceTimersByTimeAsync(60000);
+    await connectSocket(sockets, 1);
+    await client.close();
+  });
+
+  it("a bare close 4014 (no error{}) also derives errorName APPLICATION_CLOSE from the wire code and starts backoff at the cap", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, "random").mockReturnValue(1);
+    const sockets: FakeSocket[] = [];
+    const disconnects: DisconnectPayload[] = [];
+    const reconnecting: Array<{ attempt: number; delayMs: number; cause: string }> = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: "t",
+      _wsFactory: makeFactory(sockets),
+      reconnect: { base: 1000, cap: 60000 },
+      onDisconnect: (r) => disconnects.push(r),
+    });
+    client.on("reconnecting", (info) => reconnecting.push(info));
+
+    const started = client.start();
+    started.catch(() => {});
+    await connectSocket(sockets, 0);
+    await started;
+
+    sockets[0]!.serverClose(4000 + ErrorCode.APPLICATION_CLOSE, "goodbye");
+    await tick();
+
+    expect(disconnects).toHaveLength(1);
+    expect(disconnects[0]).toMatchObject({
+      wsCode: 4000 + ErrorCode.APPLICATION_CLOSE,
+      errorName: "APPLICATION_CLOSE",
+      closeReason: "goodbye",
+      fatal: false,
+    });
+    expect(reconnecting).toHaveLength(1);
+    expect(reconnecting[0]!.delayMs).toBe(60000);
+
+    await client.close();
+  });
+});

@@ -16,13 +16,17 @@
 import { EventEmitter } from "node:events";
 import { WebSocket } from "ws";
 import type { AgentInfo, DrainMsg, WelcomeMsg } from "./control.js";
-import { ErrorCode, StreamError, WsMixerError, codeName } from "./errors.js";
+import { ErrorCode, StreamError, WsMixerError, closeCode, codeName } from "./errors.js";
 import { MixerConn, type WSLike } from "./conn.js";
 import { MAX_MESSAGE_SIZE } from "./frame.js";
 import type { MixerStream } from "./stream.js";
 
 export const SUBPROTOCOL = "ws-mixer.v1";
-export const SDK_VERSION = "0.2.0";
+// Kept in sync with package.json's "version" by hand (test/version.test.ts
+// asserts the two match, so a release bump that forgets this one fails CI
+// instead of silently going stale on the wire in hello.agent.sdk_version /
+// the User-Agent header).
+export const SDK_VERSION = "0.3.1";
 
 export type ClientState = "idle" | "dialing" | "connected" | "backoff" | "closed";
 
@@ -95,12 +99,39 @@ export type DisconnectPhase = "dial" | "handshake" | "connected";
  */
 export interface DisconnectReason {
   phase: DisconnectPhase;
+  /**
+   * The WebSocket close code, when a WS close occurred. When derived from a
+   * ws-mixer error (this side's own `WsMixerError`/`ConnError`, or a peer's
+   * `error{code}`), this is always the semantic `4000+error_code` -- for an
+   * `error_code` outside the legal WS close range (>= 0x1000_0000, an
+   * application-layer code that is legal for a stream RESET but never was
+   * for a connection close), that can differ from the *actual* bytes this
+   * side puts on the wire, which are clamped to `4000+INTERNAL_ERROR` (4002)
+   * instead (conn.ts's `wireCloseCode`, mirroring go/wsmixer's
+   * `wsCloseCode`) -- `errorCode` always keeps the real, unclamped code
+   * either way. When instead observed directly from a bare close frame
+   * (`onSocketClose`, no preceding `error{}`), `wsCode` is exactly what was
+   * on the wire, since there is nothing else it could be.
+   */
   wsCode?: number;
   errorCode?: number;
   errorName?: string;
   httpStatus?: number;
   fatal: boolean;
   message: string;
+  /**
+   * The reason field of the close frame *received from the peer*, verbatim
+   * -- never this side's own outgoing reason (CLIENT-SDK.md's `closeReason`
+   * row). Absent or empty whenever no reason was received from the peer:
+   * this includes an abnormal closure (no close frame at all), this side
+   * having initiated the close itself (a peer's echo carries no information
+   * and RFC 6455 doesn't require it to copy the reason), and the SDK closing
+   * on a peer's `error{}` without reading whatever close frame follows it,
+   * as OVERVIEW.md section 2.7 allows ("logs, surfaces and closes"). The
+   * human-readable text is in `message` for all of those cases instead --
+   * consumers SHOULD prefer `closeReason` and fall back to `message`.
+   */
+  closeReason?: string;
   cause?: unknown;
 }
 
@@ -133,6 +164,7 @@ interface DisconnectContext {
   httpStatus?: number;
   cause?: unknown;
   message: string;
+  closeReason?: string;
   protocolError?: boolean;
   code?: number;
   name?: string;
@@ -187,6 +219,20 @@ export interface ConnectOptions {
   };
 }
 
+/** Options for an application-initiated `MixerClient.close()` (CLIENT-SDK.md's "Application close" row). See `close()`'s doc comment. */
+export interface CloseOptions {
+  /**
+   * A ws-mixer error code (OVERVIEW.md section 2.8); the connection closes
+   * with `error{code, message}` then WS close `4000+code`, instead of the
+   * default graceful drain. Must be an integer in `[0, 999]` so `4000+code`
+   * is a legal WS close code -- `close()` throws a `RangeError` synchronously
+   * otherwise, before any close is attempted.
+   */
+  code?: number;
+  /** The `error{}` message and (truncated to 123 UTF-8 bytes on a character boundary) the WS close reason. Defaults to "". */
+  message?: string;
+}
+
 const DEFAULT_RECONNECT: Required<ReconnectOptions> = {
   base: 1000,
   cap: 60000,
@@ -199,6 +245,7 @@ const FATAL_WS_CODES = new Set([4000 + ErrorCode.UNSUPPORTED, 4000 + ErrorCode.U
 const GOING_AWAY_WS_CODE = 4000 + ErrorCode.GOING_AWAY; // 4012
 const KEEPALIVE_TIMEOUT_WS_CODE = 4000 + ErrorCode.KEEPALIVE_TIMEOUT; // 4013
 const ENHANCE_YOUR_CALM_WS_CODE = 4000 + ErrorCode.ENHANCE_YOUR_CALM; // 4009
+const APPLICATION_CLOSE_WS_CODE = 4000 + ErrorCode.APPLICATION_CLOSE; // 4014
 const ABNORMAL_CLOSURE_WS_CODE = 1001; // non-ws-mixer close treated as 4012, OVERVIEW.md section 2.8
 /**
  * Close codes that mean "SDK bug", per OVERVIEW.md section 2.9's reconnect
@@ -212,6 +259,13 @@ const PROTOCOL_BUG_WS_CODES = new Set([
   4000 + ErrorCode.FLOW_CONTROL_ERROR, // 4003
   4000 + ErrorCode.FRAME_SIZE_ERROR, // 4004
 ]);
+// A connected-phase 4014 (APPLICATION_CLOSE) gets 4009's own "start at cap"
+// treatment below (WIRE.md section 2.9): it is by nature sent *after*
+// welcome (the app accepted, then refused), and welcome already reset
+// `attempt` to 0, so plain full-jitter backoff would redial roughly once a
+// second forever instead of climbing. A handshake-phase 4014 has no such
+// problem -- it never reset `attempt` -- so it stays on the ordinary
+// handshake-failure path (connectOnce's catch), attempt counter and all.
 
 export declare interface MixerClient {
   on(event: "welcome", listener: (welcome: WelcomeMsg) => void): this;
@@ -325,8 +379,30 @@ export class MixerClient extends EventEmitter {
    * live/in-flight connection. A dial already in flight when this is called
    * is closed as soon as it resolves (see connectOnce); nothing reconnects
    * after this returns.
+   *
+   * With `opts.code`, this is instead an application-initiated close
+   * (CLIENT-SDK.md's "Application close" row, e.g. `code:
+   * ErrorCode.APPLICATION_CLOSE`): `error{code, message}` on stream 0, WS
+   * close `4000+code` (message truncated to 123 UTF-8 bytes on a character
+   * boundary), then the socket -- `MixerConn.fail()`'s `teardownConn`
+   * already performs exactly those three steps in order. No `drain`, no
+   * grace period. Validated synchronously (before either connection is
+   * touched): `code` must be an integer in `[0, 999]` so `4000+code` is a
+   * legal WS close code, or this throws a `RangeError`.
    */
-  async close(): Promise<void> {
+  close(opts?: CloseOptions): Promise<void> {
+    if (opts?.code !== undefined && (!Number.isInteger(opts.code) || opts.code < 0 || opts.code > 999)) {
+      throw new RangeError(
+        `ws-mixer: close() code must be an integer in [0, 999] (so 4000+code is a legal WS close code); got ${opts.code}`,
+      );
+    }
+    return this.closeImpl(opts);
+  }
+
+  private async closeImpl(opts?: CloseOptions): Promise<void> {
+    // Marked closing/closed FIRST, before either connection is touched, so
+    // nothing below -- the 'close' handler's own reconnect-scheduling
+    // branches -- ever schedules a reconnect for this shutdown.
     this.closing = true;
     this.state = "closed";
     // An app-initiated close() always wins over a pending drain deadline:
@@ -339,17 +415,29 @@ export class MixerClient extends EventEmitter {
     // client-initiated shutdown before any connection ever completed.
     this.rejectStartIfNeverConnected(new Error("ws-mixer: closed before the first connection completed"));
     this.clearReconnectTimer();
+    // Built once and reused for every conn this call tears down, so a
+    // code/message given to close() isn't silently dropped for a
+    // retiring/dialing conn just because it wasn't yet the primary `conn`
+    // (previously these two always hard-coded NO_ERROR/"client closing"
+    // regardless of opts).
+    const closeErr = opts?.code !== undefined ? new WsMixerError(opts.code, opts.message ?? "") : new WsMixerError(ErrorCode.NO_ERROR, "client closing");
     if (this.retiringConn) {
       const old = this.retiringConn;
       this.retiringConn = null;
-      old.fail(new WsMixerError(ErrorCode.NO_ERROR, "client closing"));
+      old.fail(closeErr);
     }
     if (this.dialingConn) {
       const dialing = this.dialingConn;
       this.dialingConn = null;
-      dialing.fail(new WsMixerError(ErrorCode.NO_ERROR, "client closing"));
+      dialing.fail(closeErr);
     }
-    if (this.conn) await this.conn.close();
+    if (this.conn) {
+      if (opts?.code !== undefined) {
+        this.conn.fail(closeErr);
+      } else {
+        await this.conn.close();
+      }
+    }
   }
 
   // this.state is a plain string-literal-union property, and TS's control
@@ -478,22 +566,44 @@ export class MixerClient extends EventEmitter {
     } catch (e) {
       this.dialingConn = null;
       const err = e as WsMixerError;
+      // A raw peer close (onSocketClose) carries `err.wsCode`: derive
+      // errorCode/wsCode from it exactly like the connected-phase 'close'
+      // handler below does (`info.errorCode ?? info.wsCode! - 4000`), rather
+      // than trusting onSocketClose's generic INTERNAL_ERROR placeholder --
+      // a bare 4010/4011 close before welcome must classify (and go fatal)
+      // the same way a post-welcome one does. A *locally* raised failure
+      // (hello timeout, welcome validation, ...) has no observed wsCode: its
+      // `err.code` is already the genuine classification, so derive the WS
+      // code it's about to close with instead (CLIENT-SDK.md's
+      // "Handshake-phase close" row: the welcome timeout carries the locally
+      // generated wsCode 4001, no closeReason).
+      let errorCode: number | undefined;
+      let wsCode = err.wsCode;
+      if (wsCode !== undefined) {
+        errorCode = wsCode >= 4000 && wsCode < 5000 ? wsCode - 4000 : undefined;
+      } else {
+        errorCode = err.code;
+        wsCode = closeCode(err.code);
+      }
       const ctx: DisconnectContext = {
         phase: "handshake",
-        errorCode: err.code,
-        errorName: codeName(err.code),
+        wsCode,
+        errorCode,
+        errorName: errorCode !== undefined ? codeName(errorCode) : undefined,
         message: err.message,
+        closeReason: err.closeReason,
       };
-      if (err.fatal || err.code === ErrorCode.UNSUPPORTED || err.code === ErrorCode.UNAUTHORIZED) {
+      if (err.fatal || errorCode === ErrorCode.UNSUPPORTED || errorCode === ErrorCode.UNAUTHORIZED) {
         this.goFatal(ctx);
         return;
       }
       if (this.closing || this.isClosed()) return;
       // Non-fatal handshake failure (e.g. no `welcome` within the hello
-      // timeout): still "every disconnect...is reported" (OVERVIEW.md
-      // section 4.0) -- exactly once, whether that's this retry's report or
-      // (if maxAttempts is already exhausted) the single merged exhaustion
-      // report scheduleReconnect emits via giveUp instead.
+      // timeout, or the peer closing the socket before it ever arrived):
+      // still "every disconnect...is reported" (OVERVIEW.md section 4.0) --
+      // exactly once, whether that's this retry's report or (if maxAttempts
+      // is already exhausted) the single merged exhaustion report
+      // scheduleReconnect emits via giveUp instead.
       this.scheduleReconnect(ctx, "handshake failed: " + err.message);
     }
   }
@@ -509,6 +619,16 @@ export class MixerClient extends EventEmitter {
    * once). The retry still counts toward `maxAttempts`, so it's skipped if
    * the ceiling is already reached. A throwing/rejecting provider is always
    * fatal, verbatim, whether on the first call or the retry's.
+   *
+   * This one-time refresh-retry is scoped to the dial's own HTTP 401
+   * response (CLIENT-SDK.md's "401 on upgrade" row). A *handshake-phase*
+   * UNAUTHORIZED (4011) -- whether from the normative error{11}+close
+   * rejection (OVERVIEW.md section 3.4's Authenticate hook,
+   * spec/fixtures/sequences/auth_failure.json) or a bare 4011 close with no
+   * error{} -- has no equivalent retry at this layer and is simply fatal,
+   * the same as any other 4011 (conn.ts's dispatchControl routes a
+   * pre-welcome `error` to handlePeerError precisely so it surfaces with its
+   * own code instead of being masked as a local PROTOCOL_ERROR).
    */
   private async dialWithAuth(connectTimeoutMs: number): Promise<{ ws: DialSocket; token: string }> {
     const isProvider = typeof this.opts.token === "function";
@@ -615,6 +735,7 @@ export class MixerClient extends EventEmitter {
               errorCode: info.errorCode,
               errorName: codeName(code),
               message: info.message,
+              closeReason: info.closeReason,
               protocolError: true,
               code,
               name: codeName(code),
@@ -636,6 +757,7 @@ export class MixerClient extends EventEmitter {
                   ? codeName(info.wsCode - 4000)
                   : undefined,
             message: info.message,
+            closeReason: info.closeReason,
           };
 
       if (fatal) {
@@ -708,6 +830,17 @@ export class MixerClient extends EventEmitter {
         this.scheduleReconnectAtCap(ctx, "enhance_your_calm");
         return;
       }
+      if (info.wsCode === APPLICATION_CLOSE_WS_CODE) {
+        // WIRE.md section 2.9: a connected-phase 4014 is, by nature, sent
+        // *after* welcome already reset `attempt` to 0 -- same "start at
+        // cap" treatment as 4009 above, for the same reason (see the const's
+        // own comment). Covers both the error{14}+close and bare-4014
+        // variants; a *handshake-phase* 4014 never reaches this handler at
+        // all (it's a connectOnce catch/goFatal-or-scheduleReconnect concern,
+        // where `attempt` does climb normally).
+        this.scheduleReconnectAtCap(ctx, "application_close");
+        return;
+      }
       this.scheduleReconnect(ctx, info.message);
     });
   }
@@ -727,6 +860,7 @@ export class MixerClient extends EventEmitter {
       httpStatus: ctx.httpStatus,
       cause: ctx.cause,
       message: messageOverride ?? ctx.message,
+      closeReason: ctx.closeReason,
       fatal,
     };
     if (ctx.protocolError) {

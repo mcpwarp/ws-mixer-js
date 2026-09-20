@@ -9,7 +9,7 @@ import { FakeWS } from "./helpers/fake-ws.js";
 import { MixerConn } from "../src/conn.js";
 import { encodeControl } from "../src/control.js";
 import { decodeFrame, encodeClose, encodeData, encodeOpen, encodeWindow, FrameType } from "../src/frame.js";
-import { ErrorCode, StreamError } from "../src/errors.js";
+import { ErrorCode, StreamError, WsMixerError } from "../src/errors.js";
 import { MixerStream } from "../src/stream.js";
 
 function agent() {
@@ -398,16 +398,48 @@ describe("MixerConn minor conformance (item 6)", () => {
     expect(close.wsCode).toBe(4001);
   });
 
-  it("error{} received before welcome completes is PROTOCOL_ERROR (item 1)", async () => {
+  it("error{} received before welcome completes surfaces with the peer's own code, not a local PROTOCOL_ERROR (auth_failure.json shape)", async () => {
     const ws = new FakeWS();
     const conn = new MixerConn(ws, { token: "t", agent: agent() });
     conn.on("error", () => {});
-    const closeP = new Promise<{ wsCode: number }>((resolve) => conn.on("close", resolve as never));
+    conn.on("fatal", () => {});
+    const closeP = new Promise<{ wsCode: number; errorCode?: number; message: string }>((resolve) =>
+      conn.on("close", resolve as never),
+    );
     conn.handshake().catch(() => {});
     await new Promise((r) => setImmediate(r));
-    ws.receive(encodeData(0, encodeControl({ t: "error", code: ErrorCode.INTERNAL_ERROR, message: "peer confused" } as never)));
+    ws.receive(
+      encodeData(
+        0,
+        encodeControl({ t: "error", code: ErrorCode.UNAUTHORIZED, message: "token invalid: signature verification failed" } as never),
+      ),
+    );
     const close = await closeP;
-    expect(close.wsCode).toBe(4001);
+    // WIRE.md section 2.7/2.10 step 12: the server MAY reject `hello` with
+    // error{code,message}+close before ever sending `welcome`
+    // (spec/fixtures/sequences/auth_failure.json) -- this is not a protocol
+    // violation on the peer's part, so it must surface with the peer's own
+    // code/message, not a masking local PROTOCOL_ERROR/4001.
+    expect(close.wsCode).toBe(4000 + ErrorCode.UNAUTHORIZED);
+    expect(close.errorCode).toBe(ErrorCode.UNAUTHORIZED);
+    expect(close.message).toBe("token invalid: signature verification failed");
+    // WIRE.md section 2.7: a peer that receives `error` MUST NOT reply with
+    // its own.
+    const errorReplies = ws.sent.filter((f) => {
+      let frame;
+      try {
+        frame = decodeFrame(f);
+      } catch {
+        return false;
+      }
+      if (frame.streamId !== 0 || frame.type !== FrameType.DATA) return false;
+      try {
+        return (JSON.parse(Buffer.from(frame.payload).toString()) as { t: string }).t === "error";
+      } catch {
+        return false;
+      }
+    });
+    expect(errorReplies).toHaveLength(0);
   });
 });
 
@@ -618,5 +650,55 @@ describe("MixerConn.handleDispatchError (item 10)", () => {
     const resetFrame = ws.sent.find((f) => decodeFrame(f).type === FrameType.RESET && decodeFrame(f).streamId === 1);
     expect(resetFrame, "expected the connection to have sent RESET(1)").toBeDefined();
     expect(decodeFrame(resetFrame!).payload[3]).toBe(ErrorCode.STREAM_CLOSED);
+  });
+});
+describe("MixerConn wire close-code clamping (item B)", () => {
+  const HUGE_CODE = 0x10000001; // >= 0x1000_0000: a legal application/RESET code, never a legal WS close code
+
+  it("peer error{code:0x10000001} in connected phase: the WS close frame is clamped to 4002, not a throw/terminate(1006)", async () => {
+    const ws = new FakeWS();
+    const { conn } = await handshaken(ws);
+    conn.on("error", () => {});
+    const closeP = new Promise<{ wsCode: number; errorCode?: number; message: string }>((resolve) =>
+      conn.on("close", resolve as never),
+    );
+    ws.receive(encodeData(0, encodeControl({ t: "error", code: HUGE_CODE, message: "layer-above reason" } as never)));
+    const close = await closeP;
+    // Reported wsCode/errorCode stay the real, unclamped semantic values --
+    // only the bytes actually sent on the wire are clamped.
+    expect(close.wsCode).toBe(4000 + HUGE_CODE);
+    expect(close.errorCode).toBe(HUGE_CODE);
+    expect(close.message).toBe("layer-above reason");
+    expect(ws.closedWith).not.toBeNull();
+    expect(ws.closedWith!.code).toBe(4000 + ErrorCode.INTERNAL_ERROR);
+  });
+
+  it("peer error{code:0x10000001} before welcome: same clamped wire close, no throw", async () => {
+    const ws = new FakeWS();
+    const conn = new MixerConn(ws, { token: "t", agent: agent() });
+    conn.on("error", () => {});
+    conn.on("fatal", () => {});
+    const closeP = new Promise<{ wsCode: number; errorCode?: number }>((resolve) => conn.on("close", resolve as never));
+    conn.handshake().catch(() => {});
+    await new Promise((r) => setImmediate(r));
+    ws.receive(encodeData(0, encodeControl({ t: "error", code: HUGE_CODE, message: "layer-above reason" } as never)));
+    const close = await closeP;
+    expect(close.wsCode).toBe(4000 + HUGE_CODE);
+    expect(close.errorCode).toBe(HUGE_CODE);
+    expect(ws.closedWith).not.toBeNull();
+    expect(ws.closedWith!.code).toBe(4000 + ErrorCode.INTERNAL_ERROR);
+  });
+
+  it("MixerConn.fail() with such a code likewise clamps the wire close", async () => {
+    const ws = new FakeWS();
+    const { conn } = await handshaken(ws);
+    conn.on("error", () => {});
+    const closeP = new Promise<{ wsCode: number; errorCode?: number }>((resolve) => conn.on("close", resolve as never));
+    conn.fail(new WsMixerError(HUGE_CODE, "locally detected"));
+    const close = await closeP;
+    expect(close.wsCode).toBe(4000 + HUGE_CODE);
+    expect(close.errorCode).toBe(HUGE_CODE);
+    expect(ws.closedWith).not.toBeNull();
+    expect(ws.closedWith!.code).toBe(4000 + ErrorCode.INTERNAL_ERROR);
   });
 });

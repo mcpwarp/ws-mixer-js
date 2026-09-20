@@ -91,7 +91,9 @@ surfaced verbatim as `DisconnectReason.cause` (`message` is copied from `error.m
 the SDK calls it again and redials immediately (no backoff, though the retry still counts toward
 `reconnect.maxAttempts`). A second 401 is fatal. A static string `token` skips the retry entirely
 and is fatal on the first 401, since there is nothing to refresh. HTTP 403/404 are always fatal,
-with no retry, provider or not.
+with no retry, provider or not. This refresh-retry is specifically about the dial's own HTTP 401
+response: a handshake-phase close carrying `UNAUTHORIZED` (`4011`), with or without a preceding
+`error{}`, has no equivalent retry today and is simply fatal, the same as any other `4011`.
 
 ## Reconnect semantics
 
@@ -110,7 +112,8 @@ that, `MixerClient` owns a persistent reconnect loop, a single state machine
 | Close `4009` (`ENHANCE_YOUR_CALM`) | Backoff starts **at the cap**, not at `base`. |
 | HTTP `429` during the dial, with a `Retry-After` header | Honoured verbatim (seconds or an HTTP-date) instead of the usual jitter. |
 | HTTP `401` during the dial, with a token provider present, on this dial's first 401 | One immediate refresh-retry: the provider is called again and the dial redialed right away (no backoff, but counts toward `maxAttempts`). See "Authentication" above. |
-| Close `4010` (`UNSUPPORTED`), `4011` (`UNAUTHORIZED`); HTTP 401/403/404 (after the one refresh-retry above, if it applied); missing/mismatched subprotocol echo; a token provider that throws/rejects | **Fatal.** Surfaced on the `fatal` event and via `onDisconnect({ ..., fatal: true })`; `close()` is issued; **never retried**. `connect()` rejects if this happens before any `welcome`. |
+| Close `4010` (`UNSUPPORTED`), `4011` (`UNAUTHORIZED`) -- in any phase, with or without a preceding `error{}`; HTTP 401/403/404 (after the one refresh-retry above, if it applied); missing/mismatched subprotocol echo; a token provider that throws/rejects | **Fatal.** Surfaced on the `fatal` event and via `onDisconnect({ ..., fatal: true })`; `close()` is issued; **never retried**. `connect()` rejects if this happens before any `welcome`. |
+| Close `4014` (`APPLICATION_CLOSE`), connected phase | Same "start at the cap" treatment as `4009` above (WIRE.md section 2.9): it is by nature sent *after* `welcome` (the app accepted, then refused -- e.g. a per-account connection cap), and `welcome` already reset the attempt counter, so plain full-jitter backoff would redial roughly once a second forever instead of climbing. Applies to both the `error{14}+close` and bare-`4014` shapes. Never emitted by ws-mixer itself -- reserved for the application above to close a connection for its own reason (the reason text is in `error.message`/the WS close reason). See `close({ code, message })` below. A **handshake-phase** `4014` (before `welcome`) is not special-cased: it follows the ordinary handshake-failure path, where the attempt counter climbs normally. |
 | `reconnect.maxAttempts` exhausted | Stops reconnecting. `connect()` rejects if it never connected once. |
 | `close()` called while a dial is in flight | The in-flight socket is closed as soon as the dial resolves; nothing reconnects afterward. |
 
@@ -136,19 +139,44 @@ never a first report for the failure followed by a second one for giving up.
 
 | Field | Meaning |
 |---|---|
-| `phase` | `"dial"` (opening the socket / the auth handshake), `"handshake"` (`hello`/`welcome` after the socket opened), or `"connected"` (after `welcome`). |
-| `wsCode` | The WebSocket close code, when a WS close occurred. |
-| `errorCode` | The ws-mixer error code (OVERVIEW.md section 2.8), when one preceded the close. Absent for a token-provider throw/reject: that's an application error, not a wire error. |
+| `phase` | `"dial"` (opening the socket / the auth handshake), `"handshake"` (`hello`/`welcome` after the socket opened), or `"connected"` (after `welcome`). Always present. |
+| `wsCode` | The WebSocket close code, when a WS close occurred (including the SDK's own locally-generated code for a close it initiated itself, e.g. `4001` for a hello/welcome timeout). When derived from a ws-mixer error (this side's own error, or a peer's `error{code}`), this is always the semantic `4000+error_code` -- for a `code > 999` that differs from the `4002` actually sent on the wire (illegal WS close codes are clamped; see `errorCode`, which always keeps the real, unclamped value). When instead observed directly from a bare close frame with no preceding `error{}`, `wsCode` is exactly what was on the wire. |
+| `errorCode` | The ws-mixer error code (OVERVIEW.md section 2.8), when one is known -- either because a ws-mixer `error{}` preceded the close, or because the close code itself is in the ws-mixer wire range (`4000`-`4999`). Absent for a token-provider throw/reject: that's an application error, not a wire error. |
 | `errorName` | That error code's wire name (e.g. `"KEEPALIVE_TIMEOUT"`). |
 | `httpStatus` | The HTTP status of the upgrade response, when the dial failed at the HTTP layer (401/403/404/429). |
 | `fatal` | Whether the SDK will never reconnect after this (includes `reconnect.maxAttempts` exhaustion). |
 | `message` | Human-readable description. |
+| `closeReason` | The reason field of the close frame **received from the peer**, verbatim -- never this side's own outgoing reason. Absent or empty whenever no reason was received from the peer: an abnormal closure (no close frame at all), this side having initiated the close itself (a peer's echo carries no information and RFC 6455 doesn't require it to copy the reason), or the SDK closing on a peer's `error{}` without reading whatever close frame follows it (OVERVIEW.md section 2.7 allows "logs, surfaces and closes"). The human-readable text is in `message` for all of those cases instead -- consumers SHOULD prefer `closeReason` and fall back to `message`. |
 | `cause` | The token provider's thrown/rejected error, when that's why the dial failed. |
 
 `sendApp()` returns a `Promise<void>` that resolves once the frame is actually written to the
 socket (OVERVIEW.md section 4), or rejects with the connection's terminal error if the connection
 fails before it gets there -- `conn.ts`'s control queue carries a resolver per queued frame the same
 way `sendData()`'s per-stream outbox already does for stream bytes.
+
+### Application-initiated close
+
+`close()` normally performs the default graceful shutdown shown above (`drain{client_requested}`,
+a grace period, then close `1000`). Pass `{ code, message }` instead to close the connection for an
+application-level reason (e.g. `ErrorCode.APPLICATION_CLOSE`, `0x0e`/WS close `4014` -- reserved for
+this and never emitted by ws-mixer itself): `error{code, message}` on stream 0, then WS close
+`4000+code` with `message` truncated to 123 UTF-8 bytes on a character boundary, then the socket --
+no `drain`, no grace period, and no reconnect is scheduled (matches the default `close()`'s
+one-report-then-done shape). `code` must be an integer in `[0, 999]` so `4000+code` is a legal WS
+close code; anything else throws a `RangeError` synchronously, before either connection is touched.
+
+```ts
+await client.close({ code: ErrorCode.APPLICATION_CLOSE, message: "operator requested shutdown" });
+```
+
+### Errors
+
+`WsMixerError` (and its `ConnError`/`StreamError` subclasses) is the single error type this SDK
+throws or emits (`'error'`/`'fatal'`, and every `Promise` rejection). Its `wsCode`/`closeReason`
+fields exist for the same reason as the identically-named `DisconnectReason` fields above -- set
+only when this particular error was built from an actually-observed close frame (as opposed to a
+locally-raised protocol violation), and under the same "never this side's own outgoing reason" rule
+as `closeReason`.
 
 ## Tests
 
