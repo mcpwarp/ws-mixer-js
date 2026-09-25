@@ -16,7 +16,7 @@ export type { ConnOptions, WSLike } from "./conn.js";
 export { MixerStream } from "./stream.js";
 export type { StreamState } from "./stream.js";
 
-export { ErrorCode, WsMixerError, ConnError, StreamError, codeName, parseErrorCode, closeCode } from "./errors.js";
+export { ErrorCode, WsMixerError, ConnError, StreamError, TokenUnavailableError, codeName, parseErrorCode, closeCode } from "./errors.js";
 export type { ErrorCodeValue } from "./errors.js";
 
 export {

@@ -535,6 +535,150 @@ describe("MixerConn ordered async delivery: handler errors (blocker 2)", () => {
   });
 });
 
+describe("MixerConn ordered async delivery: flush after close (R1)", () => {
+  it("app A (handler pending) + app B queued + error{} mid-flight -> both delivered, in order, B after close; a further enqueue after close is refused", async () => {
+    const ws = new FakeWS();
+    const { conn } = await handshaken(ws);
+    const order: string[] = [];
+    let closed = false;
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    conn.on("close", () => {
+      closed = true;
+    });
+    conn.on("error", () => {}); // guard: error{} -> handlePeerError -> teardownConn's guarded 'error' emit
+    conn.on("app", async (b: Record<string, unknown>) => {
+      const i = b.i as number;
+      order.push(`start:${i}`);
+      if (i === 0) await gate; // A suspends here, still pending when error{} arrives
+      order.push(`end:${i}`);
+    });
+
+    ws.receive(encodeData(0, encodeControl({ t: "app", body: { i: 0 } } as never))); // A: wedges the loop on gate
+    ws.receive(encodeData(0, encodeControl({ t: "app", body: { i: 1 } } as never))); // B: queued behind A
+    ws.receive(encodeData(0, encodeControl({ t: "error", code: ErrorCode.INTERNAL_ERROR, message: "boom" } as never))); // ends the connection while A is still in flight
+    // A further event arriving strictly after teardown must never be
+    // enqueued at all (enqueueDelivery refuses once this.closed) -- it
+    // should never show up in `order`, even after the flush below runs.
+    ws.receive(encodeData(0, encodeControl({ t: "app", body: { i: 99 } } as never)));
+
+    await new Promise((r) => setImmediate(r));
+    expect(closed).toBe(true); // the connection already tore down...
+    expect(order).toEqual(["start:0"]); // ...but B (queued before the close) has NOT been dropped -- it's still owed
+
+    release();
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(order).toEqual(["start:0", "end:0", "start:1", "end:1"]); // B delivered after close, in wire order; i:99 never appears
+  });
+
+  it("a queued stream OPEN is still delivered after close, and the stream it hands over is already destroyed with an error (no read/write ever hangs)", async () => {
+    const ws = new FakeWS();
+    const { conn } = await handshaken(ws, { maxStreams: 4 });
+    const delivered: MixerStream[] = [];
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    conn.on("app", async () => {
+      await gate; // wedges the loop on the app event queued ahead of the stream OPEN
+    });
+    conn.on("stream", (s: MixerStream) => {
+      delivered.push(s);
+    });
+    conn.on("error", () => {});
+
+    ws.receive(encodeData(0, encodeControl({ t: "app", body: {} } as never))); // wedges the loop
+    ws.receive(encodeOpen(1)); // OPEN: registered in MixerConn's stream table synchronously, its 'stream' event queued behind the wedge
+    ws.receive(encodeData(0, encodeControl({ t: "error", code: ErrorCode.INTERNAL_ERROR, message: "boom" } as never))); // ends the connection -- rejectOutstanding tears stream 1 down NOW, before its 'stream' event is ever delivered
+
+    await new Promise((r) => setImmediate(r));
+    expect(delivered).toHaveLength(0); // the stream event is still queued, not dropped
+
+    release();
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(delivered).toHaveLength(1);
+    const stream = delivered[0]!;
+    // Handed to the app already dead: destroyed, with the connection's error
+    // -- never a clean end, and no read/write on it can ever hang.
+    expect(stream.destroyed).toBe(true);
+    expect(stream.errored).toBeTruthy();
+  });
+
+  it("a handler that throws mid-flush does not stop the rest of the backlog from being delivered, and produces no unhandled rejection", async () => {
+    const ws = new FakeWS();
+    const { conn } = await handshaken(ws);
+    const order: string[] = [];
+    const handlerErrors: Array<{ event: string; error: Error }> = [];
+    conn.on("handlerError", (info) => handlerErrors.push(info));
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    conn.on("app", async (b: Record<string, unknown>) => {
+      const i = b.i as number;
+      if (i === 0) {
+        await gate;
+        throw new Error("boom mid-flush");
+      }
+      order.push(`app:${i}`);
+    });
+    conn.on("error", () => {});
+
+    const unhandled: unknown[] = [];
+    const onUnhandledRejection = (reason: unknown) => unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandledRejection);
+    try {
+      ws.receive(encodeData(0, encodeControl({ t: "app", body: { i: 0 } } as never)));
+      ws.receive(encodeData(0, encodeControl({ t: "app", body: { i: 1 } } as never)));
+      ws.receive(encodeData(0, encodeControl({ t: "error", code: ErrorCode.INTERNAL_ERROR, message: "boom" } as never)));
+      await new Promise((r) => setImmediate(r));
+
+      release();
+      await new Promise((r) => setTimeout(r, 10));
+
+      expect(order).toEqual(["app:1"]); // event 1 still delivered despite event 0's handler throwing
+      expect(handlerErrors).toHaveLength(1);
+      expect(handlerErrors[0]!.error.message).toBe("boom mid-flush");
+      expect(unhandled).toHaveLength(0);
+    } finally {
+      process.off("unhandledRejection", onUnhandledRejection);
+    }
+  });
+});
+
+describe("MixerConn abnormal connection death errors open streams, never re-touches an already-closed one (R2)", () => {
+  it("a stream that already fully, cleanly closed both directions before the connection later dies abnormally is unaffected -- already retired, never re-touched", async () => {
+    const ws = new FakeWS();
+    const { conn } = await handshaken(ws, { maxStreams: 4 });
+    let stream: MixerStream | undefined;
+    let sawError = false;
+    conn.on("stream", (s: MixerStream) => {
+      stream = s;
+      s.on("error", () => {
+        sawError = true;
+      });
+    });
+    ws.receive(encodeOpen(1));
+    await new Promise((r) => setImmediate(r));
+    expect(stream).toBeDefined();
+
+    // Both directions close cleanly: the peer's CLOSE, then this side's own.
+    ws.receive(encodeClose(1));
+    stream!.end(); // -> closeWrite(): CLOSE sent, state "closed", retired
+    await new Promise((r) => setImmediate(r));
+    expect(stream!.getState()).toBe("closed");
+    expect(stream!.errored).toBeFalsy(); // ended cleanly, not with an error
+
+    // Now the WHOLE connection dies abnormally (1006, no close frame).
+    ws.emit("close", 1006, Buffer.from(""));
+    await new Promise((r) => setImmediate(r));
+
+    // The already-retired stream is never reached by rejectOutstanding at
+    // all (it's no longer in MixerConn's stream table) -- its clean end
+    // stands, unaffected by the connection's later abnormal death.
+    expect(sawError).toBe(false);
+    expect(stream!.errored).toBeFalsy();
+  });
+});
+
 describe("MixerConn peer error{} handling (item 4)", () => {
   it("records the error and closes with 4000+code immediately, without waiting for the peer", async () => {
     const ws = new FakeWS();

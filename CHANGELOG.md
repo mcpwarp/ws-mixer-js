@@ -2,6 +2,190 @@
 
 All notable changes to `@mcpwarp/ws-mixer` (the JS/TypeScript client SDK) are documented here.
 
+## 0.4.0 - 2026-09-25
+
+- New `TokenUnavailableError` (exported from the package root): a token provider that throws or
+  rejects with an instance of it (directly, or wrapped via `cause`) now gets treated like a failed
+  dial instead of the fatal-by-default verdict every other provider throw/reject still gets — a
+  non-fatal `{phase: "dial", fatal: false}` report, normal full-jitter backoff (it counts as a
+  failed attempt: `reconnect.maxAttempts` applies, the stability rule is unaffected), and the
+  provider's error surfaced verbatim as `cause`, same as before. Detection is `instanceof
+  TokenUnavailableError` only, deliberately not duck-typed on any property or method, so an
+  unrelated library's error can never accidentally turn a genuinely fatal provider failure into an
+  endless retry loop. On the one-time pre-`welcome` refresh-retry's own provider call, a marked
+  failure leaves the retry budget spent and takes this same non-fatal path rather than going fatal
+  or granting a second refresh. On the very first connect, a marked failure no longer rejects
+  `start()`/`connect()` — same as a first-dial network error.
+- A pre-`welcome` token rejection -- an HTTP 401 on the upgrade, or a handshake-phase
+  `UNAUTHORIZED` (`4011`, with or without a preceding `error{}`) -- now gets the same one-time
+  refresh-retry treatment in *either* place, as ONE shared budget: when `token` is a provider
+  function, the SDK calls it again and retries the dial immediately (no backoff); a second
+  rejection, in either shape (`401` then `4011`, or `4011` then `401`), is fatal. A retry dial that
+  instead fails for an unrelated, non-auth reason (a network error, an HTTP 5xx, a transport death
+  before `welcome`) is *not* treated as a second rejection -- it takes the ordinary recoverable path
+  (non-fatal report, normal backoff) -- but the budget stays spent regardless, so a genuine
+  rejection on some later cycle, before the client ever goes stable, is still fatal with no further
+  refresh. Previously only the dial's own HTTP 401 got this retry -- a handshake-phase `4011` was
+  always immediately fatal, even with a token provider present. A **static string** `token` is
+  unaffected: still fatal on the very first rejection of any of the three forms, since there is
+  nothing to refresh (this was already true for HTTP 401 with a static token; it now also
+  explicitly applies to the two handshake-phase forms, which previously had no retry concept at all
+  to skip). Also fixed: this refresh-retry is now unconditional on `reconnect.maxAttempts`/
+  reconnect being disabled (it applies to the very first connect too -- one immediate redial that
+  completes the initial connection is not itself "a reconnect"), matching `ws-mixer-go`'s
+  `dialAndHandshake`; it likewise does not itself increment the attempt counter.
+- The refresh-retry budget above is a client-level flag (not local to one `connectOnce()` call), and
+  re-arms only once the connection reaches stability (see `stableAfter` below), never merely on the
+  next redial -- otherwise a server that welcomes and then closes shortly after could make the
+  client hit the token endpoint on every single reconnect cycle forever.
+- New `reconnect.stableAfter` option (default `10000`ms, next to `base`/`cap`/`connectTimeout`/
+  `maxAttempts`; must be a finite number `>= 0`, or the constructor throws a `RangeError`
+  synchronously, same as `close()`'s `code` validation -- `0` is legal and reproduces the pre-0.4
+  "reset on `welcome`" behaviour): how long a connection must stay up past `welcome` before it's
+  considered stable (WIRE.md/OVERVIEW.md section 2.9's `stable`). Fixed: the backoff attempt
+  counter, and every once-only retry budget re-armed alongside it (4013 KEEPALIVE_TIMEOUT's one-shot
+  immediate retry; the pre-`welcome` token refresh-retry above), now reset only once a connection
+  reaches stability -- **not** on `welcome` itself, as before. Fixed alongside it: 4013's one-shot
+  budget no longer un-spends itself on the very next 4013 (a leftover pre-`stableAfter` line reset
+  the flag back to "unused" immediately after falling back to normal backoff, so four 4013s in a row
+  with no intervening stable connection cycled immediate/backoff/immediate/backoff... forever instead
+  of only the first ever being immediate). A server that welcomes and then immediately closes no
+  longer resets backoff every cycle (which turned it into a redial-roughly-once-a-second loop
+  instead of actually backing off): `4009`/`4014`'s own "start backoff at the cap" treatment is
+  unaffected (still an explicit "refused on purpose, back off hard" rule, not a workaround for the
+  counter's reset timing). Stability is tracked per connection: a `drain` hand-over's retired
+  connection ending, however long after its replacement's own `welcome`, never resets or clears the
+  replacement's own stability timer. `reconnect.maxAttempts`'s doc is updated to match: it now
+  counts consecutive reconnect attempts *without* a stable connection in between.
+- Fixed: `giveUp` (the `reconnect.maxAttempts`-exhaustion path) now mirrors `goFatal` -- it clears
+  the stability timer and detaches-then-fails every live/in-flight conn (`conn`, `dialingConn`,
+  `retiringConn`, which a drain hand-over can leave all pointing at the very same live connection)
+  before reporting. Previously, exhaustion during (for example) a drain hand-over's parallel dial
+  failing could leave the still-live predecessor connection running -- socket, ping/watchdog timers,
+  and the now-orphaned stability timer all still ticking 10s past a client that already reports
+  itself `closed`.
+- Fixed: a transport failure between the 101 upgrade and `welcome` no longer fabricates a
+  semantically-meaningless ws-mixer close code (`wsCode: 4002`, "as if" this side had itself closed
+  with `INTERNAL_ERROR`) depending on whether `ws`'s `'error'` or `'close'` event happened to be
+  delivered first. `'close'` is now the sole reporter for this window (measured against real `ws`
+  8.21: a TCP reset/half-close/peer close frame delivers a bare `'close'` with no `'error'` at all;
+  a protocol-level failure `ws` itself detects delivers `'error'` immediately followed by `'close'`
+  a macrotask or more later -- `'close'` never races `'error'`, it always follows it, if it comes at
+  all); `'error'` only records its message for `'close'`'s report to fall back on when the close
+  itself carries no reason. The report now always carries the close code `ws` actually delivers
+  (`1006` for a genuine abnormal closure, or whatever real close code it sent), never a fabricated
+  one. If `'error'` fires and `'close'` never follows at all, nothing here waits on it: the existing
+  hello/welcome timeout (`wsCode` `4001`) is unaffected and is what eventually reports it, as before
+  -- deliberately the only fallback for that case. The connected phase was checked for the same
+  class of bug and does not have it: an `'error'` there never produces a report by itself (see the
+  `message` bullet below for the one real behaviour change to the connected phase's report shape).
+- Fixed: a second `drain` on the same connection (before its first parallel reconnect resolves) no
+  longer starts a second, redundant parallel dial -- mirrors `ws-mixer-go`, which already ignores a
+  repeat drain the same way.
+- `conformance/adapter/adapter.mjs`: `disconnected.error_name` now prefers the SDK's own
+  `DisconnectReason.errorName` (which already derives the wire name from a bare 4xxx close code, not
+  only from an explicit `error{}`) over re-deriving it from `errorCode` through the adapter's own
+  smaller name table.
+- A disconnect whose close frame carried no reason (from the peer, or a `ws`-level abnormal closure)
+  now reports `message: "socket closed with code N"` instead of an empty string, in both the
+  connected and handshake phases. Previously that fallback text only ever reached the internal
+  `WsMixerError` used to reject in-flight sends and fail the handshake promise; the *emitted*
+  `'close'` event (and so `DisconnectPayload.message`) carried the bare, possibly-empty close
+  reason directly. A non-empty `message` is strictly more useful (and matches `ws-mixer-go`, which
+  reports `"peer closed with code N"` for the same case) -- consumers that want "nothing, if the
+  peer sent nothing" specifically should keep preferring `closeReason` over `message`, as the
+  `closeReason` field's own doc already recommends.
+- Confirmed (no behavior change): `MixerClient.close()`/`close({code,message})` already stop
+  reconnecting in every state, and clear the stability timer alongside the existing backoff timer.
+  Precisely what's reported: one non-fatal disconnect when a connection had actually been
+  established for this cycle; nothing at all when none had (dialing, mid-handshake, or backing off)
+  -- exactly like plain `close()` in those same windows, since there is no connection to send
+  `error{}`/a WS close over in the first place.
+- **Behavior change** (D-2026-09-20-09, cross-SDK alignment with `ws-mixer-go`): `errorCode`/
+  `errorName` are no longer synthesised for anything that isn't a ws-mixer wire close code. An HTTP
+  `401`/`403` upgrade rejection previously carried `errorCode: UNAUTHORIZED` -- it no longer does;
+  `httpStatus` alone still identifies it (`404`/`429`/`5xx` were never affected, they never carried
+  one). Conversely, a **connected**-phase bare close (no preceding `error{}`) in ws-mixer's private-use
+  range `4001`-`4999` now derives both `errorCode`/`errorName` from the wire code the same way the
+  dial/handshake phases already did -- previously only `errorName` was derived there, `errorCode`
+  stayed `undefined`. The derivation itself is unchanged: `errorCode = wsCode - 4000`, `errorName`
+  from the WIRE.md §2.8 table (unknown -> `INTERNAL_ERROR`), restricted to `4001`-`4999` (not `4000`,
+  which is never legitimately on the wire -- `NO_ERROR` closes as `1000`). Also fixed as part of the
+  same alignment: the `'fatal'` event's `WsMixerError.code` now follows this same rule instead of its
+  own, separately-stale `info.errorCode` read -- for an HTTP `401`/`403` it is now `INTERNAL_ERROR`
+  (no ws-mixer code exists for an upgrade rejection) where it used to be `UNAUTHORIZED`, and for a
+  bare `4010`/`4011` close it is now the derived `UNSUPPORTED`/`UNAUTHORIZED` (previously
+  `INTERNAL_ERROR`, mismatching the disconnect reason's own `errorCode` for that same close).
+  Consumers that need to distinguish *why* a fatal happened should branch on the disconnect reason's
+  `httpStatus`/`wsCode`/`errorCode`, not on the fatal error's `code` alone.
+- **Fixed (blocker):** a stream `OPEN`, `app`, or `drain` event already queued for delivery when the
+  connection ended could be silently dropped instead of delivered, whenever an async
+  `onStream`/`onApp`/`onDrain` handler was still in flight at that exact moment (`error{}` is always
+  the *last* message on the wire, so anything queued ahead of it genuinely arrived before the
+  connection ended and is owed delivery — CLIENT-SDK.md's "Handler delivery" row). The delivery loop
+  now finishes flushing whatever was already queued even after the connection has torn down, instead
+  of exiting as soon as `this.closed` flips true out from under an in-flight `await`. **Behaviour
+  change:** `onStream`/`onApp`/`onDrain` (and the `'stream'`/`'app'`/`'drain'` events) may now fire
+  shortly after `MixerClient.close()`/`MixerConn.close()`'s own promise has already resolved, for an
+  event that arrived before that close. A `drain` delivered this way never starts a reconnect for a
+  connection that is no longer the live one: on an already closing/closed client the existing
+  `!this.closing && this.state !== "closed"` guard already covered it, but a `drain` queued behind a
+  blocked handler on a conn that then dies for an *unrelated* reason (its own 'close' handler already
+  ran synchronously and replaced/cleared `this.conn`, and already scheduled the real reconnect) needed
+  a further `this.conn === conn` guard -- without it, the flushed `drain` would still see
+  `!this.closing && this.state !== "closed" && !this.drainReconnectScheduled` all true and spawn a
+  second, parallel reconnect against the already-dead conn, latching `drainReconnectScheduled` and
+  wrongly suppressing the next legitimate close-driven reconnect. Nothing can be newly enqueued once
+  the connection is closed (defensive backstop, in addition to the architectural invariant that the
+  read path always stops before teardown), so the flush is always bounded and terminates.
+- **Fixed:** an open stream whose connection died abnormally (a `1006` tunnel death, or any
+  connection-level failure) with no `'error'` listener attached used to end *cleanly* — `'end'`
+  then `'close'`, with `stream.errored` never set — indistinguishable from the peer's own response
+  legitimately finishing (CLIENT-SDK.md's "Stream teardown on disconnect" row; WIRE.md section 2.9
+  requires the opposite: `io.ErrUnexpectedEOF`-equivalent, unless that stream's own `CLOSE` had
+  already arrived). **Behaviour change**, and it now depends on whether the peer's own `CLOSE` for
+  *that stream* had already arrived when the connection died, per WIRE.md's "`CLOSE` preserves
+  buffered data; `RESET` discards it" rule:
+  - `CLOSE` already arrived: the response DID complete, independent of the connection dying. Node's
+    `push(null)` doesn't discard what's still buffered — it marks EOF, and Node delivers the buffered
+    bytes to the consumer and only then emits `'end'`. `stream.errored` stays `null` and no `'error'`
+    event fires. Only the **write** side fails: a write already pending, or started afterward, fails
+    promptly (its callback receives the connection's error) instead of hanging or silently
+    succeeding.
+  - Otherwise (a peer `RESET`, or the connection ending any other way, with this stream's `CLOSE`
+    never having arrived): the stream always ends with an error, never a false clean end —
+    `stream.errored` carries it, `'close'` fires, and (for a consumer that *did* attach `'error'`)
+    that listener receives it, but `'end'` is never emitted for this case; a read or write already
+    pending, or started afterward, fails promptly. A pending write's callback now also receives the
+    real error instead of being reported as having succeeded, in both cases above. A `RESET` always
+    discards buffered data and errors, even if this stream's `CLOSE` had *also* already arrived
+    (`RESET` always wins). A stream already fully, cleanly closed before the connection died (both
+    directions' `CLOSE` already exchanged) is unaffected — it already ended cleanly and is no longer
+    tracked by the connection at all. `MixerClient`'s class doc comment and README already described
+    the intended behaviour; the code now actually matches it, with no remaining gap against
+    CLIENT-SDK.md's "data already buffered ... still delivered first" rule.
+- **Fixed:** a stream whose peer `CLOSE` had already arrived when the connection died -- the
+  cleanly-ending case in the bullet above -- never actually emitted `'close'` (never got
+  destroyed): `push(null)` delivered the buffered data and `'end'` fired, but nothing then called
+  `destroy()`. It now does: buffered data delivered, `'end'`, then `destroy()`/`'close'`, same as
+  a stream that ends any other way.
+- **Fixed:** in that same state, a write already pending (or started afterward) had its error
+  routed through Node's ordinary Writable error path, which also marks the readable side
+  `errored` and permanently blocks `'end'` -- a consumer draining `data`/`end` on the stream could
+  hang forever waiting behind a write it never awaited. Affected write callbacks are now held and
+  only settled with the terminal error once the read side has finished delivering buffered data
+  and emitted `'end'`, or the stream is destroyed some other way (app `destroy()`, `reset()`). An
+  app that awaits a write's callback without ever reading this stream will wait until it does one
+  or the other.
+- **Fixed:** a fatal close (`UNSUPPORTED`/`UNAUTHORIZED`) on the retiring connection during a
+  `drain` hand-over's parallel dial didn't cancel that in-flight dial: the client emitted
+  `'fatal'` and then flipped back to `"connected"` once the dial's own `welcome` landed, and with
+  `UNAUTHORIZED` it could also redial again via the pre-`welcome` token-refresh-retry loop. The
+  dial is now cancelled (`NO_ERROR`/"client closing") as part of going fatal, and the client stays
+  closed.
+- `conformance/adapter/adapter.mjs` now reports the SDK's real `SDK_VERSION` in `ready`/`hello`
+  instead of a stale hardcoded `"0.1.0"`.
+
 ## 0.3.1 - 2026-09-20
 
 - `DisconnectReason` gains `closeReason`: the reason field of the close frame *received from the

@@ -69,7 +69,11 @@ export function closeCode(code: number): number {
 /**
  * WsMixerError is the single error type this package throws or emits.
  * `fatal` marks a close code the client SDK must never reconnect after
- * (UNSUPPORTED, UNAUTHORIZED, and the client's own auth/handshake failures).
+ * (UNSUPPORTED always; UNAUTHORIZED once it's actually final -- after
+ * `welcome`, or before `welcome` once the one provider refresh-retry has
+ * already been spent (or immediately, with a static token that has nothing
+ * to refresh) -- see client.ts's connectOnce/dialAndHandshakeOnce; and the
+ * client's own auth/handshake failures).
  */
 export class WsMixerError extends Error {
   readonly code: number;
@@ -122,5 +126,26 @@ export class StreamError extends WsMixerError {
   constructor(code: number, streamId: number, message: string) {
     super(code, message, { streamId });
     this.name = "StreamError";
+  }
+}
+
+/**
+ * A token provider's explicit signal that it could not OBTAIN a token for a
+ * temporary reason (a laptop waking before the network is back, the auth
+ * server briefly unreachable while refreshing an expired token) -- as
+ * opposed to a genuinely fatal provider failure (a malformed credential, a
+ * permanently revoked client). Throwing/rejecting with an instance of this
+ * (directly, or wrapped via `cause`) is how a provider opts a dial failure
+ * into client.ts's ordinary non-fatal dial-retry path instead of the
+ * fatal-by-default one every other provider throw/reject still gets --
+ * detection is `instanceof` only, deliberately not duck-typed on any
+ * property or method, so an accidental match on some unrelated library's
+ * error can never turn a genuinely fatal provider failure into an endless
+ * retry loop.
+ */
+export class TokenUnavailableError extends Error {
+  override name = "TokenUnavailableError";
+  constructor(message?: string, options?: { cause?: unknown }) {
+    super(message, options);
   }
 }

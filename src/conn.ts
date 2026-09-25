@@ -257,6 +257,13 @@ export class MixerConn extends EventEmitter {
   private watchdogTimer: ReturnType<typeof setInterval> | null = null;
   private handshakeTimer: ReturnType<typeof setTimeout> | null = null;
   private jitterTimer: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * The most recent pre-welcome `'error'` event's message, recorded so
+   * `onSocketClose`'s report -- the sole reporter, see its own doc comment
+   * -- can use it as `message` when `ws`'s own close carries no reason of
+   * its own.
+   */
+  private pendingHandshakeErrorMessage: string | undefined;
 
   constructor(ws: WSLike, opts: ConnOptions) {
     super();
@@ -569,8 +576,18 @@ export class MixerConn extends EventEmitter {
    * the Go side. Throws ConnError(ENHANCE_YOUR_CALM) if the bounded queue
    * (`max(128, max_streams + 64)`) is full, which the caller (dispatchFrame/
    * dispatchControl, inside onMessage's try/catch) turns into fail().
+   *
+   * Refuses once `this.closed` (CLIENT-SDK.md's "Handler delivery" row):
+   * `dispatchFrame`/`dispatchControl` -- the only callers -- always run
+   * before whatever ends the connection sets `this.closed` (every
+   * fail()/close()/handlePeerError path runs teardownConn synchronously,
+   * `error` is always the last message on the wire), so nothing legitimate
+   * should ever reach here once closed; this is the defensive backstop that
+   * makes runDeliveryLoop's post-close drain below provably bounded and
+   * terminating regardless.
    */
   private enqueueDelivery(ev: DeliveryEvent): void {
+    if (this.closed) return;
     const capacity = Math.max(DELIVERY_QUEUE_MIN, this.maxStreams + DELIVERY_QUEUE_MARGIN);
     if (this.deliveryQueue.length >= capacity) {
       throw new ConnError(ErrorCode.ENHANCE_YOUR_CALM, `application delivery queue full (>${capacity} pending stream/app/drain callbacks)`);
@@ -582,8 +599,22 @@ export class MixerConn extends EventEmitter {
     }
   }
 
+  /**
+   * Drains `deliveryQueue` until empty -- deliberately NOT gated on
+   * `!this.closed` (CLIENT-SDK.md's "Handler delivery" row): an event
+   * already queued when the connection ends is still owed to its handler
+   * (`error` is the last message on the wire, so a stream OPEN/`app`/`drain`
+   * queued ahead of it arrived before the connection ended), so this loop
+   * finishes flushing that backlog even after `teardownConn` has already set
+   * `this.closed` and emitted `'close'` -- a handler MAY therefore run
+   * shortly after `MixerClient.close()`/`MixerConn.close()`'s own promise has
+   * already resolved (see those methods' doc comments and README). `if
+   * (!ev) break` is what actually ends the loop; since `enqueueDelivery`
+   * above refuses once closed, the queue can only shrink from here, so this
+   * always terminates.
+   */
   private async runDeliveryLoop(): Promise<void> {
-    while (!this.closed) {
+    for (;;) {
       const ev = this.deliveryQueue.shift();
       if (!ev) break;
       switch (ev.kind) {
@@ -962,6 +993,10 @@ export class MixerConn extends EventEmitter {
    * (drained) conn: the streams on it aren't erroring, the conn they were
    * riding on is being replaced, so each gets a stream-scoped CANCEL
    * ("connection drained") instead of the connection's own NO_ERROR.
+   *
+   * Synchronous, but any stream/app/drain event still queued for delivery at
+   * this point is not: runDeliveryLoop keeps flushing it after this returns
+   * (see close()'s doc comment above for why).
    */
   fail(err: WsMixerError, streamErrorFactory?: (streamId: number) => WsMixerError): void {
     this.teardownConn(err, true, streamErrorFactory);
@@ -979,7 +1014,16 @@ export class MixerConn extends EventEmitter {
     this.teardownConn(err, false);
   }
 
-  /** Graceful client shutdown: drain{client_requested}, brief grace period, then close(NO_ERROR). */
+  /**
+   * Graceful client shutdown: drain{client_requested}, brief grace period,
+   * then close(NO_ERROR). This resolves once teardownConn's synchronous
+   * steps are done (frame/WS close/rejects/'close' emitted) -- it does NOT
+   * wait for runDeliveryLoop to finish flushing whatever stream/app/drain
+   * backlog was still queued at that point. A handler for an event received
+   * before this close MAY therefore still be invoked shortly after this
+   * promise (and 'close') has already resolved/fired (CLIENT-SDK.md's
+   * "Handler delivery" row).
+   */
   async close(graceMs = 5000): Promise<void> {
     if (this.closed) return;
     if (this.handshakeDone) {
@@ -1022,25 +1066,57 @@ export class MixerConn extends EventEmitter {
    * already `true`, this is a close frame arriving after teardownConn()
    * already ran and reported (never our own echoed close winning a race),
    * and is correctly ignored rather than folded in after the fact.
+   *
+   * Pre-welcome, this is also the SOLE reporter for a transport failure
+   * before `welcome` -- measured against real `ws` (8.21): a TCP reset,
+   * half-close or peer close frame after the 101 delivers a bare 'close'
+   * with no 'error' at all, and a protocol-level failure `ws` itself
+   * detects (an invalid frame: 1002, an oversized message: 1009, ...)
+   * delivers 'error' immediately followed by 'close' a macrotask or more
+   * later -- 'close' is never racing 'error' for which one wins; it always
+   * arrives after it, if it arrives at all. `onSocketError` below therefore
+   * never finalizes anything itself, only records the error's message here
+   * for `message` to fall back on when the close carries no reason of its
+   * own -- so this always reports the *actual* close code `ws` delivers
+   * (1006, or whatever real close code it sent), never a wsCode fabricated
+   * for a close that never happened.
    */
   private onSocketClose(code: number, reason: Buffer): void {
     if (this.closed) return;
     this.closed = true;
     this.stopTimers();
     const reasonStr = reason.toString();
-    const err = new WsMixerError(ErrorCode.INTERNAL_ERROR, reasonStr || `socket closed with code ${code}`, {
+    const handshakePhase = !this.handshakeDone;
+    const message = reasonStr || (handshakePhase ? this.pendingHandshakeErrorMessage : undefined) || `socket closed with code ${code}`;
+    const err = new WsMixerError(ErrorCode.INTERNAL_ERROR, message, {
       wsCode: code,
       closeReason: reasonStr || undefined,
     });
     this.rejectOutstanding(err);
-    if (!this.handshakeDone) this.emit("__handshake_failed_internal", err);
-    this.emit("close", { wsCode: code, message: reasonStr, closeReason: reasonStr || undefined });
+    if (handshakePhase) this.emit("__handshake_failed_internal", err);
+    this.emit("close", { wsCode: code, message, closeReason: reasonStr || undefined });
   }
 
+  /**
+   * Pre-welcome, `'error'` never arrives in the same microtask as (or after)
+   * a 'close' that never comes -- see onSocketClose's own doc comment for
+   * what real `ws` actually does. So this deliberately does NOT reject or
+   * finalize the handshake itself; it just records the error's message for
+   * onSocketClose (the sole reporter) to use as `message` when the close
+   * that follows carries no reason of its own. If `'close'` somehow never
+   * follows at all (a transport that violates `ws`'s own contract), nothing
+   * here is left waiting on it: `handshake()`'s own hello/welcome timeout
+   * (`handshakeTimer`, 10s default) still fires and produces the one report
+   * (`wsCode` 4001) regardless -- deliberately the only fallback for that
+   * case, not a second mechanism grafted on here.
+   */
   private onSocketError(err: Error): void {
-    if (!this.handshakeDone) this.emit("__handshake_failed_internal", new WsMixerError(ErrorCode.INTERNAL_ERROR, err.message));
-    // Guarded (item 2): onSocketClose still follows and emits 'close', so
-    // onDisconnect(reason) still reports this even with no 'error' listener.
+    if (!this.handshakeDone && !this.closed) {
+      this.pendingHandshakeErrorMessage = err.message;
+    }
+    // Guarded (item 2): onSocketClose (or the hello/welcome timeout above)
+    // still follows and emits 'close', so onDisconnect(reason) still
+    // reports this even with no 'error' listener.
     if (this.listenerCount("error") > 0) this.emit("error", new WsMixerError(ErrorCode.INTERNAL_ERROR, err.message));
   }
 

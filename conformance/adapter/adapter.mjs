@@ -17,11 +17,9 @@
 // -- the runner's --adapter shim (or the generic buildGenericAdapter
 // contract, post-split) runs `npm run build` at the repo root before
 // spawning this file, so dist is never stale.
-import { connect } from "../../dist/index.js";
+import { connect, SDK_VERSION } from "../../dist/index.js";
 import { fileURLToPath } from "node:url";
 import fs from "node:fs";
-
-const SDK_VERSION = "0.1.0";
 
 // startTime anchors t_ms (docs/CONFORMANCE.md section 1): milliseconds since
 // this adapter process started, monotonic, stamped on every data,
@@ -413,7 +411,13 @@ async function handleCommand(cmd) {
               e.error_name = info.name;
             } else if (info.errorCode !== undefined) {
               e.error_code = info.errorCode;
-              e.error_name = codeNameOf(info.errorCode);
+              // Prefer the SDK's own errorName when it supplied one (it
+              // already derives the wire name from a bare 4xxx close code
+              // too, not just an explicit error{} -- see DisconnectReason's
+              // own errorName doc); codeNameOf is only a fallback for the
+              // (currently theoretical) case where errorCode is present but
+              // errorName isn't.
+              e.error_name = info.errorName ?? codeNameOf(info.errorCode);
             }
             emit(e);
           },

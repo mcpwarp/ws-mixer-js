@@ -17,7 +17,7 @@ import {
 } from "../src/client.js";
 import { encodeControl, type ControlMessage } from "../src/control.js";
 import { decodeFrame, encodeClose, encodeData, encodeOpen, FrameType } from "../src/frame.js";
-import { ErrorCode, StreamError } from "../src/errors.js";
+import { ErrorCode, StreamError, TokenUnavailableError, WsMixerError } from "../src/errors.js";
 import type { MixerStream } from "../src/stream.js";
 
 /** Asserts the invariant blocker 3 requires: `currentState() === "connected"` never coincides with `currentConn() === null`. */
@@ -25,6 +25,21 @@ function assertConnInvariant(client: MixerClient): void {
   if (client.currentState() === "connected") {
     expect(client.currentConn()).not.toBeNull();
   }
+}
+
+/** Builds a `welcome` control frame and pushes it to `socket`, for tests that disable `autoWelcome` and drive the handshake by hand. */
+function pushWelcome(socket: FakeSocket, overrides: Partial<ControlMessage> = {}): void {
+  const welcome = {
+    t: "welcome",
+    v: 1,
+    session: "test-session",
+    window: 262144,
+    max_streams: 64,
+    ping_interval: 30000,
+    ping_timeout: 90000,
+    ...overrides,
+  } as ControlMessage;
+  socket.push(encodeData(0, encodeControl(welcome)));
 }
 
 // --- fake transport ----------------------------------------------------------
@@ -149,6 +164,11 @@ function makeFactory(
  * of nextTick/immediate hops deep, which plain `await Promise.resolve()`
  * chains alone don't reliably drain. `vi.advanceTimersByTimeAsync(0)` (every
  * test here runs under `vi.useFakeTimers()`) flushes both.
+ *
+ * Note: under fake timers, a timer scheduled with a delay under 1ms is
+ * indistinguishable from "already due" and fires inside this zero-advance
+ * flush -- so a test must not assert "this timer has not fired yet" for an
+ * unpinned `Math.random()`-jittered delay unless it pins `Math.random` first.
  */
 async function tick(n = 5): Promise<void> {
   for (let i = 0; i < n; i++) {
@@ -199,17 +219,31 @@ describe("fullJitterDelay", () => {
   });
 });
 
+describe("MixerClient reconnect.stableAfter validation", () => {
+  for (const bad of [NaN, -1, Infinity, -Infinity]) {
+    it(`throws a RangeError synchronously for stableAfter: ${bad}`, () => {
+      expect(() => new MixerClient("wss://x/tunnel", { token: "t", reconnect: { stableAfter: bad } })).toThrow(
+        RangeError,
+      );
+    });
+  }
+
+  it("accepts stableAfter: 0", () => {
+    expect(() => new MixerClient("wss://x/tunnel", { token: "t", reconnect: { stableAfter: 0 } })).not.toThrow();
+  });
+});
+
 // --- end-to-end reconnect policy against a fake transport ---------------------
 
 describe("MixerClient reconnect policy", () => {
-  it("resets the attempt counter only on welcome, never on a bare dial success", async () => {
+  it("does NOT reset the attempt counter on welcome alone: a welcome-then-immediate-close (well before stableAfter) keeps counting", async () => {
     vi.useFakeTimers();
     const sockets: FakeSocket[] = [];
     const reconnecting: Array<{ attempt: number; delayMs: number; cause: string }> = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
       _wsFactory: makeFactory(sockets),
-      reconnect: { base: 1000, cap: 60000 },
+      reconnect: { base: 1000, cap: 60000, stableAfter: 10000 },
     });
     client.on("reconnecting", (info) => reconnecting.push(info));
 
@@ -230,11 +264,13 @@ describe("MixerClient reconnect policy", () => {
     await connectSocket(sockets, 1);
     await started;
 
-    // A second, independent failure must start counting from attempt 1 again.
+    // Immediately (well inside stableAfter's 10s window) drop again: since
+    // this conn never proved stable, `attempt` must NOT have reset --
+    // 0.3.1's "reset on welcome" rule is gone (Change 2).
     sockets[1]!.serverClose(1006, "abnormal");
     await tick();
     expect(reconnecting).toHaveLength(2);
-    expect(reconnecting[1]!.attempt).toBe(1);
+    expect(reconnecting[1]!.attempt).toBe(2);
 
     await client.close();
   });
@@ -374,11 +410,11 @@ describe("MixerClient reconnect policy", () => {
   });
 
   for (const code of [4000 + ErrorCode.UNSUPPORTED, 4000 + ErrorCode.UNAUTHORIZED]) {
-    it(`close ${code} is fatal: no reconnect, 'fatal' fires, onDisconnect({fatal:true})`, async () => {
+    it(`close ${code} is fatal: no reconnect, 'fatal' fires, onDisconnect({fatal:true}), and the 'fatal' event's error code matches the disconnect payload's derived errorCode (not INTERNAL_ERROR)`, async () => {
       vi.useFakeTimers();
       const sockets: FakeSocket[] = [];
-      const fatalEvents: unknown[] = [];
-      const disconnects: Array<{ fatal: boolean }> = [];
+      const fatalEvents: WsMixerError[] = [];
+      const disconnects: DisconnectPayload[] = [];
       const client = new MixerClient("wss://x/tunnel", {
         token: "t",
         _wsFactory: makeFactory(sockets),
@@ -397,8 +433,48 @@ describe("MixerClient reconnect policy", () => {
       expect(sockets.length).toBe(1); // never retried
       expect(fatalEvents).toHaveLength(1);
       expect(disconnects.at(-1)?.fatal).toBe(true);
+      // A bare close (no preceding error{}) still derives errorCode from the
+      // wire code -- the 'fatal' event's WsMixerError.code must match it,
+      // not fall back to INTERNAL_ERROR just because MixerConn itself never
+      // set info.errorCode.
+      const derivedErrorCode = code - 4000;
+      expect(disconnects.at(-1)?.errorCode).toBe(derivedErrorCode);
+      expect(fatalEvents[0]!.code).toBe(derivedErrorCode);
     });
   }
+
+  it("a missing/mismatched subprotocol echo is fatal: errorCode UNSUPPORTED, no wsCode, no httpStatus -- the SDK itself raised this, not a ws-mixer close code or an HTTP rejection", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    const fatalEvents: unknown[] = [];
+    const disconnects: DisconnectPayload[] = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: "t",
+      _wsFactory: makeFactory(sockets),
+      onDisconnect: (r) => disconnects.push(r),
+    });
+    client.on("fatal", (e) => fatalEvents.push(e));
+
+    const started = client.start();
+    started.catch(() => {});
+    await tick();
+    sockets[0]!.open("some-other-protocol");
+    await tick();
+    await vi.advanceTimersByTimeAsync(120000); // give a buggy implementation every chance to retry
+
+    await expect(started).rejects.toBeTruthy();
+    expect(sockets.length).toBe(1); // never retried
+    expect(fatalEvents).toHaveLength(1);
+    expect(disconnects).toHaveLength(1);
+    expect(disconnects[0]).toMatchObject({
+      phase: "dial",
+      fatal: true,
+      errorCode: ErrorCode.UNSUPPORTED,
+      errorName: "UNSUPPORTED",
+      wsCode: undefined,
+      httpStatus: undefined,
+    });
+  });
 
   it("HTTP 401 during the initial dial is fatal: connect() rejects, never retries", async () => {
     vi.useFakeTimers();
@@ -553,6 +629,330 @@ describe("MixerClient reconnect policy", () => {
       expect(openCount()).toBeLessThanOrEqual(1);
       void s;
     }
+
+    await client.close();
+  });
+});
+
+// --- Change 2: the attempt counter (and the once-only budgets it gates) ------
+// resets only once a connection has stayed up `stableAfter` ms past welcome,
+// never on welcome itself ------------------------------------------------------
+
+describe("MixerClient stability (reconnect.stableAfter)", () => {
+  it("welcome-then-immediate-close, repeated: 'reconnecting' delays keep climbing instead of resetting every cycle", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, "random").mockReturnValue(1); // pin full-jitter's sample to its ceiling for an exact sequence
+    const sockets: FakeSocket[] = [];
+    const reconnecting: Array<{ attempt: number; delayMs: number }> = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: "t",
+      _wsFactory: makeFactory(sockets),
+      reconnect: { base: 1000, cap: 60000, stableAfter: 10000 },
+    });
+    client.on("reconnecting", (info) => reconnecting.push(info));
+
+    const started = client.start();
+    started.catch(() => {});
+    await connectSocket(sockets, 0);
+    await started;
+
+    // Three welcome-then-immediate-close cycles, each well inside the 10s
+    // stability window: with Math.random pinned to 1, the ceiling itself is
+    // the delay, so this pins the exact climbing sequence up to the cap.
+    const expected = [2000, 4000, 8000];
+    for (let i = 0; i < expected.length; i++) {
+      sockets.at(-1)!.serverClose(1006, "abnormal");
+      await tick();
+      expect(reconnecting).toHaveLength(i + 1);
+      expect(reconnecting[i]!.attempt).toBe(i + 1);
+      expect(reconnecting[i]!.delayMs).toBe(expected[i]);
+      await vi.advanceTimersByTimeAsync(expected[i]!);
+      await connectSocket(sockets, sockets.length - 1);
+      await tick();
+    }
+
+    await client.close();
+  });
+
+  it("does NOT reset the delay before stableAfter elapses, but does once a connection survives it (distinguishes from reset-on-welcome: see the revert-proof test below)", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, "random").mockReturnValue(1);
+    const sockets: FakeSocket[] = [];
+    const reconnecting: Array<{ attempt: number; delayMs: number }> = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: "t",
+      _wsFactory: makeFactory(sockets),
+      reconnect: { base: 1000, cap: 60000, stableAfter: 10000 },
+    });
+    client.on("reconnecting", (info) => reconnecting.push(info));
+
+    const started = client.start();
+    started.catch(() => {});
+    await connectSocket(sockets, 0);
+    await started;
+
+    // One unstable cycle first, to bump attempt off zero.
+    sockets.at(-1)!.serverClose(1006, "abnormal");
+    await tick();
+    expect(reconnecting[0]!.delayMs).toBe(2000); // base*2^1
+    await vi.advanceTimersByTimeAsync(2000);
+    await connectSocket(sockets, sockets.length - 1);
+    await tick();
+
+    // Drop again almost immediately -- well short of stableAfter (10000ms).
+    // A reset-on-welcome implementation (0.3.1's rule) would already have
+    // reset `attempt` to 0 the instant that last `welcome` landed, so this
+    // delay would be back at 2000ms; the real rule (reset only at
+    // stability) instead keeps climbing.
+    await vi.advanceTimersByTimeAsync(1000);
+    sockets.at(-1)!.serverClose(1006, "abnormal");
+    await tick();
+    expect(reconnecting).toHaveLength(2);
+    expect(reconnecting[1]!.attempt).toBe(2);
+    expect(reconnecting[1]!.delayMs).toBe(4000); // base*2^2 -- NOT reset
+    await vi.advanceTimersByTimeAsync(4000);
+    await connectSocket(sockets, sockets.length - 1);
+    await tick();
+
+    // This time, let it stay up for the full stability window before dropping.
+    await vi.advanceTimersByTimeAsync(10000);
+    sockets.at(-1)!.serverClose(1006, "abnormal");
+    await tick();
+
+    expect(reconnecting).toHaveLength(3);
+    // Back at the first step (base*2^1), not base*2^3 -- stability reset attempt to 0.
+    expect(reconnecting[2]!.attempt).toBe(1);
+    expect(reconnecting[2]!.delayMs).toBe(2000);
+
+    await vi.advanceTimersByTimeAsync(2000);
+    await client.close();
+  });
+
+  it("a drain hand-over's retiring conn closing after its replacement's welcome does not clear (or falsely reset) the replacement's own timer -- the replacement still needs its own full stableAfter before resetting", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, "random").mockReturnValue(1);
+    const sockets: FakeSocket[] = [];
+    const reconnecting: Array<{ attempt: number; delayMs: number }> = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: "t",
+      _wsFactory: makeFactory(sockets),
+      reconnect: { base: 1000, cap: 60000, stableAfter: 10000 },
+    });
+    client.on("reconnecting", (info) => reconnecting.push(info));
+
+    const started = client.start();
+    started.catch(() => {});
+    const s0 = await connectSocket(sockets, 0);
+    await started;
+
+    // Bump attempt off zero with one unstable cycle first, so a later reset
+    // is actually observable.
+    s0.serverClose(1006, "abnormal");
+    await tick();
+    expect(reconnecting[0]!.delayMs).toBe(2000);
+    await vi.advanceTimersByTimeAsync(2000);
+    const s1 = await connectSocket(sockets, 1);
+    await tick();
+
+    // Drain immediately (well before s1 itself would ever prove stable): a
+    // parallel reconnect starts (connectOnce's own delayMs>0 branch emits its
+    // own 'reconnecting', unrelated to `attempt`), its own welcome arms ITS
+    // own timer, and (per connectOnce's success path) s1 is torn down
+    // (old.fail()) right away -- s1's close must NOT clear (or, worse,
+    // falsely appear to reset) s2's freshly-armed timer.
+    s1.push(encodeData(0, encodeControl({ t: "drain", reason: "rollout", last_stream_id: 0 } as ControlMessage)));
+    await tick();
+    await vi.advanceTimersByTimeAsync(2000); // drain's own jitter window
+    await connectSocket(sockets, 2);
+    await tick();
+    expect(s1.closedWith).not.toBeNull(); // superseded, torn down synchronously
+
+    // Drop s2 almost immediately -- well short of ITS OWN stableAfter. If
+    // s1's earlier close (or the drain hand-over itself) had wrongly reset
+    // anything, this delay would be back at the first step (2000ms); it must
+    // instead still be climbing from the pre-drain attempt count.
+    await vi.advanceTimersByTimeAsync(1000);
+    sockets[2]!.serverClose(1006, "abnormal");
+    await tick();
+    expect(reconnecting).toHaveLength(3);
+    expect(reconnecting[2]!.attempt).toBe(2);
+    expect(reconnecting[2]!.delayMs).toBe(4000); // NOT reset
+    await vi.advanceTimersByTimeAsync(4000);
+    await connectSocket(sockets, 3);
+    await tick();
+
+    // NOW let this connection actually stay up for its own full
+    // stableAfter: the reset genuinely happens once elapsed time earns it,
+    // not merely because "some welcome happened somewhere".
+    await vi.advanceTimersByTimeAsync(10000);
+    sockets[3]!.serverClose(1006, "abnormal");
+    await tick();
+
+    expect(reconnecting).toHaveLength(4);
+    expect(reconnecting[3]!.attempt).toBe(1);
+    expect(reconnecting[3]!.delayMs).toBe(2000);
+
+    await vi.advanceTimersByTimeAsync(2000);
+    await client.close();
+  });
+
+  it("4013's one-shot immediate retry does not un-spend itself on the second 4013: four consecutive 4013s before stability go immediate, backoff, backoff, backoff (climbing), then immediate again once stable", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, "random").mockReturnValue(1); // pin full-jitter's sample to its ceiling for an exact sequence
+    const sockets: FakeSocket[] = [];
+    const reconnecting: Array<{ attempt: number; delayMs: number }> = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: "t",
+      _wsFactory: makeFactory(sockets),
+      reconnect: { base: 1000, cap: 60000, stableAfter: 10000 },
+    });
+    client.on("reconnecting", (info) => reconnecting.push(info));
+
+    const started = client.start();
+    started.catch(() => {});
+    await connectSocket(sockets, 0);
+    await started;
+
+    // 4013 #1: the one-shot immediate retry -- no backoff, no 'reconnecting'.
+    sockets[0]!.serverClose(4000 + ErrorCode.KEEPALIVE_TIMEOUT, "no pong");
+    await tick();
+    expect(sockets.length).toBe(2);
+    expect(reconnecting).toHaveLength(0);
+    await connectSocket(sockets, 1);
+    await tick();
+
+    // 4013 #2, well before stability: the BLOCKER this test exists to catch
+    // -- a buggy implementation that un-spends the budget right back to
+    // "unused" on this very close (instead of only at stability) would
+    // immediately retry AGAIN here, keeping sockets.length at 2 forever
+    // instead of ever backing off. It must back off instead, with a
+    // climbing delay like any other normal-backoff disconnect.
+    sockets[1]!.serverClose(4000 + ErrorCode.KEEPALIVE_TIMEOUT, "no pong again");
+    await tick();
+    expect(sockets.length).toBe(2); // no third socket yet
+    expect(reconnecting).toHaveLength(1);
+    expect(reconnecting[0]!.delayMs).toBe(4000); // attempt 2: base*2^2
+    await vi.advanceTimersByTimeAsync(4000);
+    await connectSocket(sockets, 2);
+    await tick();
+
+    // 4013 #3: still no immediate retry (budget stays spent), delay keeps climbing.
+    sockets[2]!.serverClose(4000 + ErrorCode.KEEPALIVE_TIMEOUT, "no pong a third time");
+    await tick();
+    expect(sockets.length).toBe(3);
+    expect(reconnecting).toHaveLength(2);
+    expect(reconnecting[1]!.delayMs).toBe(8000); // attempt 3: base*2^3
+    await vi.advanceTimersByTimeAsync(8000);
+    await connectSocket(sockets, 3);
+    await tick();
+
+    // This connection survives stability: attempt AND the 4013 budget reset.
+    await vi.advanceTimersByTimeAsync(10000);
+
+    // 4013 #4: immediate again, exactly like the very first one.
+    sockets[3]!.serverClose(4000 + ErrorCode.KEEPALIVE_TIMEOUT, "no pong once more");
+    await tick();
+    expect(sockets.length).toBe(5);
+    expect(reconnecting).toHaveLength(2); // still no 'reconnecting' for this immediate retry
+
+    await client.close();
+  });
+
+  it("maxAttempts counts consecutive reconnects without a stable connection in between: welcome-then-close cycles exhaust it and go fatal", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    const disconnects: DisconnectPayload[] = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: "t",
+      _wsFactory: makeFactory(sockets),
+      reconnect: { base: 1, cap: 10, maxAttempts: 3, stableAfter: 10000 },
+      onDisconnect: (r) => disconnects.push(r),
+    });
+
+    const started = client.start();
+    started.catch(() => {});
+    await connectSocket(sockets, 0);
+    await started;
+
+    // Three welcome-then-close cycles, each redialing successfully but never
+    // staying up long enough to prove stable -- `attempt` climbs 1, 2, 3
+    // across them (maxAttempts:3 hasn't been reached YET after the third:
+    // the exhaustion check runs before the increment, so the third close
+    // still gets its redial).
+    for (let i = 0; i < 3; i++) {
+      sockets.at(-1)!.serverClose(1006, "abnormal");
+      await tick();
+      await vi.advanceTimersByTimeAsync(10);
+      await connectSocket(sockets, sockets.length - 1);
+      await tick();
+    }
+    expect(client.currentState()).toBe("connected");
+
+    // The fourth close is the one that finds attempt(3) >= maxAttempts(3):
+    // give up instead of redialing again.
+    sockets.at(-1)!.serverClose(1006, "abnormal");
+    await tick();
+
+    expect(client.currentState()).toBe("closed");
+    expect(disconnects.at(-1)?.fatal).toBe(true);
+    expect(disconnects.at(-1)?.message).toContain("max reconnect attempts");
+  });
+
+  it("close() clears every timer (including the stability timer), a general hygiene check -- not itself a Change-2-specific proof", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: "t",
+      _wsFactory: makeFactory(sockets),
+      reconnect: { stableAfter: 10000 },
+    });
+
+    const started = client.start();
+    started.catch(() => {});
+    await connectSocket(sockets, 0);
+    await started;
+
+    await client.close();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("stableAfter: 0 reproduces the pre-0.4 reset-on-welcome behaviour (a config-level approximation, not a real source revert -- an actual revert of armStabilityTimer's reset timing was separately confirmed to fail 5 tests in this suite)", async () => {
+    // Approximates the pre-Change-2 "reset on welcome" behaviour by driving
+    // armStabilityTimer's effect immediately instead of waiting for
+    // stableAfter, and confirms the climbing-sequence assertion the test
+    // above relies on would indeed have failed under the old rule -- i.e.
+    // this suite is not accidentally passing for an unrelated reason.
+    vi.useFakeTimers();
+    vi.spyOn(Math, "random").mockReturnValue(1);
+    const sockets: FakeSocket[] = [];
+    const reconnecting: Array<{ attempt: number; delayMs: number }> = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: "t",
+      _wsFactory: makeFactory(sockets),
+      // stableAfter: 0 reproduces "reset on welcome" -- the timer fires on
+      // the very next tick after welcome, just like the old unconditional reset did.
+      reconnect: { base: 1000, cap: 60000, stableAfter: 0 },
+    });
+    client.on("reconnecting", (info) => reconnecting.push(info));
+
+    const started = client.start();
+    started.catch(() => {});
+    await connectSocket(sockets, 0);
+    await started;
+
+    for (let i = 0; i < 2; i++) {
+      sockets.at(-1)!.serverClose(1006, "abnormal");
+      await tick();
+      await vi.advanceTimersByTimeAsync(reconnecting.at(-1)!.delayMs);
+      await connectSocket(sockets, sockets.length - 1);
+      await tick();
+    }
+
+    // With stableAfter effectively 0, every cycle resets attempt back to 0
+    // before the next close -- delay never climbs past the first step,
+    // unlike the real default-stableAfter test above.
+    expect(reconnecting[0]!.delayMs).toBe(2000);
+    expect(reconnecting[1]!.delayMs).toBe(2000);
 
     await client.close();
   });
@@ -728,6 +1128,277 @@ describe("MixerClient drain handling", () => {
     expect(disconnects).toHaveLength(0);
 
     await client.close();
+    await client.close();
+  });
+
+  it("item 8: a second `drain` on the same connection does not spawn a second parallel reconnect", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    const client = new MixerClient("wss://x/tunnel", { token: "t", _wsFactory: makeFactory(sockets) });
+    const drains: unknown[] = [];
+    client.on("drain", (d) => drains.push(d));
+
+    const started = client.start();
+    started.catch(() => {});
+    const s0 = await connectSocket(sockets, 0);
+    await started;
+
+    // Two `drain`s on the same connection, before the first's parallel dial
+    // has resolved -- mirrors the Go SDK, which ignores a repeat drain the
+    // same way (handleServerDrain's own drainReconnectScheduled check): only
+    // ONE parallel reconnect may be in flight per superseded connection, or
+    // two could both race to spend the client-level unauthorizedRetryUsed
+    // budget (Change 1).
+    s0.push(drainFrame());
+    s0.push(drainFrame());
+    await tick();
+    await vi.advanceTimersByTimeAsync(2000); // drain's jitter window
+
+    expect(drains).toHaveLength(2); // the app still hears about both
+    expect(sockets.length).toBe(2); // but only one parallel dial started
+
+    await connectSocket(sockets, 1);
+    await tick();
+    expect(client.currentState()).toBe("connected");
+
+    await client.close();
+  });
+
+  it("R1: a `drain` queued behind a blocked onApp handler is still delivered after client.close() already resolved, and does not start a reconnect", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    const drains: Array<{ reason: string }> = [];
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const client = new MixerClient("wss://x/tunnel", {
+      token: "t",
+      _wsFactory: makeFactory(sockets),
+      onApp: async () => {
+        await gate; // wedges MixerConn's delivery loop
+      },
+      onDrain: (d) => drains.push(d),
+    });
+
+    const started = client.start();
+    started.catch(() => {});
+    const s0 = await connectSocket(sockets, 0);
+    await started;
+
+    s0.push(encodeData(0, encodeControl({ t: "app", body: {} } as never))); // wedges the delivery loop
+    s0.push(drainFrame()); // queued behind the wedge
+    await tick();
+    expect(drains).toHaveLength(0); // still queued, not yet delivered
+
+    const closePromise = client.close(); // starts closing NOW, while the drain is still queued
+    await tick();
+
+    release(); // let the wedged onApp handler -- and then the queued drain -- proceed
+    await tick();
+
+    expect(drains).toHaveLength(1); // still delivered, after close() already started
+    expect(sockets.length).toBe(1); // no reconnect scheduled for the flushed drain: client was already closing
+    await closePromise;
+  });
+
+  it("R1 regression: a `drain` queued behind a blocked onApp handler, delivered after the conn already died for an unrelated (non-close()) reason, does not spawn a second reconnect and does not leave the latch stuck", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, "random").mockReturnValue(1); // pin backoff delays to their ceiling
+    const sockets: FakeSocket[] = [];
+    const drains: Array<{ reason: string }> = [];
+    const reconnecting: Array<{ delayMs: number }> = [];
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const client = new MixerClient("wss://x/tunnel", {
+      token: "t",
+      _wsFactory: makeFactory(sockets),
+      reconnect: { base: 1000, cap: 60000 },
+      onApp: async () => {
+        await gate; // wedges MixerConn's delivery loop
+      },
+      onDrain: (d) => drains.push(d),
+    });
+    client.on("reconnecting", (info) => reconnecting.push(info));
+
+    const started = client.start();
+    started.catch(() => {});
+    const s0 = await connectSocket(sockets, 0);
+    await started;
+
+    s0.push(encodeData(0, encodeControl({ t: "app", body: {} } as never))); // wedges the delivery loop
+    s0.push(drainFrame()); // queued behind the wedge
+    await tick();
+    expect(drains).toHaveLength(0); // still queued, not yet delivered
+
+    // The conn dies for an UNRELATED reason (a peer error{9}, not client.close())
+    // while the drain is still queued behind the wedge: its own 'close'
+    // handler runs synchronously right now -- this.conn = null, one ordinary
+    // reconnect scheduled -- all before the wedged app handler (and the
+    // drain behind it) ever gets to run.
+    s0.push(encodeData(0, encodeControl({ t: "error", code: ErrorCode.ENHANCE_YOUR_CALM, message: "too many stream-0 messages" } as never)));
+    await tick();
+    expect(sockets.length).toBe(1); // no new dial yet -- only the backoff timer was armed
+    expect(reconnecting).toHaveLength(1); // the one ordinary reconnect from the close
+
+    release(); // let the wedged app handler -- and then the queued drain -- proceed
+    await tick();
+
+    expect(drains).toHaveLength(1); // still delivered (Handler delivery: still owed)
+    expect(reconnecting).toHaveLength(1); // NOT a second, parallel reconnect from the flushed drain
+
+    // Fire exactly the one scheduled backoff: exactly ONE further socket is dialled.
+    await vi.advanceTimersByTimeAsync(reconnecting[0]!.delayMs);
+    expect(sockets.length).toBe(2);
+
+    await connectSocket(sockets, 1);
+    await tick();
+    expect(client.currentState()).toBe("connected");
+
+    // The latch isn't stuck: a later ordinary close still schedules a reconnect.
+    sockets[1]!.serverClose(1006, "abnormal");
+    await tick();
+    expect(reconnecting).toHaveLength(2);
+
+    await client.close();
+  });
+
+  it("BUG 3: a fatal close on the retiring conn while the drain's parallel dial is still mid-handshake fails that dial too -- the client never flips back to 'connected'", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    const fatalEvents: WsMixerError[] = [];
+    // autoWelcome:false so the test controls exactly when (or whether) the
+    // parallel dial's welcome lands, to land it squarely mid-handshake.
+    const client = new MixerClient("wss://x/tunnel", { token: "t", _wsFactory: makeFactory(sockets, { autoWelcome: false }) });
+    client.on("fatal", (e) => fatalEvents.push(e));
+
+    const started = client.start();
+    started.catch(() => {});
+    await tick();
+    sockets[0]!.open();
+    await tick();
+    pushWelcome(sockets[0]!);
+    await tick();
+    await started;
+    expect(client.currentState()).toBe("connected");
+
+    // Drain: the parallel dial starts (sockets[1]) but is deliberately left
+    // mid-handshake -- dialed and hello sent, no welcome yet.
+    sockets[0]!.push(drainFrame());
+    await tick();
+    await vi.advanceTimersByTimeAsync(2000); // drain's jitter window
+    expect(sockets.length).toBe(2);
+    sockets[1]!.open();
+    await tick(); // hello sent on sockets[1]; still no welcome -- genuinely mid-handshake
+
+    // The retiring conn (sockets[0], still `this.conn` until the replacement
+    // welcomes) now closes with a fatal code.
+    sockets[0]!.serverClose(4000 + ErrorCode.UNSUPPORTED, "version mismatch");
+    await tick();
+
+    expect(fatalEvents).toHaveLength(1);
+    expect(client.currentState()).toBe("closed");
+    // The abandoned parallel dial must actually be closed, not left dangling.
+    expect(sockets[1]!.closedWith).not.toBeNull();
+
+    // Even if a welcome somehow still arrived for it (a slow reply racing the
+    // abort), it must not resurrect the client back to "connected".
+    pushWelcome(sockets[1]!);
+    await tick();
+    expect(client.currentState()).toBe("closed");
+    expect(fatalEvents).toHaveLength(1); // still exactly one fatal report
+
+    await client.close();
+  });
+
+  it("BUG 3 variant: the drain's parallel dial's welcome lands just BEFORE the retiring conn's fatal close is processed -- connectOnce's own `attempt.ok` guard (not the fatal branch's dialingConn cleanup) is what stops it from flipping the client back to 'connected'", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    const fatalEvents: WsMixerError[] = [];
+    const client = new MixerClient("wss://x/tunnel", { token: "t", _wsFactory: makeFactory(sockets, { autoWelcome: false }) });
+    client.on("fatal", (e) => fatalEvents.push(e));
+
+    const started = client.start();
+    started.catch(() => {});
+    await tick();
+    sockets[0]!.open();
+    await tick();
+    pushWelcome(sockets[0]!);
+    await tick();
+    await started;
+    expect(client.currentState()).toBe("connected");
+
+    sockets[0]!.push(drainFrame());
+    await tick();
+    await vi.advanceTimersByTimeAsync(2000); // drain's jitter window
+    expect(sockets.length).toBe(2);
+    sockets[1]!.open();
+    await tick(); // hello sent on sockets[1]; still mid-handshake
+
+    // The parallel dial's welcome and the retiring conn's fatal close arrive
+    // back-to-back, with no `tick()` between them: the welcome's handshake
+    // resolution (dialAndHandshakeOnce's `attempt.ok`) and the fatal branch's
+    // own `dialingConn.fail()` cleanup then race in the same microtask
+    // window -- exactly the case connectOnce's own `attempt.ok` guard, not
+    // that cleanup, has to catch.
+    pushWelcome(sockets[1]!);
+    sockets[0]!.serverClose(4000 + ErrorCode.UNSUPPORTED, "version mismatch");
+    await tick();
+
+    expect(fatalEvents).toHaveLength(1);
+    expect(client.currentState()).toBe("closed");
+    expect(sockets[1]!.closedWith).not.toBeNull(); // the promoted-then-abandoned dial is actually closed, not left dangling
+
+    await client.close();
+  });
+
+  it("a fatal UNAUTHORIZED (4011) close on the retiring conn while the drain's parallel dial is still mid-handshake does not re-dial with a fresh token: the token-provider retry budget is left unspent and no third socket is opened", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    const fatalEvents: WsMixerError[] = [];
+    let calls = 0;
+    const provider = () => {
+      calls++;
+      return `token-${calls}`;
+    };
+    const client = new MixerClient("wss://x/tunnel", { token: provider, _wsFactory: makeFactory(sockets, { autoWelcome: false }) });
+    client.on("fatal", (e) => fatalEvents.push(e));
+
+    const started = client.start();
+    started.catch(() => {});
+    await tick();
+    sockets[0]!.open();
+    await tick();
+    pushWelcome(sockets[0]!);
+    await tick();
+    await started;
+    expect(client.currentState()).toBe("connected");
+    expect(calls).toBe(1);
+
+    // Drain: the parallel dial starts (sockets[1], a fresh token-2) but is
+    // deliberately left mid-handshake.
+    sockets[0]!.push(drainFrame());
+    await tick();
+    await vi.advanceTimersByTimeAsync(2000); // drain's jitter window
+    expect(sockets.length).toBe(2);
+    expect(calls).toBe(2);
+    sockets[1]!.open();
+    await tick(); // hello sent on sockets[1]; still mid-handshake
+
+    // The retiring conn (sockets[0]) now closes fatally with UNAUTHORIZED
+    // (4011). Before the fix, failing the mid-handshake dial with that same
+    // UNAUTHORIZED error made connectOnce's own unauthorized-retry loop treat
+    // it as a fresh rejection and re-dial with yet another token, even though
+    // the client had already gone fatal.
+    sockets[0]!.serverClose(4000 + ErrorCode.UNAUTHORIZED, "token revoked");
+    await tick();
+    await vi.advanceTimersByTimeAsync(2000); // nothing scheduled, but drain the timer queue just in case
+
+    expect(fatalEvents).toHaveLength(1);
+    expect(client.currentState()).toBe("closed");
+    expect(calls).toBe(2); // the provider is NOT called a third time
+    expect(sockets.length).toBe(2); // no third socket is dialed
+    expect(sockets[1]!.closedWith).not.toBeNull(); // the abandoned mid-handshake dial is still actually closed
+
+    await client.close();
   });
 });
 
@@ -868,20 +1539,6 @@ describe("MixerClient drain respects maxAttempts", () => {
 });
 
 describe("MixerClient item 1: a pre-welcome drain does not desync the reconnect state machine", () => {
-  function pushWelcome(socket: FakeSocket, overrides: Partial<ControlMessage> = {}): void {
-    const welcome = {
-      t: "welcome",
-      v: 1,
-      session: "test-session",
-      window: 262144,
-      max_streams: 64,
-      ping_interval: 30000,
-      ping_timeout: 90000,
-      ...overrides,
-    } as ControlMessage;
-    socket.push(encodeData(0, encodeControl(welcome)));
-  }
-
   it("fails the dialing conn without setting retiringConn/drainReconnectScheduled; a later 1006 still schedules a dial", async () => {
     vi.useFakeTimers();
     const sockets: FakeSocket[] = [];
@@ -931,19 +1588,14 @@ describe("MixerClient item 1: a pre-welcome drain does not desync the reconnect 
 
 describe("MixerClient item 6: reconnectImmediately respects maxAttempts", () => {
   // End-to-end (a full 4012 flap loop where every replacement also
-  // completes a fresh welcome) can't observe the ceiling directly: welcome
-  // resets `attempt` to 0 on every success (OVERVIEW.md section 2.9: "reset
-  // backoff counter HERE, nowhere else"), so a flap loop that always
-  // reconnects successfully never accumulates attempts in the first place --
-  // by design, only a flap loop that never gets to `welcome` should be
-  // bounded. That is exactly reconnectImmediately's own job: it must count
-  // every immediate-reconnect *attempt* against the ceiling itself, so a
-  // caller who wires it up when replacements keep failing before welcome
-  // (a real "stuck" 4012 loop) is protected regardless of how failure gets
-  // there. Testing the counting/ceiling logic directly on the private
-  // method (as conn.test.ts already does for MixerConn internals like
-  // sendPing/outstandingPings) is the precise, non-flaky way to pin that
-  // contract down.
+  // completes a fresh welcome) can't observe the ceiling directly: `attempt`
+  // only resets once a connection has stayed up `stableAfter` ms past
+  // welcome (Change 2) -- a flap loop that always reconnects successfully
+  // but never stays up that long still accumulates attempts, so testing the
+  // counting/ceiling logic directly on the private method (as conn.test.ts
+  // already does for MixerConn internals like sendPing/outstandingPings) is
+  // still the precise, non-flaky way to pin this contract down without
+  // depending on stableAfter's timing.
   it("increments `attempt` on every call and gives up once maxAttempts is reached", async () => {
     vi.useFakeTimers();
     const sockets: FakeSocket[] = [];
@@ -987,7 +1639,6 @@ describe("MixerClient item 6: reconnectImmediately respects maxAttempts", () => 
 });
 
 // --- v0.2 token provider + 401 refresh-retry (OVERVIEW.md section 4.0) --------
-
 describe("MixerClient v0.2: token provider", () => {
   it("calls the provider fresh on every dial, across multiple reconnects", async () => {
     vi.useFakeTimers();
@@ -1091,7 +1742,9 @@ describe("MixerClient v0.2: token provider", () => {
     expect(calls).toBe(2);
     expect(sockets.length).toBe(2); // no third dial
     expect(fatalEvents).toHaveLength(1);
-    expect(disconnects.at(-1)).toMatchObject({ phase: "dial", httpStatus: 401, fatal: true });
+    // An HTTP upgrade rejection is never a ws-mixer wire error -- no
+    // errorCode/errorName, even for a 401 (D-2026-09-20-09).
+    expect(disconnects.at(-1)).toMatchObject({ phase: "dial", httpStatus: 401, fatal: true, errorCode: undefined, errorName: undefined });
   });
 
   it("a static string token is fatal on the first 401, no retry, httpStatus 401", async () => {
@@ -1113,7 +1766,7 @@ describe("MixerClient v0.2: token provider", () => {
 
     await expect(started).rejects.toBeTruthy();
     expect(sockets.length).toBe(1);
-    expect(disconnects.at(-1)).toMatchObject({ phase: "dial", httpStatus: 401, fatal: true });
+    expect(disconnects.at(-1)).toMatchObject({ phase: "dial", httpStatus: 401, fatal: true, errorCode: undefined, errorName: undefined });
   });
 
   it("a provider that rejects is fatal, with the thrown error surfaced as message and cause", async () => {
@@ -1200,9 +1853,12 @@ describe("MixerClient v0.2: token provider", () => {
       expect(sockets.length).toBe(1); // no retry: only 401 is retry-eligible
       expect(calls).toBe(1);
       expect(disconnects.at(-1)).toMatchObject({ phase: "dial", httpStatus: status, fatal: true });
-      // 403 is grouped with 401 (UNAUTHORIZED); 404 is fatal but isn't a
-      // ws-mixer wire error, so it gets no errorCode.
-      expect(disconnects.at(-1)?.errorCode).toBe(status === 403 ? ErrorCode.UNAUTHORIZED : undefined);
+      // An HTTP upgrade rejection is never a ws-mixer wire error -- 403 is
+      // grouped with 401 for retry/fatal purposes only (OVERVIEW.md section
+      // 2.9), and 404 never was -- neither gets an errorCode/errorName
+      // (D-2026-09-20-09).
+      expect(disconnects.at(-1)?.errorCode).toBeUndefined();
+      expect(disconnects.at(-1)?.errorName).toBeUndefined();
     });
   }
 
@@ -1227,7 +1883,7 @@ describe("MixerClient v0.2: token provider", () => {
       await tick();
 
       expect(sockets.length).toBe(1); // not yet -- still waiting out the backoff delay
-      expect(disconnects.at(-1)).toMatchObject({ phase: "dial", httpStatus: status, fatal: false, errorCode: undefined });
+      expect(disconnects.at(-1)).toMatchObject({ phase: "dial", httpStatus: status, fatal: false, errorCode: undefined, errorName: undefined });
       expect(reconnecting).toHaveLength(1);
 
       // Fire exactly the scheduled backoff, not a blind long jump: the retry
@@ -1302,8 +1958,9 @@ describe("MixerClient v0.2: token provider", () => {
     await client.close();
   });
 
-  it("maxAttempts interplay: the 401 refresh-retry is itself skipped once the ceiling is already reached", async () => {
+  it("maxAttempts interplay (item 4): an already-exhausted ceiling does NOT block the pre-welcome refresh-retry -- it still redials and can still connect", async () => {
     vi.useFakeTimers();
+    vi.spyOn(Math, "random").mockReturnValue(1); // pin full-jitter to its ceiling -- an unpinned sub-1ms draw is indistinguishable from "already due" under fake timers (see tick()'s note)
     const sockets: FakeSocket[] = [];
     let calls = 0;
     const provider = () => {
@@ -1313,7 +1970,7 @@ describe("MixerClient v0.2: token provider", () => {
     const disconnects: DisconnectPayload[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: provider,
-      _wsFactory: makeFactory(sockets),
+      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
       reconnect: { base: 10, cap: 100, maxAttempts: 1 },
       onDisconnect: (r) => disconnects.push(r),
     });
@@ -1328,15 +1985,967 @@ describe("MixerClient v0.2: token provider", () => {
     await vi.advanceTimersByTimeAsync(100);
     expect(sockets.length).toBe(2); // the one retry attempt fires...
 
-    // ...and now attempt (1) >= maxAttempts (1): a 401 on this dial must not
-    // spend a second attempt on the refresh-retry -- it's fatal immediately.
+    // ...and now attempt (1) >= maxAttempts (1) -- but the refresh-retry
+    // below is NOT one of the ordinary reconnect-attempt paths gated by
+    // maxAttempts (OVERVIEW.md section 4.0's rejected-token row is
+    // unconditional for a provider, and it does not itself increment
+    // `attempt`): a 401 on this dial still gets its one immediate retry.
+    sockets[1]!.httpReject(401);
+    await tick();
+    expect(calls).toBe(3); // the refresh-retry's own fresh provider call
+    expect(sockets.length).toBe(3); // ...and its own fresh dial
+
+    // That retry succeeds: connects normally, start() resolves (not rejects).
+    sockets[2]!.open();
+    await tick();
+    pushWelcome(sockets[2]!);
+    await tick();
+    await started;
+    expect(client.currentState()).toBe("connected");
+    // The one report is the earlier ECONNRESET (non-fatal, normal backoff);
+    // neither the 401 nor its silent refresh-retry produces a second one.
+    expect(disconnects).toHaveLength(1);
+    expect(disconnects[0]).toMatchObject({ phase: "dial", fatal: false, message: "ECONNRESET" });
+
+    await client.close();
+    await client.close();
+  });
+});
+
+// --- Change 1/1b: ONE retry budget, shared by both pre-welcome rejection -----
+// shapes (HTTP 401 on the upgrade, and handshake-phase UNAUTHORIZED/4011,
+// with or without a preceding error{}) -- provider-only, one retry, and a
+// second rejection in EITHER form is fatal ------------------------------------
+
+describe("MixerClient change 1/1b: unified pre-welcome auth-rejection retry", () => {
+  it("provider + bare close 4011 before welcome: one retry, no backoff, no disconnect reported for the first rejection, then connects", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    let calls = 0;
+    const provider = () => {
+      calls++;
+      return `token-${calls}`;
+    };
+    const disconnects: DisconnectPayload[] = [];
+    const reconnecting: unknown[] = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: provider,
+      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      onDisconnect: (r) => disconnects.push(r),
+    });
+    client.on("reconnecting", (info) => reconnecting.push(info));
+
+    const started = client.start();
+    started.catch(() => {});
+    await tick();
+    sockets[0]!.open();
+    await tick();
+    sockets[0]!.serverClose(4000 + ErrorCode.UNAUTHORIZED, "token rejected");
+    await tick(); // the retry dial happens immediately, no timer to advance
+
+    expect(calls).toBe(2);
+    expect(sockets.length).toBe(2);
+    expect(reconnecting).toHaveLength(0); // no backoff
+    expect(disconnects).toHaveLength(0); // no report for the first rejection
+    expect(sockets[1]!.authHeader).toBe("Bearer token-2");
+
+    sockets[1]!.open();
+    await tick();
+    pushWelcome(sockets[1]!);
+    await tick();
+    await started;
+
+    expect(client.currentState()).toBe("connected");
+    expect(disconnects).toHaveLength(0);
+
+    await client.close();
+  });
+
+  it("provider + bare close 4011 before welcome: a second rejection is fatal, start() rejects, provider called exactly twice", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    let calls = 0;
+    const provider = () => {
+      calls++;
+      return `token-${calls}`;
+    };
+    const disconnects: DisconnectPayload[] = [];
+    const fatalEvents: unknown[] = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: provider,
+      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      onDisconnect: (r) => disconnects.push(r),
+    });
+    client.on("fatal", (e) => fatalEvents.push(e));
+
+    const started = client.start();
+    started.catch(() => {});
+    await tick();
+    sockets[0]!.open();
+    await tick();
+    sockets[0]!.serverClose(4000 + ErrorCode.UNAUTHORIZED, "token rejected");
+    await tick();
+    expect(calls).toBe(2);
+    expect(sockets.length).toBe(2);
+
+    sockets[1]!.open();
+    await tick();
+    sockets[1]!.serverClose(4000 + ErrorCode.UNAUTHORIZED, "token rejected again");
+    await tick();
+    await vi.advanceTimersByTimeAsync(120000);
+
+    await expect(started).rejects.toBeTruthy();
+    expect(calls).toBe(2); // no third provider call
+    expect(sockets.length).toBe(2); // no third dial
+    expect(fatalEvents).toHaveLength(1);
+    expect(disconnects).toHaveLength(1);
+    expect(disconnects[0]).toMatchObject({ phase: "handshake", wsCode: 4000 + ErrorCode.UNAUTHORIZED, fatal: true });
+  });
+
+  it("static token + bare close 4011 before welcome: fatal at once, exactly one dial", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    const disconnects: DisconnectPayload[] = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: "static-token",
+      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      onDisconnect: (r) => disconnects.push(r),
+    });
+
+    const started = client.start();
+    started.catch(() => {});
+    await tick();
+    sockets[0]!.open();
+    await tick();
+    sockets[0]!.serverClose(4000 + ErrorCode.UNAUTHORIZED, "token rejected");
+    await tick();
+    await vi.advanceTimersByTimeAsync(120000);
+
+    await expect(started).rejects.toBeTruthy();
+    expect(sockets.length).toBe(1); // no retry
+    expect(disconnects).toHaveLength(1);
+    expect(disconnects[0]).toMatchObject({
+      phase: "handshake",
+      wsCode: 4000 + ErrorCode.UNAUTHORIZED,
+      errorCode: ErrorCode.UNAUTHORIZED,
+      errorName: "UNAUTHORIZED",
+      fatal: true,
+    });
+  });
+
+  it("provider + error{11 UNAUTHORIZED} before welcome: one retry, provider called twice, no disconnect reported for the first rejection", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    let calls = 0;
+    const provider = () => {
+      calls++;
+      return `token-${calls}`;
+    };
+    const disconnects: DisconnectPayload[] = [];
+    const reconnecting: unknown[] = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: provider,
+      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      onDisconnect: (r) => disconnects.push(r),
+    });
+    client.on("reconnecting", (info) => reconnecting.push(info));
+
+    const started = client.start();
+    started.catch(() => {});
+    await tick();
+    sockets[0]!.open();
+    await tick();
+    sockets[0]!.push(
+      encodeData(0, encodeControl({ t: "error", code: ErrorCode.UNAUTHORIZED, message: "token invalid" } as ControlMessage)),
+    );
+    await tick();
+
+    expect(calls).toBe(2);
+    expect(sockets.length).toBe(2);
+    expect(reconnecting).toHaveLength(0);
+    expect(disconnects).toHaveLength(0);
+
+    sockets[1]!.open();
+    await tick();
+    pushWelcome(sockets[1]!);
+    await tick();
+    await started;
+    expect(client.currentState()).toBe("connected");
+    expect(disconnects).toHaveLength(0);
+
+    await client.close();
+  });
+
+  it("provider + error{11 UNAUTHORIZED} before welcome: a second rejection is fatal", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    let calls = 0;
+    const provider = () => {
+      calls++;
+      return `token-${calls}`;
+    };
+    const disconnects: DisconnectPayload[] = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: provider,
+      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      onDisconnect: (r) => disconnects.push(r),
+    });
+
+    const started = client.start();
+    started.catch(() => {});
+    await tick();
+    sockets[0]!.open();
+    await tick();
+    sockets[0]!.push(
+      encodeData(0, encodeControl({ t: "error", code: ErrorCode.UNAUTHORIZED, message: "token invalid" } as ControlMessage)),
+    );
+    await tick();
+    sockets[1]!.open();
+    await tick();
+    sockets[1]!.push(
+      encodeData(0, encodeControl({ t: "error", code: ErrorCode.UNAUTHORIZED, message: "still invalid" } as ControlMessage)),
+    );
+    await tick();
+    await vi.advanceTimersByTimeAsync(120000);
+
+    await expect(started).rejects.toBeTruthy();
+    expect(calls).toBe(2);
+    expect(sockets.length).toBe(2);
+    expect(disconnects).toHaveLength(1);
+    expect(disconnects[0]).toMatchObject({ phase: "handshake", wsCode: 4000 + ErrorCode.UNAUTHORIZED, fatal: true });
+  });
+
+  it("provider + HTTP 401 then handshake-phase 4011: the second rejection (a different form) is still fatal -- one shared budget", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    let calls = 0;
+    const provider = () => {
+      calls++;
+      return `token-${calls}`;
+    };
+    const disconnects: DisconnectPayload[] = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: provider,
+      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      onDisconnect: (r) => disconnects.push(r),
+    });
+
+    const started = client.start();
+    started.catch(() => {});
+    await tick();
+    sockets[0]!.httpReject(401); // dial-phase rejection: uses the one retry
+    await tick(); // the retry redials immediately -- a fresh DialSocket via the factory
+
+    expect(calls).toBe(2);
+    expect(sockets.length).toBe(2);
+    sockets[1]!.open();
+    await tick();
+    sockets[1]!.serverClose(4000 + ErrorCode.UNAUTHORIZED, "handshake rejected too");
+    await tick();
+    await vi.advanceTimersByTimeAsync(120000);
+
+    await expect(started).rejects.toBeTruthy();
+    expect(calls).toBe(2); // no third provider call -- the budget was already spent by the 401
+    expect(sockets.length).toBe(2);
+    expect(disconnects).toHaveLength(1);
+    expect(disconnects[0]).toMatchObject({ phase: "handshake", wsCode: 4000 + ErrorCode.UNAUTHORIZED, fatal: true });
+  });
+
+  it("provider + handshake-phase 4011 then HTTP 401: fatal after the second, in the opposite order", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    let calls = 0;
+    const provider = () => {
+      calls++;
+      return `token-${calls}`;
+    };
+    const disconnects: DisconnectPayload[] = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: provider,
+      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      onDisconnect: (r) => disconnects.push(r),
+    });
+
+    const started = client.start();
+    started.catch(() => {});
+    await tick();
+    sockets[0]!.open();
+    await tick();
+    sockets[0]!.serverClose(4000 + ErrorCode.UNAUTHORIZED, "handshake rejected");
+    await tick(); // uses the one retry
+    expect(calls).toBe(2);
+    expect(sockets.length).toBe(2);
+
+    sockets[1]!.httpReject(401); // the retry dial itself gets a 401: budget already spent -> fatal
+    await tick();
+    await vi.advanceTimersByTimeAsync(120000);
+
+    await expect(started).rejects.toBeTruthy();
+    expect(calls).toBe(2);
+    expect(sockets.length).toBe(2);
+    expect(disconnects).toHaveLength(1);
+    expect(disconnects[0]).toMatchObject({ phase: "dial", httpStatus: 401, fatal: true });
+  });
+});
+
+// --- Change 1 addendum: the refresh-retry budget is a CLIENT-level flag, -----
+// re-armed only at stability -- never on every redial, so a server that ------
+// welcomes-then-closes can't make the client hit the token endpoint forever --
+
+describe("MixerClient change 1 addendum: refresh-retry budget re-arms only at stability", () => {
+  it("rejected -> refresh -> welcome -> close before stableAfter -> redial rejected: fatal, with 3 total provider calls (2 for the refresh-retry cycle, 1 more for the later un-stable redial that also gets rejected, with no further refresh)", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    let calls = 0;
+    const provider = () => {
+      calls++;
+      return `token-${calls}`;
+    };
+    const disconnects: DisconnectPayload[] = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: provider,
+      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      reconnect: { base: 10, cap: 100, stableAfter: 10000 },
+      onDisconnect: (r) => disconnects.push(r),
+    });
+
+    const started = client.start();
+    started.catch(() => {});
+    await tick();
+    sockets[0]!.open();
+    await tick();
+    sockets[0]!.serverClose(4000 + ErrorCode.UNAUTHORIZED, "rejected");
+    await tick(); // burns the one retry: calls -> 2, a second socket dials
+
+    expect(calls).toBe(2);
+    expect(sockets.length).toBe(2);
+    sockets[1]!.open();
+    await tick();
+    pushWelcome(sockets[1]!);
+    await tick();
+    await started; // resolves here: the client HAS connected once
+    expect(client.currentState()).toBe("connected");
+
+    // Drops well before stability: the retry budget must stay spent.
+    await vi.advanceTimersByTimeAsync(2000);
+    sockets[1]!.serverClose(1006, "abnormal");
+    await tick();
+    await vi.advanceTimersByTimeAsync(100); // normal backoff redial (base 10/cap 100: delay <= 20ms)
+    expect(sockets.length).toBe(3);
+    sockets[2]!.open();
+    await tick();
+    sockets[2]!.serverClose(4000 + ErrorCode.UNAUTHORIZED, "rejected again");
+    await tick();
+
+    // No further retry for this new rejection: the budget never re-armed
+    // (this conn never reached stability either) -- fatal at once, no third
+    // provider call. (start() already resolved above and stays resolved --
+    // a later fatal disconnect only rejects start() if the client never
+    // connected once; it's the 'fatal' event/onDisconnect that carry this.)
+    expect(calls).toBe(3); // one provider call for the third dial only, no fourth
+    expect(sockets.length).toBe(3);
+    expect(client.currentState()).toBe("closed");
+    expect(disconnects).toHaveLength(2); // the earlier non-fatal 1006 + this fatal one
+    expect(disconnects[0]).toMatchObject({ phase: "connected", wsCode: 1006, fatal: false });
+    expect(disconnects.at(-1)).toMatchObject({ phase: "handshake", fatal: true, wsCode: 4000 + ErrorCode.UNAUTHORIZED });
+  });
+
+  it("...but if the connection survives stableAfter, the next rejection gets a refresh-retry again", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    let calls = 0;
+    const provider = () => {
+      calls++;
+      return `token-${calls}`;
+    };
+    const disconnects: DisconnectPayload[] = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: provider,
+      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      reconnect: { base: 10, cap: 100, stableAfter: 10000 },
+      onDisconnect: (r) => disconnects.push(r),
+    });
+
+    const started = client.start();
+    started.catch(() => {});
+    await tick();
+    sockets[0]!.open();
+    await tick();
+    sockets[0]!.serverClose(4000 + ErrorCode.UNAUTHORIZED, "rejected");
+    await tick(); // burns the one retry
+    expect(calls).toBe(2);
+    sockets[1]!.open();
+    await tick();
+    pushWelcome(sockets[1]!);
+    await tick();
+    await started;
+
+    // This time, stay up past stability before dropping.
+    await vi.advanceTimersByTimeAsync(10000);
+    sockets[1]!.serverClose(1006, "abnormal");
+    await tick();
+    await vi.advanceTimersByTimeAsync(100); // normal backoff redial (base 10/cap 100: delay <= 20ms)
+    expect(sockets.length).toBe(3);
+    sockets[2]!.open();
+    await tick();
+    sockets[2]!.serverClose(4000 + ErrorCode.UNAUTHORIZED, "rejected once more");
+    await tick();
+
+    // The budget re-armed at stability: this rejection gets its own retry.
+    expect(calls).toBe(4); // dial 3's own token + the retry's fresh token
+    expect(sockets.length).toBe(4);
+    expect(disconnects).toHaveLength(1); // the earlier non-fatal 1006 only -- no report for the refresh-retry's own rejection
+    expect(disconnects[0]).toMatchObject({ phase: "connected", wsCode: 1006, fatal: false });
+
+    sockets[3]!.open();
+    await tick();
+    pushWelcome(sockets[3]!);
+    await tick();
+    expect(client.currentState()).toBe("connected");
+
+    await client.close();
+  });
+});
+
+describe("MixerClient change 1 item 4: the refresh-retry is unconditional on maxAttempts/reconnect-disabled", () => {
+  it("provider + maxAttempts:0 + HTTP 401 on the INITIAL connect: still gets the one refresh-retry (2 provider calls, 2 dials), and the retry succeeding completes the initial connection", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    let calls = 0;
+    const provider = () => {
+      calls++;
+      return `token-${calls}`;
+    };
+    const disconnects: DisconnectPayload[] = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: provider,
+      _wsFactory: makeFactory(sockets),
+      reconnect: { maxAttempts: 0 },
+      onDisconnect: (r) => disconnects.push(r),
+    });
+
+    const started = client.start();
+    started.catch(() => {});
+    await tick();
+    sockets[0]!.httpReject(401);
+    await tick(); // the retry redials immediately, no backoff
+
+    expect(calls).toBe(2);
+    expect(sockets.length).toBe(2);
+    expect(disconnects).toHaveLength(0); // no report for the first rejection
+
+    await connectSocket(sockets, 1);
+    await started;
+    expect(client.currentState()).toBe("connected");
+    expect(disconnects).toHaveLength(0);
+
+    await client.close();
+  });
+
+  it("provider + maxAttempts:0 + a second HTTP 401 (the retry's own dial also rejected): fatal, exactly like maxAttempts unset", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    let calls = 0;
+    const provider = () => {
+      calls++;
+      return `token-${calls}`;
+    };
+    const disconnects: DisconnectPayload[] = [];
+    const fatalEvents: unknown[] = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: provider,
+      _wsFactory: makeFactory(sockets),
+      reconnect: { maxAttempts: 0 },
+      onDisconnect: (r) => disconnects.push(r),
+    });
+    client.on("fatal", (e) => fatalEvents.push(e));
+
+    const started = client.start();
+    started.catch(() => {});
+    await tick();
+    sockets[0]!.httpReject(401);
+    await tick();
+    expect(calls).toBe(2);
     sockets[1]!.httpReject(401);
     await tick();
 
     await expect(started).rejects.toBeTruthy();
-    expect(calls).toBe(2); // no third provider call for a refresh-retry
-    expect(sockets.length).toBe(2); // no third dial
-    expect(disconnects.at(-1)).toMatchObject({ phase: "dial", httpStatus: 401, fatal: true });
+    expect(calls).toBe(2); // no third provider call
+    expect(sockets.length).toBe(2);
+    expect(fatalEvents).toHaveLength(1);
+    expect(disconnects).toHaveLength(1);
+    expect(disconnects[0]).toMatchObject({ phase: "dial", httpStatus: 401, fatal: true });
+  });
+
+  it("provider + HTTP 401 then HTTP 503 on the retry dial: NOT forced fatal -- the retry's own failure takes the ordinary recoverable path (non-fatal, normal backoff), and the spent budget stays spent (no further refresh before stability)", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    let calls = 0;
+    const provider = () => {
+      calls++;
+      return `token-${calls}`;
+    };
+    const disconnects: DisconnectPayload[] = [];
+    const reconnecting: Array<{ delayMs: number }> = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: provider,
+      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      reconnect: { base: 10, cap: 100, stableAfter: 10000 },
+      onDisconnect: (r) => disconnects.push(r),
+    });
+    client.on("reconnecting", (info) => reconnecting.push(info));
+
+    const started = client.start();
+    started.catch(() => {});
+    await tick();
+    sockets[0]!.httpReject(401); // uses the one retry
+    await tick();
+    expect(calls).toBe(2);
+    expect(sockets.length).toBe(2);
+
+    // The retry's own dial fails for an ordinary, non-auth reason: this is
+    // NOT "a second rejection" in the sense the spec means (a second token
+    // rejection) -- it's an unrelated transient failure, so it must take the
+    // normal recoverable path instead of being forced fatal.
+    sockets[1]!.httpReject(503);
+    await tick();
+
+    expect(disconnects).toHaveLength(1);
+    expect(disconnects[0]).toMatchObject({ phase: "dial", httpStatus: 503, fatal: false, errorCode: undefined });
+    expect(reconnecting).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(reconnecting[0]!.delayMs);
+    expect(sockets.length).toBe(3);
+
+    // That normal-backoff redial itself now gets rejected with a 401 too,
+    // still well before any connection has ever gone stable: the budget
+    // stayed spent (the 503 above never re-armed it), so this is fatal at
+    // once, with no further refresh-retry.
+    sockets[2]!.httpReject(401);
+    await tick();
+
+    expect(calls).toBe(3); // no fourth provider call for another refresh
+    expect(sockets.length).toBe(3);
+    await expect(started).rejects.toBeTruthy();
+    expect(disconnects).toHaveLength(2);
+    expect(disconnects[1]).toMatchObject({ phase: "dial", httpStatus: 401, fatal: true });
+  });
+});
+
+// --- TokenUnavailableError: an explicit-opt-in marker for a temporary -------
+// failure to OBTAIN a token (network still down, auth server briefly
+// unreachable), treated like a failed dial instead of the fatal-by-default
+// verdict every other provider throw/reject still gets. Detection is
+// `instanceof` only (and follows `cause`, bounded + cycle-safe) -- never a
+// duck-typed property/method, so an unrelated library's error can never
+// accidentally turn a genuinely fatal provider failure into an endless
+// retry loop.
+describe("MixerClient TokenUnavailableError", () => {
+  it("a provider that throws TokenUnavailableError on a reconnect is non-fatal: normal backoff, cause surfaced, then reconnects", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, "random").mockReturnValue(1); // pin full-jitter to its ceiling, so delays are exact
+    const sockets: FakeSocket[] = [];
+    const boom = new TokenUnavailableError("auth server briefly unreachable");
+    let calls = 0;
+    const provider = () => {
+      calls++;
+      if (calls === 2) throw boom;
+      return `token-${calls}`;
+    };
+    const disconnects: DisconnectPayload[] = [];
+    const reconnecting: Array<{ attempt: number; delayMs: number }> = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: provider,
+      _wsFactory: makeFactory(sockets),
+      reconnect: { base: 1000, cap: 60000 },
+      onDisconnect: (r) => disconnects.push(r),
+    });
+    client.on("reconnecting", (info) => reconnecting.push(info));
+
+    const started = client.start();
+    started.catch(() => {});
+    await connectSocket(sockets, 0);
+    await started;
+    expect(calls).toBe(1);
+
+    // Post-welcome drop: an ordinary reconnect trigger, unrelated to the
+    // provider -- schedules the first backoff (attempt 1).
+    sockets[0]!.serverClose(1006, "abnormal");
+    await tick();
+    expect(reconnecting).toHaveLength(1);
+    expect(reconnecting[0]!.delayMs).toBe(2000); // base*2^1, pinned to the ceiling
+
+    // That backoff's own redial is where the provider throws
+    // TokenUnavailableError: no socket for the failed provider call, exactly
+    // one non-fatal report with the thrown error verbatim as `cause`, and a
+    // normal (climbing) backoff timer -- not fatal, not an immediate retry.
+    await vi.advanceTimersByTimeAsync(reconnecting[0]!.delayMs);
+    await tick();
+    expect(calls).toBe(2);
+    expect(sockets.length).toBe(1);
+    expect(disconnects).toHaveLength(2);
+    expect(disconnects[1]).toMatchObject({ phase: "dial", fatal: false, cause: boom });
+    expect(disconnects[1]!.cause).toBe(boom);
+    expect(reconnecting).toHaveLength(2);
+    expect(reconnecting[1]!.delayMs).toBe(4000); // base*2^2, pinned
+
+    // The next attempt calls the provider again and connects.
+    await vi.advanceTimersByTimeAsync(reconnecting[1]!.delayMs);
+    expect(calls).toBe(3);
+    await connectSocket(sockets, 1);
+    expect(sockets.length).toBe(2);
+
+    await client.close();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("repeated marked failures climb the backoff delay each time, and exhaust maxAttempts fatally like any other failure", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, "random").mockReturnValue(1); // pin full-jitter to its ceiling, so delays are exact
+    const sockets: FakeSocket[] = [];
+    const boom = new TokenUnavailableError("token endpoint still down");
+    let calls = 0;
+    const provider = () => {
+      calls++;
+      if (calls === 1) return "token-1";
+      throw boom;
+    };
+    const disconnects: DisconnectPayload[] = [];
+    const reconnecting: Array<{ attempt: number; delayMs: number }> = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: provider,
+      _wsFactory: makeFactory(sockets),
+      reconnect: { base: 1000, cap: 60000, maxAttempts: 2 },
+      onDisconnect: (r) => disconnects.push(r),
+    });
+    client.on("reconnecting", (info) => reconnecting.push(info));
+
+    const started = client.start();
+    started.catch(() => {});
+    await connectSocket(sockets, 0);
+    await started;
+
+    sockets[0]!.serverClose(1006, "abnormal");
+    await tick();
+    expect(reconnecting).toHaveLength(1);
+    expect(reconnecting[0]!.delayMs).toBe(2000);
+
+    await vi.advanceTimersByTimeAsync(reconnecting[0]!.delayMs);
+    await tick();
+    expect(calls).toBe(2); // provider call #2 threw -- non-fatal, climbs to attempt 2's ceiling
+    expect(sockets.length).toBe(1); // no socket for the failed provider call
+    expect(reconnecting).toHaveLength(2);
+    expect(reconnecting[1]!.delayMs).toBe(4000);
+
+    await vi.advanceTimersByTimeAsync(reconnecting[1]!.delayMs);
+    await tick();
+    // Provider call #3 also threw, and maxAttempts (2) is now exhausted: the
+    // marked failure itself stayed non-fatal (dialAndHandshakeOnce's own
+    // verdict) -- it's exhaustion (giveUp), same as any other failure, that
+    // makes this fatal.
+    expect(calls).toBe(3);
+    expect(sockets.length).toBe(1);
+    await started; // already resolved at the first successful connect above -- exhaustion doesn't un-resolve it
+    expect(disconnects).toHaveLength(3); // 1006 (connected), the marked failure, the exhaustion
+    expect(disconnects.at(-1)).toMatchObject({ phase: "dial", fatal: true, cause: boom });
+    expect(disconnects.at(-1)?.message).toContain("max reconnect attempts");
+
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("a TokenUnavailableError reachable only via a wrapping Error's `cause` is still treated as marked", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, "random").mockReturnValue(1);
+    const sockets: FakeSocket[] = [];
+    const wrapped = new Error("refresh failed", { cause: new TokenUnavailableError("token endpoint down") });
+    let calls = 0;
+    const provider = () => {
+      calls++;
+      if (calls === 2) throw wrapped;
+      return `token-${calls}`;
+    };
+    const disconnects: DisconnectPayload[] = [];
+    const reconnecting: Array<{ delayMs: number }> = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: provider,
+      _wsFactory: makeFactory(sockets),
+      reconnect: { base: 1000, cap: 60000 },
+      onDisconnect: (r) => disconnects.push(r),
+    });
+    client.on("reconnecting", (info) => reconnecting.push(info));
+
+    const started = client.start();
+    started.catch(() => {});
+    await connectSocket(sockets, 0);
+    await started;
+
+    sockets[0]!.serverClose(1006, "abnormal");
+    await tick();
+    await vi.advanceTimersByTimeAsync(reconnecting[0]!.delayMs);
+    await tick();
+
+    expect(sockets.length).toBe(1); // non-fatal: no immediate fatal close
+    expect(disconnects).toHaveLength(2);
+    // `cause` is the wrapping error, verbatim -- exactly like an unmarked
+    // provider throw surfaces its own error, not the unwrapped inner one.
+    expect(disconnects[1]).toMatchObject({ phase: "dial", fatal: false, cause: wrapped });
+
+    await client.close();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("a deep/cyclic `cause` chain that never reaches a TokenUnavailableError does not hang, and is fatal", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    const e1 = new Error("a");
+    const e2 = new Error("b", { cause: e1 });
+    (e1 as Error & { cause?: unknown }).cause = e2; // cycle: e1 -> e2 -> e1 -> ...
+    const provider = async () => {
+      throw e1;
+    };
+    const disconnects: DisconnectPayload[] = [];
+    const fatalEvents: unknown[] = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: provider,
+      _wsFactory: makeFactory(sockets),
+      onDisconnect: (r) => disconnects.push(r),
+    });
+    client.on("fatal", (e) => fatalEvents.push(e));
+
+    const started = client.start();
+    started.catch(() => {});
+    await tick();
+    await vi.advanceTimersByTimeAsync(120000);
+
+    await expect(started).rejects.toBeTruthy();
+    expect(fatalEvents).toHaveLength(1);
+    expect(disconnects).toHaveLength(1);
+    expect(disconnects[0]).toMatchObject({ phase: "dial", fatal: true, cause: e1 });
+  });
+
+  it("an error with a retryable-looking property/method (not an `instanceof TokenUnavailableError`) is still fatal -- no duck-typing", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    const boom = Object.assign(new Error("token endpoint on fire"), { retryable: true, Retryable: () => true });
+    const provider = async () => {
+      throw boom;
+    };
+    const disconnects: DisconnectPayload[] = [];
+    const fatalEvents: unknown[] = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: provider,
+      _wsFactory: makeFactory(sockets),
+      onDisconnect: (r) => disconnects.push(r),
+    });
+    client.on("fatal", (e) => fatalEvents.push(e));
+
+    const started = client.start();
+    started.catch(() => {});
+    await tick();
+    await vi.advanceTimersByTimeAsync(120000);
+
+    await expect(started).rejects.toBeTruthy();
+    expect(sockets.length).toBe(0);
+    expect(fatalEvents).toHaveLength(1);
+    expect(disconnects).toHaveLength(1);
+    expect(disconnects[0]).toMatchObject({ phase: "dial", fatal: true, message: boom.message, cause: boom });
+  });
+
+  it("first connect: a provider that throws TokenUnavailableError does not reject start() -- same outcome as a first-dial network error", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    const boom = new TokenUnavailableError("network still down");
+    let calls = 0;
+    const provider = () => {
+      calls++;
+      if (calls === 1) throw boom;
+      return "token-2";
+    };
+    const disconnects: DisconnectPayload[] = [];
+    const reconnecting: Array<{ delayMs: number }> = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: provider,
+      _wsFactory: makeFactory(sockets),
+      reconnect: { base: 1000, cap: 60000 },
+      onDisconnect: (r) => disconnects.push(r),
+    });
+    client.on("reconnecting", (info) => reconnecting.push(info));
+
+    const started = client.start();
+    let settled = false;
+    started.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
+    );
+
+    await tick();
+    expect(sockets.length).toBe(0); // never even opened a socket, same as an unmarked provider throw
+    expect(disconnects).toHaveLength(1);
+    expect(disconnects[0]).toMatchObject({ phase: "dial", fatal: false, cause: boom });
+    expect(reconnecting).toHaveLength(1);
+    expect(settled).toBe(false); // start() has NOT rejected -- unlike an unmarked throw, which is fatal
+
+    await vi.advanceTimersByTimeAsync(reconnecting[0]!.delayMs);
+    await connectSocket(sockets, 0);
+    await started;
+    expect(settled).toBe(true);
+    expect(calls).toBe(2);
+
+    await client.close();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("refresh-retry path: the provider's own call throws TokenUnavailableError -- non-fatal backoff, budget stays spent, and the next un-stable rejection is fatal with no further refresh", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, "random").mockReturnValue(1);
+    const sockets: FakeSocket[] = [];
+    const boom = new TokenUnavailableError("token endpoint briefly unreachable");
+    let calls = 0;
+    const provider = () => {
+      calls++;
+      if (calls === 2) throw boom;
+      return `token-${calls}`;
+    };
+    const disconnects: DisconnectPayload[] = [];
+    const reconnecting: Array<{ delayMs: number }> = [];
+    const fatalEvents: unknown[] = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: provider,
+      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      reconnect: { base: 10, cap: 100, stableAfter: 10000 },
+      onDisconnect: (r) => disconnects.push(r),
+    });
+    client.on("reconnecting", (info) => reconnecting.push(info));
+    client.on("fatal", (e) => fatalEvents.push(e));
+
+    const started = client.start();
+    started.catch(() => {});
+    await tick();
+    sockets[0]!.httpReject(401); // uses the one retry
+    await tick();
+
+    // The retry's own provider call threw TokenUnavailableError: no second
+    // socket (resolveToken throws before dialWebSocket), non-fatal, normal
+    // backoff -- NOT forced fatal by the refresh-retry rule, and no
+    // disconnect reported for the 401 itself (only the final outcome is).
+    expect(calls).toBe(2);
+    expect(sockets.length).toBe(1);
+    expect(disconnects).toHaveLength(1);
+    expect(disconnects[0]).toMatchObject({ phase: "dial", fatal: false, cause: boom });
+    expect(reconnecting).toHaveLength(1);
+
+    await vi.advanceTimersByTimeAsync(reconnecting[0]!.delayMs);
+    expect(calls).toBe(3);
+    expect(sockets.length).toBe(2);
+
+    // That redial itself now gets rejected with a 401 too, still well
+    // before any connection has ever gone stable: the budget stayed spent
+    // (the marked failure above never re-armed it), so this is fatal at
+    // once, with no further refresh-retry.
+    sockets[1]!.httpReject(401);
+    await tick();
+
+    expect(calls).toBe(3); // no fourth provider call for another refresh
+    expect(sockets.length).toBe(2);
+    await expect(started).rejects.toBeTruthy();
+    expect(fatalEvents).toHaveLength(1);
+    expect(disconnects).toHaveLength(2);
+    expect(disconnects[1]).toMatchObject({ phase: "dial", httpStatus: 401, fatal: true });
+
+    await client.close();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("a throwing `cause` getter on the provider's error never escapes as an unhandled rejection: exactly one fatal report, start() rejects", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    const e = new Error("wedge via cause");
+    Object.defineProperty(e, "cause", {
+      get() {
+        throw new Error("cause getter boom");
+      },
+    });
+    const provider = async () => {
+      throw e;
+    };
+    const disconnects: DisconnectPayload[] = [];
+    const fatalEvents: unknown[] = [];
+    const unhandledRejections: unknown[] = [];
+    const onUnhandledRejection = (reason: unknown) => unhandledRejections.push(reason);
+    process.on("unhandledRejection", onUnhandledRejection);
+    try {
+      const client = new MixerClient("wss://x/tunnel", {
+        token: provider,
+        _wsFactory: makeFactory(sockets),
+        onDisconnect: (r) => disconnects.push(r),
+      });
+      client.on("fatal", (ev) => fatalEvents.push(ev));
+
+      const started = client.start();
+      started.catch(() => {});
+      await tick();
+      await vi.advanceTimersByTimeAsync(120000);
+
+      // Check the synchronous-by-now observables BEFORE awaiting `started`'s
+      // rejection: on a regression (the throw escaping uncaught) `started`
+      // never settles, and awaiting it first would just hang for the full
+      // per-test timeout instead of failing fast with the real reason.
+      expect(unhandledRejections).toHaveLength(0);
+      expect(fatalEvents).toHaveLength(1);
+      expect(disconnects).toHaveLength(1);
+      expect(disconnects[0]).toMatchObject({ phase: "dial", fatal: true });
+      expect(disconnects[0]!.cause).toBe(e);
+      await expect(started).rejects.toBeTruthy();
+    } finally {
+      process.off("unhandledRejection", onUnhandledRejection);
+    }
+  });
+
+  it("a throwing `message` getter on the provider's error never escapes as an unhandled rejection: exactly one fatal report, start() rejects", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    const e = new Error("placeholder");
+    Object.defineProperty(e, "message", {
+      get() {
+        throw new Error("message getter boom");
+      },
+    });
+    const provider = async () => {
+      throw e;
+    };
+    const disconnects: DisconnectPayload[] = [];
+    const fatalEvents: unknown[] = [];
+    const unhandledRejections: unknown[] = [];
+    const onUnhandledRejection = (reason: unknown) => unhandledRejections.push(reason);
+    process.on("unhandledRejection", onUnhandledRejection);
+    try {
+      const client = new MixerClient("wss://x/tunnel", {
+        token: provider,
+        _wsFactory: makeFactory(sockets),
+        onDisconnect: (r) => disconnects.push(r),
+      });
+      client.on("fatal", (ev) => fatalEvents.push(ev));
+
+      const started = client.start();
+      started.catch(() => {});
+      await tick();
+      await vi.advanceTimersByTimeAsync(120000);
+
+      // Same ordering rationale as the `cause`-getter test above: check the
+      // synchronous-by-now observables before awaiting `started`, so a
+      // regression fails fast instead of hanging for the full test timeout.
+      expect(unhandledRejections).toHaveLength(0);
+      expect(fatalEvents).toHaveLength(1);
+      expect(disconnects).toHaveLength(1);
+      expect(disconnects[0]).toMatchObject({ phase: "dial", fatal: true });
+      expect(disconnects[0]!.cause).toBe(e);
+      await expect(started).rejects.toBeTruthy();
+    } finally {
+      process.off("unhandledRejection", onUnhandledRejection);
+    }
   });
 });
 
@@ -1541,6 +3150,63 @@ describe("MixerClient blocker 1: exactly one DisconnectReason per disconnect", (
     expect(disconnects).toHaveLength(1);
     expect(disconnects[0]).toMatchObject({ phase: "connected", wsCode: 1006, fatal: true });
     expect(disconnects[0]!.message).toContain("max reconnect attempts");
+  });
+});
+
+// --- giveUp (maxAttempts exhaustion) must mirror goFatal: no orphaned ------
+// live conn/timers left running past "closed" -----------------------------
+
+describe("MixerClient giveUp mirrors goFatal: no orphaned conn/timers after exhaustion", () => {
+  it("maxAttempts:1, welcome -> unstable redial -> welcome -> drain's parallel dial fails -> exhaustion closes the still-live conn and leaves zero timers", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    const disconnects: DisconnectPayload[] = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: "t",
+      _wsFactory: makeFactory(sockets),
+      reconnect: { base: 10, cap: 100, maxAttempts: 1, stableAfter: 10000 },
+      onDisconnect: (r) => disconnects.push(r),
+    });
+
+    const started = client.start();
+    started.catch(() => {});
+    await connectSocket(sockets, 0);
+    await started;
+
+    // An unstable cycle bumps attempt 0 -> 1 (still under maxAttempts:1's
+    // ceiling, so this redial is allowed).
+    sockets[0]!.serverClose(1006, "abnormal");
+    await tick();
+    await vi.advanceTimersByTimeAsync(20);
+    const s1 = await connectSocket(sockets, 1);
+    await tick();
+    expect(client.currentState()).toBe("connected");
+
+    // Drain, well before s1 ever proves stable: a parallel reconnect starts
+    // (retiringConn === conn === s1's MixerConn, since drain never touches
+    // `this.conn` itself). That parallel dial then fails for an ordinary
+    // (non-auth, non-fatal) reason.
+    s1.push(encodeData(0, encodeControl({ t: "drain", reason: "rollout", last_stream_id: 0 } as ControlMessage)));
+    await tick();
+    await vi.advanceTimersByTimeAsync(2000); // drain's own jitter window
+    expect(sockets.length).toBe(3);
+    sockets[2]!.netError(new Error("ECONNRESET"));
+    await tick();
+
+    // attempt is already 1 (== maxAttempts): this dial failure's own
+    // scheduleReconnect finds the ceiling already reached and gives up
+    // immediately, without ever incrementing further.
+    expect(client.currentState()).toBe("closed");
+    expect(disconnects.at(-1)?.fatal).toBe(true);
+    expect(disconnects.at(-1)?.message).toContain("max reconnect attempts");
+
+    // The mirror-goFatal fix: s1 (still live, welcomed, and both `conn` AND
+    // `retiringConn` at the moment of exhaustion) must actually be closed --
+    // not left running with its ping/watchdog timers, nor its own
+    // stability timer left orphaned to fire 10s later against a closed
+    // client.
+    expect(s1.closedWith).not.toBeNull();
+    expect(vi.getTimerCount()).toBe(0);
   });
 });
 
@@ -1859,8 +3525,8 @@ describe("MixerClient closeReason", () => {
 });
 
 // --- handshake-phase fatal classification: a bare close carrying a --------
-// ws-mixer wire code must classify (and go fatal for 4010/4011) the same way
-// a connected-phase one already does, instead of trusting onSocketClose's
+// ws-mixer wire code must classify (and go fatal for 4010) the same way a
+// connected-phase one already does, instead of trusting onSocketClose's
 // generic INTERNAL_ERROR placeholder ----------------------------------------
 
 describe("MixerClient handshake-phase close classification", () => {
@@ -1898,39 +3564,13 @@ describe("MixerClient handshake-phase close classification", () => {
     });
   });
 
-  it("bare close 4011 (UNAUTHORIZED) before welcome is fatal, same as a connected-phase 4011 -- no refresh-retry mechanism at this layer", async () => {
-    vi.useFakeTimers();
-    const sockets: FakeSocket[] = [];
-    const disconnects: DisconnectPayload[] = [];
-    const fatalEvents: unknown[] = [];
-    const client = new MixerClient("wss://x/tunnel", {
-      token: "t",
-      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
-      onDisconnect: (r) => disconnects.push(r),
-    });
-    client.on("fatal", (e) => fatalEvents.push(e));
-
-    const started = client.start();
-    started.catch(() => {});
-    await tick();
-    sockets[0]!.open();
-    await tick();
-    sockets[0]!.serverClose(4000 + ErrorCode.UNAUTHORIZED, "token rejected");
-    await tick();
-    await vi.advanceTimersByTimeAsync(120000);
-
-    await expect(started).rejects.toBeTruthy();
-    expect(sockets.length).toBe(1); // never retried: no refresh-retry at the WS-close layer
-    expect(fatalEvents).toHaveLength(1);
-    expect(disconnects).toHaveLength(1);
-    expect(disconnects[0]).toMatchObject({
-      phase: "handshake",
-      wsCode: 4000 + ErrorCode.UNAUTHORIZED,
-      errorCode: ErrorCode.UNAUTHORIZED,
-      errorName: "UNAUTHORIZED",
-      fatal: true,
-    });
-  });
+  // 4011 (UNAUTHORIZED) itself moved to "MixerClient change 1/1b: unified
+  // pre-welcome auth-rejection retry" above: a token PROVIDER now gets one
+  // refresh-retry for this shape too (Change 1); this is the STATIC-token
+  // variant that stays fatal on the very first rejection (Change 1b) --
+  // see that describe block for the provider variants (0.3.1 pinned this as
+  // always-fatal, with no distinction between a provider and a static token,
+  // which is no longer the case).
 
   it("bare close 4009 (ENHANCE_YOUR_CALM) before welcome is still non-fatal, normal reconnect", async () => {
     vi.useFakeTimers();
@@ -2007,7 +3647,7 @@ describe("MixerClient handshake failures raised locally carry their own wsCode",
 // surfaces with the peer's own code, and the client sends no reply --------
 
 describe("MixerClient pre-welcome error{} rejection (auth_failure.json shape)", () => {
-  it("error{11 UNAUTHORIZED} before welcome: fatal, wsCode 4011, the server's message, no reply sent, no reconnect, start() rejects", async () => {
+  it("error{11 UNAUTHORIZED} before welcome, STATIC token: fatal, wsCode 4011, the server's message, no reply sent, no reconnect, start() rejects", async () => {
     vi.useFakeTimers();
     const sockets: FakeSocket[] = [];
     const disconnects: DisconnectPayload[] = [];
@@ -2038,7 +3678,7 @@ describe("MixerClient pre-welcome error{} rejection (auth_failure.json shape)", 
     await vi.advanceTimersByTimeAsync(120000); // give a buggy implementation every chance to retry
 
     await expect(started).rejects.toBeTruthy();
-    expect(sockets.length).toBe(1); // never retried
+    expect(sockets.length).toBe(1); // never retried: static token, no refresh possible
     expect(fatalEvents).toHaveLength(1);
     expect(disconnects).toHaveLength(1);
     expect(disconnects[0]).toMatchObject({
@@ -2139,7 +3779,198 @@ describe("MixerClient pre-welcome error{} rejection (auth_failure.json shape)", 
   });
 });
 
-// --- application-initiated close: CLIENT-SDK.md's "Application close" row -
+// --- Change 3: a failure after the 101 and before welcome is ALWAYS phase ---
+// "handshake", reported deterministically regardless of whether 'error' or
+// 'close' happens to arrive first (or 'close' never arrives at all) --------
+
+describe("MixerClient change 3: handshake-phase 'error'/'close' converge on one deterministic report", () => {
+  it("'error' then 'close'(1006) delivered ~2ms later (a later macrotask, matching real ws 8.21's own behaviour): one report, wsCode 1006, no errorCode, non-fatal, reconnect scheduled", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    const disconnects: DisconnectPayload[] = [];
+    const reconnecting: unknown[] = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: "t",
+      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      reconnect: { base: 10, cap: 100 },
+      onDisconnect: (r) => disconnects.push(r),
+    });
+    client.on("reconnecting", (info) => reconnecting.push(info));
+
+    const started = client.start();
+    started.catch(() => {});
+    await tick();
+    sockets[0]!.open();
+    await tick();
+
+    sockets[0]!.emit("error", new Error("read ECONNRESET"));
+    await tick();
+    expect(disconnects).toHaveLength(0); // onSocketError never reports by itself, only records the message
+    // Real `ws` never delivers 'close' in the same microtask as a preceding
+    // 'error' -- a protocol-level failure it detects delivers 'error'
+    // immediately followed by 'close' a macrotask or more later. Schedule it
+    // the same way here (a real timer, not a synchronous emit) instead.
+    setTimeout(() => sockets[0]!.emit("close", 1006, Buffer.from("")), 2);
+    await vi.advanceTimersByTimeAsync(2);
+    await tick();
+
+    expect(disconnects).toHaveLength(1);
+    expect(disconnects[0]).toMatchObject({ phase: "handshake", wsCode: 1006, fatal: false, message: "read ECONNRESET" });
+    expect(disconnects[0]!.errorCode).toBeUndefined();
+    expect(disconnects[0]!.errorName).toBeUndefined();
+    expect(disconnects[0]!.message).not.toMatch(/no welcome within/);
+    expect(reconnecting).toHaveLength(1);
+
+    await vi.advanceTimersByTimeAsync(reconnecting[0]! ? (reconnecting[0] as { delayMs: number }).delayMs : 0);
+    await client.close();
+  });
+
+  it("'close'(1006) then 'error' (a hypothetical ordering real ws never actually produces, but the code stays order-independent): still the same one report", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    const disconnects: DisconnectPayload[] = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: "t",
+      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      reconnect: { base: 10, cap: 100 },
+      onDisconnect: (r) => disconnects.push(r),
+    });
+
+    const started = client.start();
+    started.catch(() => {});
+    await tick();
+    sockets[0]!.open();
+    await tick();
+
+    sockets[0]!.emit("close", 1006, Buffer.from(""));
+    sockets[0]!.emit("error", new Error("read ECONNRESET")); // arrives after 'close' already reported and closed -- a no-op
+    await tick();
+
+    expect(disconnects).toHaveLength(1);
+    expect(disconnects[0]).toMatchObject({ phase: "handshake", wsCode: 1006, fatal: false });
+
+    await vi.advanceTimersByTimeAsync(100);
+    await client.close();
+  });
+
+  it("only 'close'(1006), no 'error' at all: unaffected, still one report", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    const disconnects: DisconnectPayload[] = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: "t",
+      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      reconnect: { base: 10, cap: 100 },
+      onDisconnect: (r) => disconnects.push(r),
+    });
+
+    const started = client.start();
+    started.catch(() => {});
+    await tick();
+    sockets[0]!.open();
+    await tick();
+
+    sockets[0]!.emit("close", 1006, Buffer.from(""));
+    await tick();
+
+    expect(disconnects).toHaveLength(1);
+    expect(disconnects[0]).toMatchObject({ phase: "handshake", wsCode: 1006, fatal: false });
+
+    await vi.advanceTimersByTimeAsync(100);
+    await client.close();
+  });
+
+  it("only 'error', with no 'close' ever following: onSocketError never finalizes anything itself -- the ordinary hello/welcome timeout is what eventually reports it (wsCode 4001), not a second mechanism", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    const disconnects: DisconnectPayload[] = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: "t",
+      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      reconnect: { base: 10, cap: 100 },
+      onDisconnect: (r) => disconnects.push(r),
+    });
+
+    const started = client.start();
+    started.catch(() => {});
+    await tick();
+    sockets[0]!.open();
+    await tick();
+
+    sockets[0]!.emit("error", new Error("boom, no close ever follows"));
+    await tick();
+    // Nothing reported yet: onSocketError only recorded the message, it
+    // never rejects/finalizes the handshake by itself.
+    expect(disconnects).toHaveLength(0);
+
+    await vi.advanceTimersByTimeAsync(10000); // DEFAULT_HELLO_TIMEOUT_MS
+    await tick();
+
+    expect(disconnects).toHaveLength(1);
+    expect(disconnects[0]).toMatchObject({
+      phase: "handshake",
+      wsCode: 4000 + ErrorCode.PROTOCOL_ERROR,
+      errorCode: ErrorCode.PROTOCOL_ERROR,
+      fatal: false,
+    });
+    expect(disconnects[0]!.message).toMatch(/no welcome within/);
+
+    await client.close();
+  });
+
+  it("a connect() cancelled by client.close() mid-handshake is not reported as a handshake failure (unchanged)", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    const disconnects: DisconnectPayload[] = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: "t",
+      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      onDisconnect: (r) => disconnects.push(r),
+    });
+
+    const started = client.start();
+    started.catch(() => {});
+    await tick();
+    sockets[0]!.open();
+    await tick();
+    // hello sent, no welcome yet: MixerConn exists as dialingConn only.
+
+    await client.close();
+    await tick();
+
+    await expect(started).rejects.toBeTruthy();
+    expect(disconnects).toHaveLength(0);
+  });
+
+  it("connected phase: a bare close with no reason yields message 'socket closed with code N', not an empty string (the emitted 'close' payload's message now always gets this fallback, in both phases, not just the handshake-phase pendingHandshakeErrorMessage one)", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    const disconnects: DisconnectPayload[] = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: "t",
+      _wsFactory: makeFactory(sockets),
+      onDisconnect: (r) => disconnects.push(r),
+    });
+
+    const started = client.start();
+    started.catch(() => {});
+    await connectSocket(sockets, 0);
+    await started;
+
+    sockets[0]!.serverClose(4000 + ErrorCode.APPLICATION_CLOSE, "");
+    await tick();
+
+    expect(disconnects).toHaveLength(1);
+    expect(disconnects[0]).toMatchObject({
+      phase: "connected",
+      wsCode: 4000 + ErrorCode.APPLICATION_CLOSE,
+      message: `socket closed with code ${4000 + ErrorCode.APPLICATION_CLOSE}`,
+    });
+    expect(disconnects[0]!.closeReason).toBeUndefined();
+
+    await client.close();
+  });
+});
 
 describe("MixerClient close({ code, message })", () => {
   it("performs error{code,message} + WS close 4000+code (message truncated to 123 bytes), no drain, no reconnect", async () => {
@@ -2284,6 +4115,43 @@ describe("MixerClient close({ code, message })", () => {
     await vi.advanceTimersByTimeAsync(120000);
     expect(sockets.length).toBe(1); // never reconnected
   });
+
+  it("close({code,message}) mid-backoff: stops reconnecting and clears every timer, but -- like plain close() in the same window -- reports nothing (no connection was ever established for this cycle)", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    const disconnects: DisconnectPayload[] = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: "t",
+      _wsFactory: makeFactory(sockets),
+      reconnect: { base: 1000, cap: 60000, stableAfter: 10000 },
+      onDisconnect: (r) => disconnects.push(r),
+    });
+
+    const started = client.start();
+    started.catch(() => {});
+    await connectSocket(sockets, 0);
+    await started;
+
+    // Drop and let it enter "backoff" (a pending reconnect timer, plus the
+    // (already-cleared, since the conn ended) stability timer) before close().
+    sockets[0]!.serverClose(1006, "abnormal");
+    await tick();
+    expect(client.currentState()).toBe("backoff");
+    // The 1006 above already produced its own one non-fatal report.
+    expect(disconnects).toHaveLength(1);
+
+    await client.close({ code: ErrorCode.APPLICATION_CLOSE, message: "operator shutdown" });
+    expect(client.currentState()).toBe("closed");
+    expect(vi.getTimerCount()).toBe(0);
+    // No live connection existed to send error{}/close 4000+code over --
+    // close({code}) mid-backoff degrades to the same "closes, stays closed,
+    // reports nothing" shape as plain close() in this window (there is no
+    // second report for the backoff itself ending).
+    expect(disconnects).toHaveLength(1);
+
+    await vi.advanceTimersByTimeAsync(120000);
+    expect(sockets.length).toBe(1); // never reconnected
+  });
 });
 
 // --- 0x0e APPLICATION_CLOSE: connection-level, non-fatal, starts at cap ---
@@ -2360,6 +4228,7 @@ describe("MixerClient 0x0e APPLICATION_CLOSE", () => {
     expect(disconnects).toHaveLength(1);
     expect(disconnects[0]).toMatchObject({
       wsCode: 4000 + ErrorCode.APPLICATION_CLOSE,
+      errorCode: ErrorCode.APPLICATION_CLOSE,
       errorName: "APPLICATION_CLOSE",
       closeReason: "goodbye",
       fatal: false,
@@ -2368,5 +4237,60 @@ describe("MixerClient 0x0e APPLICATION_CLOSE", () => {
     expect(reconnecting[0]!.delayMs).toBe(60000);
 
     await client.close();
+  });
+
+  it("connected phase: a bare close with an unrecognised ws-mixer code (4777) still derives errorCode 777, errorName INTERNAL_ERROR", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    const disconnects: DisconnectPayload[] = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: "t",
+      _wsFactory: makeFactory(sockets),
+      onDisconnect: (r) => disconnects.push(r),
+    });
+
+    const started = client.start();
+    started.catch(() => {});
+    await connectSocket(sockets, 0);
+    await started;
+
+    sockets[0]!.serverClose(4777, "unknown code");
+    await tick();
+
+    expect(disconnects).toHaveLength(1);
+    expect(disconnects[0]).toMatchObject({
+      phase: "connected",
+      wsCode: 4777,
+      errorCode: 777,
+      errorName: "INTERNAL_ERROR",
+    });
+
+    await client.close();
+  });
+
+  it("connected phase: a bare close in 1000/1001/1006/1009/1011 (not a ws-mixer code) carries no errorCode/errorName", async () => {
+    vi.useFakeTimers();
+    for (const wsCode of [1000, 1001, 1006, 1009, 1011]) {
+      const sockets: FakeSocket[] = [];
+      const disconnects: DisconnectPayload[] = [];
+      const client = new MixerClient("wss://x/tunnel", {
+        token: "t",
+        _wsFactory: makeFactory(sockets),
+        onDisconnect: (r) => disconnects.push(r),
+      });
+
+      const started = client.start();
+      started.catch(() => {});
+      await connectSocket(sockets, 0);
+      await started;
+
+      sockets[0]!.serverClose(wsCode, "");
+      await tick();
+
+      expect(disconnects).toHaveLength(1);
+      expect(disconnects[0]).toMatchObject({ phase: "connected", errorCode: undefined, errorName: undefined });
+
+      await client.close();
+    }
   });
 });

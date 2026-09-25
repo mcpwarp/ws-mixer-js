@@ -1,7 +1,7 @@
 /** Unit tests for MixerStream's state machine, credit accounting and half-close semantics, against a fake StreamHost. */
 import { describe, expect, it, vi } from "vitest";
 import { MixerStream, type StreamHost } from "../src/stream.js";
-import { ErrorCode } from "../src/errors.js";
+import { ErrorCode, StreamError, WsMixerError } from "../src/errors.js";
 import { decodeFrame, FrameType, windowIncrement } from "../src/frame.js";
 
 function fakeHost(): StreamHost & { frames: Uint8Array[]; retired: number[] } {
@@ -386,5 +386,284 @@ describe("MixerStream state machine", () => {
     const web = s.toWeb();
     expect(web.readable).toBeInstanceOf(ReadableStream);
     expect(web.writable).toBeInstanceOf(WritableStream);
+  });
+});
+
+describe("MixerStream.terminateNoThrow: abnormal connection death always errors an open stream (R2)", () => {
+  function abnormalCloseError(): WsMixerError {
+    return new WsMixerError(ErrorCode.INTERNAL_ERROR, "socket closed with code 1006", { wsCode: 1006 });
+  }
+
+  it("no 'error' listener: 'end' is NOT emitted, 'close' fires, stream.errored carries the error, nothing crashes the process", async () => {
+    const host = fakeHost();
+    const s = new MixerStream(1, host, 1024, 1024);
+    let sawEnd = false;
+    let sawClose = false;
+    s.on("data", () => {});
+    s.on("end", () => {
+      sawEnd = true;
+    });
+    s.on("close", () => {
+      sawClose = true;
+    });
+    s.resume(); // flowing mode, so a clean end would surface 'end' here if this bug regressed
+
+    const uncaught: unknown[] = [];
+    const onUncaught = (e: unknown) => uncaught.push(e);
+    process.on("uncaughtException", onUncaught);
+    try {
+      const err = abnormalCloseError();
+      s.terminateNoThrow(err);
+      await new Promise((r) => setImmediate(r));
+
+      expect(sawEnd).toBe(false);
+      expect(sawClose).toBe(true);
+      expect(s.errored).toBe(err);
+      expect(uncaught).toHaveLength(0);
+    } finally {
+      process.off("uncaughtException", onUncaught);
+    }
+  });
+
+  it("with an 'error' listener attached: it receives the connection's error", async () => {
+    const host = fakeHost();
+    const s = new MixerStream(1, host, 1024, 1024);
+    let received: unknown;
+    s.on("error", (e) => {
+      received = e;
+    });
+    const err = abnormalCloseError();
+    s.terminateNoThrow(err);
+    await new Promise((r) => setImmediate(r));
+    expect(received).toBe(err);
+  });
+
+  it("a for-await consumer throws the connection's error instead of completing normally, even with no 'error' listener attached", async () => {
+    const host = fakeHost();
+    const s = new MixerStream(1, host, 1024, 1024);
+    const err = abnormalCloseError();
+    const consume = (async () => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of s) chunks.push(chunk as Buffer);
+      return chunks;
+    })();
+    s.terminateNoThrow(err);
+    await expect(consume).rejects.toBe(err);
+  });
+
+  it("a write blocked on send credit gets the connection's error via its callback, promptly, instead of hanging", async () => {
+    const host = fakeHost();
+    const s = new MixerStream(1, host, 1024, 0); // sendWindow 0: the write blocks immediately in reserveSendCredit
+    const err = abnormalCloseError();
+    const writeErr = await new Promise<Error | null | undefined>((resolve) => {
+      s.write(Buffer.from("hello"), (e) => resolve(e));
+      setImmediate(() => s.terminateNoThrow(err));
+    });
+    expect(writeErr).toBe(err);
+  });
+});
+
+describe("MixerStream.terminateNoThrow: the peer's CLOSE already arrived -- buffered data is preserved, not discarded (R2 gap closed)", () => {
+  function abnormalCloseError(): WsMixerError {
+    return new WsMixerError(ErrorCode.INTERNAL_ERROR, "socket closed with code 1006", { wsCode: 1006 });
+  }
+
+  it("CLOSE already received with data still buffered: a later connection-level failure still delivers the buffered data, then 'end' -- stream.errored stays null, no 'error' fires", async () => {
+    const host = fakeHost();
+    const s = new MixerStream(1, host, 1024, 1024);
+    s.handleData(new TextEncoder().encode("hello"));
+    s.handleClose(); // the peer's CLOSE already arrived; "hello" is still unread, sitting in the buffer
+
+    let sawError = false;
+    s.on("error", () => {
+      sawError = true;
+    });
+
+    const err = abnormalCloseError();
+    s.terminateNoThrow(err); // the connection dies abnormally before "hello" was ever read
+
+    const chunks: Buffer[] = [];
+    for await (const chunk of s) chunks.push(chunk as Buffer);
+    expect(Buffer.concat(chunks).toString()).toBe("hello"); // delivered first, as CLIENT-SDK.md requires
+    expect(s.errored).toBeNull(); // the response DID complete -- no error on the read side
+    expect(sawError).toBe(false);
+  });
+
+  it("CLOSE already received: the WRITE side's callback is settled with the real error once the read side has drained, not before", async () => {
+    const host = fakeHost();
+    const s = new MixerStream(1, host, 1024, 1024);
+    s.handleData(new TextEncoder().encode("hello"));
+    s.handleClose(); // the peer's CLOSE already arrived; "hello" is still unread, sitting in the buffer
+    const err = abnormalCloseError();
+    s.terminateNoThrow(err); // read side pending 'end' until "hello" is consumed below
+
+    const writeErrP = new Promise<Error | null | undefined>((resolve) => {
+      s.write(Buffer.from("still trying to write"), (e) => resolve(e));
+    });
+
+    const chunks: Buffer[] = [];
+    for await (const chunk of s) chunks.push(chunk as Buffer);
+    expect(Buffer.concat(chunks).toString()).toBe("hello"); // read side still delivers what it buffered
+
+    expect(await writeErrP).toBe(err); // the write's callback gets the real terminal error, not a generic one
+    expect(s.destroyed).toBe(true);
+  });
+
+  it("CLOSE already received, terminateNoThrow already ran: a write issued after termination still resolves with the real error, and the buffered read + 'end' + 'close' still happen (write-after-termination)", async () => {
+    const host = fakeHost();
+    const s = new MixerStream(1, host, 1024, 1024);
+    s.handleData(new TextEncoder().encode("hello"));
+    s.handleClose();
+    const err = abnormalCloseError();
+    s.terminateNoThrow(err);
+
+    const events: string[] = [];
+    s.on("end", () => events.push("end"));
+    s.on("close", () => events.push("close"));
+    const closeP = new Promise<void>((resolve) => s.on("close", resolve));
+
+    const writeErrP = new Promise<Error | null | undefined>((resolve) => {
+      s.write(Buffer.from("x"), (e) => resolve(e));
+    });
+
+    const chunks: Buffer[] = [];
+    for await (const chunk of s) chunks.push(chunk as Buffer);
+    expect(Buffer.concat(chunks).toString()).toBe("hello");
+
+    await closeP;
+    expect(events).toEqual(["end", "close"]);
+    expect(await writeErrP).toBe(err);
+  });
+
+  it("a RESET still discards buffered data and errors, even when the peer had already sent CLOSE first -- discardBuffered overrides the CLOSE-preserves-data path", async () => {
+    const host = fakeHost();
+    const s = new MixerStream(1, host, 1024, 1024);
+    let received: unknown;
+    s.on("error", (e) => {
+      received = e;
+    });
+    s.handleData(new TextEncoder().encode("hello"));
+    s.handleClose(); // remoteClosed = true, "hello" still buffered
+    s.handleReset(ErrorCode.CANCEL, "actually never mind"); // RESET arrives after CLOSE -- WIRE.md: RESET discards
+    await new Promise((r) => setImmediate(r));
+
+    expect(s.getState()).toBe("closed");
+    expect(s.destroyed).toBe(true);
+    expect(s.errored).toBeTruthy();
+    expect(s.resetCode).toBe(ErrorCode.CANCEL);
+    expect(received).toBeInstanceOf(StreamError);
+  });
+});
+
+describe("MixerStream.terminateNoThrow: 'close' always fires on the CLOSE-already-arrived path (BUG 1/2)", () => {
+  function abnormalCloseError(): WsMixerError {
+    return new WsMixerError(ErrorCode.INTERNAL_ERROR, "socket closed with code 1006", { wsCode: 1006 });
+  }
+
+  it("CLOSE already received, buffer already empty: a later connection failure still destroys the stream and fires 'close'", async () => {
+    const host = fakeHost();
+    const s = new MixerStream(1, host, 1024, 1024);
+    s.on("error", () => {});
+    s.handleClose(); // remoteClosed = true, nothing buffered -- maybeDeliverEOF already pushed EOF
+    const closeP = new Promise<void>((resolve) => s.on("close", resolve));
+    s.terminateNoThrow(abnormalCloseError());
+    await closeP;
+    expect(s.destroyed).toBe(true);
+  });
+
+  it("CLOSE already received, data still buffered: 'close' fires once the buffered data has been delivered and 'end' fires, with stream.errored staying null", async () => {
+    const host = fakeHost();
+    const s = new MixerStream(1, host, 1024, 1024);
+    s.handleData(new TextEncoder().encode("hello"));
+    s.handleClose();
+    const closeP = new Promise<void>((resolve) => s.on("close", resolve));
+    const err = abnormalCloseError();
+    s.terminateNoThrow(err);
+
+    const chunks: Buffer[] = [];
+    for await (const chunk of s) chunks.push(chunk as Buffer);
+    expect(Buffer.concat(chunks).toString()).toBe("hello");
+    await closeP;
+    expect(s.destroyed).toBe(true);
+    expect(s.errored).toBeNull();
+  });
+
+  it("CLOSE already received with a write still outstanding when the connection dies: the write fails promptly with the real error (not silently, not routed around), the buffered read is still delivered followed by 'end', and the stream still reaches 'close' instead of hanging", async () => {
+    const host = fakeHost();
+    const s = new MixerStream(1, host, 1024, 0); // sendWindow 0: the write blocks in reserveSendCredit, staying queued/"outstanding"
+    s.handleData(new TextEncoder().encode("hello"));
+    s.handleClose(); // remoteClosed = true, "hello" buffered
+    const err = abnormalCloseError();
+
+    const closeP = new Promise<void>((resolve) => s.on("close", resolve));
+    const writeErrP = new Promise<Error | null | undefined>((resolve) => {
+      s.write(Buffer.from("still trying to write"), (e) => resolve(e));
+    });
+    // Let the write settle into writeQueue (blocked on send credit) before
+    // the connection dies, and before anything reads "hello" back out --
+    // terminateNoThrow must see both the outstanding write AND the still-
+    // unread buffer at once.
+    await new Promise((resolve) => setImmediate(resolve));
+    s.terminateNoThrow(err);
+
+    const chunks: Buffer[] = [];
+    for await (const chunk of s) chunks.push(chunk as Buffer);
+    expect(Buffer.concat(chunks).toString()).toBe("hello"); // buffered read is still delivered, not lost
+
+    expect(await writeErrP).toBe(err);
+    await closeP;
+    expect(s.destroyed).toBe(true);
+    expect(s.errored).toBe(err); // Node's own Writable machinery still marks `errored` once the held write callback runs with `err`, even though the read side finished cleanly first (no 'error' event fires, per the other assertions here)
+  });
+
+  it("app calls reset() while a write callback is held back for the read side: the stream destroys, 'close' fires, and the callback still receives the terminal error, instead of hanging forever (BUG 1)", async () => {
+    const host = fakeHost();
+    const s = new MixerStream(1, host, 1024, 0); // sendWindow 0: the write blocks in reserveSendCredit, staying queued/"outstanding"
+    s.handleData(new TextEncoder().encode("hello"));
+    s.handleClose(); // remoteClosed = true, "hello" buffered
+    const err = new WsMixerError(ErrorCode.INTERNAL_ERROR, "socket closed with code 1006", { wsCode: 1006 });
+
+    const writeErrP = new Promise<Error | null | undefined>((resolve) => {
+      s.write(Buffer.from("still trying to write"), (e) => resolve(e));
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    s.terminateNoThrow(err); // holds the write callback back, waiting on the never-to-be-read buffer
+
+    const closeP = new Promise<void>((resolve) => s.on("close", resolve));
+    s.reset(ErrorCode.CANCEL, "giving up"); // nobody ever reads "hello" -- reset() must still unstick this
+
+    await closeP;
+    expect(s.destroyed).toBe(true);
+    expect(await writeErrP).toBe(err);
+  });
+
+  it("write with no reader attached: the callback stays uncalled until the read side is actually drained, then 'end'/'close' fire and the callback runs with the terminal error (documented tradeoff)", async () => {
+    const host = fakeHost();
+    const s = new MixerStream(1, host, 1024, 0); // sendWindow 0: the write blocks in reserveSendCredit, staying queued/"outstanding"
+    s.handleData(new TextEncoder().encode("hello"));
+    s.handleClose(); // remoteClosed = true, "hello" buffered, nobody reading
+    const err = new WsMixerError(ErrorCode.INTERNAL_ERROR, "socket closed with code 1006", { wsCode: 1006 });
+
+    let writeErr: Error | null | undefined = "unsettled" as unknown as Error | null | undefined;
+    s.write(Buffer.from("x"), (e) => {
+      writeErr = e;
+    });
+    await new Promise((r) => setImmediate(r)); // let the write settle into writeQueue, blocked on send credit, before terminating
+    s.terminateNoThrow(err);
+    await new Promise((r) => setImmediate(r));
+    expect(writeErr).toBe("unsettled"); // no reader yet -- callback must not have run
+
+    const events: string[] = [];
+    s.on("end", () => events.push("end"));
+    s.on("close", () => events.push("close"));
+    const closeP = new Promise<void>((resolve) => s.on("close", resolve));
+
+    const chunks: Buffer[] = [];
+    for await (const chunk of s) chunks.push(chunk as Buffer); // attach a reader now
+    expect(Buffer.concat(chunks).toString()).toBe("hello");
+
+    await closeP;
+    expect(events).toEqual(["end", "close"]);
+    expect(writeErr).toBe(err);
   });
 });
