@@ -19,9 +19,6 @@ jobs:
           go-version: "1.24"
       - run: npm ci
       - run: npm run build
-      # spec.pin does not resolve until ws-mixer-spec is pushed to GitHub --
-      # until then this step (and the run below) fail; see
-      # docs/MIGRATION.md section 6 step 15.
       - run: npm run fetch-spec
       # .spec is its own Go module and this repo has no go.mod at all, so
       # `go run "$PWD/.spec/..."` fails outright -- cd into .spec and run it
@@ -40,3 +37,42 @@ jobs:
         with:
           name: conformance-report
           path: build/conformance.xml
+
+  pair-go-js:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - run: npm ci
+      - run: npm run build
+      - run: npm run fetch-spec
+      - run: npm run fetch-goserver
+      # .goserver is ws-mixer-go at goserver.pin, its own Go module; the
+      # conformance tag compiles in wsmixer.AllowSubfloorTiming, which the
+      # adapter needs (same build as ws-mixer-go's own pair-go-go job).
+      - name: build go adapter
+        run: |
+          repo="$PWD"
+          (cd .goserver && go build -tags conformance -o "$repo/build/go-adapter" ./cmd/conformance-adapter)
+      # --sdk go,js runs both the go->go and go->js pairs, so a go->go FAIL also fails this job.
+      # The go->js floor in COUNTS.json is enforced here: the runner at spec.pin >= v0.4.1 checks floors on --sdk/--mode-filtered runs.
+      - name: run conformance runner (go server x js client, pair mode)
+        run: |
+          repo="$PWD"
+          (cd .spec && go run ./conformance/runner \
+            --spec-root "$repo/.spec" \
+            --adapter "go=$repo/build/go-adapter,js=$repo/conformance/adapter/run" \
+            --sdk go,js --mode pair \
+            --counts "$repo/conformance/COUNTS.json" \
+            --report "$repo/build/conformance-pair.xml")
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: conformance-pair-report
+          path: build/conformance-pair.xml

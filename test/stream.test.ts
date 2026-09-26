@@ -667,3 +667,207 @@ describe("MixerStream.terminateNoThrow: 'close' always fires on the CLOSE-alread
     expect(writeErr).toBe(err);
   });
 });
+
+describe("MixerStream.drainWriteQueue: a write that fails outside termination reports its error, never a false success", () => {
+  /**
+   * Runs `body`, collecting any uncaughtException/unhandledRejection raised while it (and one
+   * macrotask after it) runs -- an unlistened 'error' emitted from inside drainWriteQueue's async
+   * loop surfaces as the latter.
+   */
+  async function collectUncaught(body: () => Promise<void>): Promise<unknown[]> {
+    const uncaught: unknown[] = [];
+    const onUncaught = (e: unknown) => uncaught.push(e);
+    process.on("uncaughtException", onUncaught);
+    process.on("unhandledRejection", onUncaught);
+    try {
+      await body();
+      await new Promise((r) => setImmediate(r));
+    } finally {
+      process.off("uncaughtException", onUncaught);
+      process.off("unhandledRejection", onUncaught);
+    }
+    return uncaught;
+  }
+
+  it("no 'error' listener, the connection's send rejects mid-drain: the callback gets that error, a promisified write rejects, nothing crashes", async () => {
+    const host = fakeHost();
+    const sendErr = new Error("socket write failed");
+    host.sendData = vi.fn(async () => {
+      throw sendErr;
+    });
+    const s = new MixerStream(1, host, 1024, 1024);
+    const { promisify } = await import("node:util");
+    const write = promisify((chunk: Buffer, cb: (e?: Error | null) => void) => s.write(chunk, cb));
+
+    const uncaught = await collectUncaught(async () => {
+      await expect(write(Buffer.from("hello"))).rejects.toBe(sendErr);
+    });
+    expect(uncaught).toHaveLength(0);
+    expect(s.errored).toBe(sendErr);
+  });
+
+  it("no 'error' listener, a write blocked on send credit is rejected by closeWrite(): the callback gets STREAM_CLOSED, nothing crashes", async () => {
+    const host = fakeHost();
+    const s = new MixerStream(1, host, 1024, 0); // sendWindow 0: the write blocks in reserveSendCredit
+    let writeErr: Error | null | undefined;
+    const uncaught = await collectUncaught(async () => {
+      const writeErrP = new Promise<Error | null | undefined>((resolve) => {
+        s.write(Buffer.from("hello"), (e) => resolve(e));
+      });
+      await new Promise((r) => setImmediate(r));
+      s.closeWrite();
+      s.handleWindow(100); // wakes the waiter, which now sees half_closed_local and rejects
+      writeErr = await writeErrP;
+    });
+    expect(writeErr).toBeInstanceOf(StreamError);
+    expect((writeErr as StreamError).code).toBe(ErrorCode.STREAM_CLOSED);
+    expect(uncaught).toHaveLength(0);
+
+    // The failed write errored the read side too, before the peer finished sending: DATA + CLOSE arriving afterwards are accepted by the state machine but never reach a reader.
+    s.handleData(new TextEncoder().encode("late"));
+    s.handleClose();
+    expect(s.getState()).toBe("closed");
+    expect(s.errored).toBe(writeErr);
+    const events: string[] = [];
+    s.on("data", () => events.push("data"));
+    s.on("end", () => events.push("end"));
+    await new Promise((r) => setImmediate(r));
+    expect(events).toEqual([]);
+  });
+
+  it("peer CLOSE already arrived with data buffered, no 'error' listener, the send rejects before any teardown: the buffer, 'end' and 'close' are still delivered, and the callback is held until after 'end'", async () => {
+    const host = fakeHost();
+    const sendErr = new Error("WebSocket is not open: readyState 2 (CLOSING)");
+    host.sendData = vi.fn(async () => {
+      throw sendErr;
+    });
+    const s = new MixerStream(1, host, 1024, 1024);
+    s.handleData(new TextEncoder().encode("hello"));
+    s.handleClose(); // remoteClosed = true, "hello" still buffered
+
+    const events: string[] = [];
+    let writeErr: Error | null | undefined;
+    s.write(Buffer.from("x"), (e) => {
+      writeErr = e;
+      events.push("write-cb");
+    });
+    await new Promise((r) => setImmediate(r)); // the send has rejected; no teardown has reached the stream yet
+    expect(events).toEqual([]);
+    expect(s.errored).toBeNull();
+
+    s.on("end", () => events.push("end"));
+    s.on("close", () => events.push("close"));
+    const closeP = new Promise<void>((resolve) => s.on("close", resolve));
+    const connErr = new WsMixerError(ErrorCode.INTERNAL_ERROR, "socket closed with code 1006", { wsCode: 1006 });
+    s.terminateNoThrow(connErr); // what MixerConn.rejectOutstanding() does once the socket's 'close' follows
+
+    const chunks: Buffer[] = [];
+    for await (const chunk of s) chunks.push(chunk as Buffer);
+    expect(Buffer.concat(chunks).toString()).toBe("hello");
+    await closeP;
+    expect(events).toEqual(["end", "write-cb", "close"]);
+    expect(writeErr).toBe(connErr);
+    expect(s.errored).toBe(connErr); // marked by Node's Writable once the held callback runs, after the read side finished
+  });
+
+  it("peer CLOSE already arrived with data buffered, the send rejects, then the app calls closeWrite() before any teardown: draining the buffer still settles the held callback and fires 'close'", async () => {
+    const host = fakeHost();
+    const sendErr = new Error("WebSocket is not open: readyState 2 (CLOSING)");
+    host.sendData = vi.fn(async () => {
+      throw sendErr;
+    });
+    const s = new MixerStream(1, host, 1024, 1024);
+    s.handleData(new TextEncoder().encode("hello"));
+    s.handleClose();
+
+    const events: string[] = [];
+    let writeErr: Error | null | undefined;
+    s.write(Buffer.from("x"), (e) => {
+      writeErr = e;
+      events.push("write-cb");
+    });
+    await new Promise((r) => setImmediate(r)); // the send has rejected and is held
+    s.closeWrite(); // closed + retired: MixerConn's teardown will never reach this stream now
+    expect(s.getState()).toBe("closed");
+    expect(host.retired).toEqual([1]);
+
+    s.on("end", () => events.push("end"));
+    s.on("close", () => events.push("close"));
+    const closeP = new Promise<void>((resolve) => s.on("close", resolve));
+    const chunks: Buffer[] = [];
+    for await (const chunk of s) chunks.push(chunk as Buffer);
+    expect(Buffer.concat(chunks).toString()).toBe("hello");
+    await closeP;
+    expect(events).toEqual(["end", "write-cb", "close"]);
+    expect(writeErr).toBe(sendErr);
+    expect(s.destroyed).toBe(true);
+  });
+
+  it("peer CLOSE already arrived with data buffered, the send rejects, no teardown and no closeWrite(): draining the buffer settles the held callback after 'end', and the later teardown fires 'close'", async () => {
+    const host = fakeHost();
+    const sendErr = new Error("WebSocket is not open: readyState 2 (CLOSING)");
+    host.sendData = vi.fn(async () => {
+      throw sendErr;
+    });
+    const s = new MixerStream(1, host, 1024, 1024);
+    s.handleData(new TextEncoder().encode("hello"));
+    s.handleClose();
+
+    const events: string[] = [];
+    const writeErrP = new Promise<Error | null | undefined>((resolve) => {
+      s.write(Buffer.from("x"), (e) => {
+        events.push("write-cb");
+        resolve(e);
+      });
+    });
+    await new Promise((r) => setImmediate(r));
+    s.on("end", () => events.push("end"));
+    const chunks: Buffer[] = [];
+    for await (const chunk of s) chunks.push(chunk as Buffer);
+    expect(Buffer.concat(chunks).toString()).toBe("hello");
+    expect(await writeErrP).toBe(sendErr);
+    expect(events).toEqual(["end", "write-cb"]);
+    expect(s.getState()).toBe("half_closed_remote");
+
+    const closeP = new Promise<void>((resolve) => s.on("close", resolve));
+    s.terminateNoThrow(new WsMixerError(ErrorCode.INTERNAL_ERROR, "socket closed with code 1006", { wsCode: 1006 }));
+    await closeP;
+  });
+
+  it("peer CLOSE already arrived and 'end' already fired, the send rejects before any teardown: the callback gets the send error right away, and teardown still fires 'close'", async () => {
+    const host = fakeHost();
+    const sendErr = new Error("WebSocket is not open: readyState 2 (CLOSING)");
+    host.sendData = vi.fn(async () => {
+      throw sendErr;
+    });
+    const s = new MixerStream(1, host, 1024, 1024);
+    s.handleClose(); // nothing buffered: EOF pushed right away
+    const chunks: Buffer[] = [];
+    for await (const chunk of s) chunks.push(chunk as Buffer);
+    expect(s.readableEnded).toBe(true);
+
+    const writeErr = await new Promise<Error | null | undefined>((resolve) => {
+      s.write(Buffer.from("x"), (e) => resolve(e));
+    });
+    expect(writeErr).toBe(sendErr);
+    const closeP = new Promise<void>((resolve) => s.on("close", resolve));
+    const connErr = new WsMixerError(ErrorCode.INTERNAL_ERROR, "socket closed with code 1006", { wsCode: 1006 });
+    s.terminateNoThrow(connErr);
+    await closeP;
+  });
+
+  it("with an 'error' listener: the callback gets the send error and the listener fires with the same error", async () => {
+    const host = fakeHost();
+    const sendErr = new Error("socket write failed");
+    host.sendData = vi.fn(async () => {
+      throw sendErr;
+    });
+    const s = new MixerStream(1, host, 1024, 1024);
+    const errP = new Promise<Error>((resolve) => s.on("error", resolve));
+    const writeErr = await new Promise<Error | null | undefined>((resolve) => {
+      s.write(Buffer.from("hello"), (e) => resolve(e));
+    });
+    expect(writeErr).toBe(sendErr);
+    expect(await errP).toBe(sendErr);
+  });
+});

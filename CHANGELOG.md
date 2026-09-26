@@ -2,6 +2,37 @@
 
 All notable changes to `@mcpwarp/ws-mixer` (the JS/TypeScript client SDK) are documented here.
 
+## 0.6.0 - 2026-09-26
+
+- A stream write that fails outside stream termination now reports that error to its write callback,
+  so a promisified/awaited write rejects. Previously, with no `'error'` listener attached, the
+  callback was called with no error — the write reported success even though its bytes were never
+  sent.
+  - On a stream whose peer CLOSE already arrived, a write whose socket send fails before the
+    connection's teardown reaches the stream is held, the same way as 0.4.0's held writes: the
+    buffered data, `'end'` and `'close'` are still delivered, and the callback is settled once the
+    read side has emitted `'end'` (or the stream is destroyed first) — with the error of whatever
+    tore the stream down first (connection teardown, or the app's own `destroy()`/`reset()`),
+    otherwise the send's own error. This no longer depends on teardown reaching the stream, so it
+    also holds after the app's own `closeWrite()`. If `'end'` had already fired, the callback gets
+    the send's error immediately.
+    With an `'error'` listener attached, 0.5.0 instead failed the callback immediately, which
+    errored the read side and blocked `'end'`; that is fixed too.
+  - Otherwise the callback gets the error immediately. This includes a write rejected after the
+    app's own `closeWrite()`: for a stream with no `'error'` listener it now also marks the stream
+    errored (`stream.errored` carries the error), same as before with a listener. If nothing is
+    listening, the SDK's internal no-op `'error'` listener is attached first, so the failure never
+    crashes the process.
+- CI: a new `pair-go-js` conformance job runs the go->js pair matrix (`--mode pair`) against
+  ws-mixer-go at `goserver.pin`, with a `go->js: 10` floor in `conformance/COUNTS.json` (all 10 pair
+  scenarios pass at spec v0.4.0 / ws-mixer-go v0.6.0). `spec.pin` is v0.4.1 in this release, whose
+  runner enforces COUNTS on `--sdk`/`--mode`-filtered runs, so the floor is live.
+- Docs: nearly all comments (84 of 88 references) now cite the split spec docs (`WIRE.md` section
+  2.x, `CLIENT-SDK.md` rows, and this repo's `docs/DESIGN.md`) instead of the old monorepo
+  `OVERVIEW.md` section numbers. The remaining four point at material that no longer exists in any
+  spec doc and are left as-is (`conn.ts`, `control.test.ts` ×2, `reconnect.test.ts`).
+  Comment-only; no behaviour change.
+
 ## 0.5.0 - 2026-09-25
 
 - **Breaking:** `MixerClient.close()`'s options no longer take a `code` — `close({message})` always

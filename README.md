@@ -174,7 +174,7 @@ token expiry on some later reconnect still gets its one retry.
 a fatal close/HTTP status, or `maxAttempts` exhausted before any connection ever succeeded). After
 that, `MixerClient` owns a persistent reconnect loop, a single state machine
 (`idle -> dialing -> connected -> backoff -> ...`, terminating in `closed`) driven entirely by
-`src/client.ts` and OVERVIEW.md section 2.9.
+`src/client.ts` and WIRE.md section 2.9.
 
 Three phases, referenced throughout this section and in `DisconnectReason.phase`:
 
@@ -202,7 +202,7 @@ Three phases, referenced throughout this section and in `DisconnectReason.phase`
 ### Stability and `reconnect.stableAfter`
 
 `reconnect.stableAfter` (default `10000`ms) is how long a connection must stay up past `welcome`
-before it's considered **stable** (WIRE.md/OVERVIEW.md section 2.9's `stable`). Only once a
+before it's considered **stable** (WIRE.md section 2.9's `stable`). Only once a
 connection reaches stability does the SDK reset:
 
 - The backoff attempt counter (`attempt`), which drives both the full-jitter delay's ceiling and
@@ -280,16 +280,16 @@ never a first report for the failure followed by a second one for giving up.
 |---|---|
 | `phase` | `"dial"` (opening the socket / the auth handshake), `"handshake"` (`hello`/`welcome` after the socket opened), or `"connected"` (after `welcome`). Always present. |
 | `wsCode` | The WebSocket close code, when a WS close occurred (including the SDK's own locally-generated code for a close it initiated itself, e.g. `4001` for a hello/welcome timeout). When derived from a ws-mixer error (this side's own error, or a peer's `error{code}`), this is always the semantic `4000+error_code` -- for a `code > 999` that differs from the `4002` actually sent on the wire (illegal WS close codes are clamped; see `errorCode`, which always keeps the real, unclamped value). When instead observed directly from a bare close frame with no preceding `error{}`, `wsCode` is exactly what was on the wire. |
-| `errorCode` | The ws-mixer error code (OVERVIEW.md section 2.8), present under exactly three conditions (D-2026-09-20-09): a ws-mixer `error{}` preceded the close; the close carries a **bare** ws-mixer close code in `4001`-`4999` (derived mechanically as `wsCode - 4000`); or the SDK itself raised a ws-mixer error locally, with no close frame involved yet (a missing/mismatched subprotocol echo -> `UNSUPPORTED`, the welcome timeout -> `PROTOCOL_ERROR`, and the SDK's own other protocol-violation failures). **Never** synthesised for anything else: an HTTP upgrade rejection (401/403/404/429) is `httpStatus` alone, and an abnormal closure (`1006`) or other non-ws-mixer close code (`1000`, `1001`, `1009`, `1011`, ...) carries neither. Also absent for a token-provider throw/reject: that's an application error, not a wire error. |
+| `errorCode` | The ws-mixer error code (WIRE.md section 2.8), present under exactly three conditions (D-2026-09-20-09): a ws-mixer `error{}` preceded the close; the close carries a **bare** ws-mixer close code in `4001`-`4999` (derived mechanically as `wsCode - 4000`); or the SDK itself raised a ws-mixer error locally, with no close frame involved yet (a missing/mismatched subprotocol echo -> `UNSUPPORTED`, the welcome timeout -> `PROTOCOL_ERROR`, and the SDK's own other protocol-violation failures). **Never** synthesised for anything else: an HTTP upgrade rejection (401/403/404/429) is `httpStatus` alone, and an abnormal closure (`1006`) or other non-ws-mixer close code (`1000`, `1001`, `1009`, `1011`, ...) carries neither. Also absent for a token-provider throw/reject: that's an application error, not a wire error. |
 | `errorName` | That error code's wire name (e.g. `"KEEPALIVE_TIMEOUT"`). |
 | `httpStatus` | The HTTP status of the upgrade response, when the dial failed at the HTTP layer (401/403/404/429). |
 | `fatal` | Whether the SDK will never reconnect after this (includes `reconnect.maxAttempts` exhaustion). |
 | `message` | Human-readable description; never empty -- a close observed with no reason at all (from the peer, or `ws` itself) still falls back to a description like `"socket closed with code 4014"`. |
-| `closeReason` | The reason field of the close frame **received from the peer**, verbatim -- never this side's own outgoing reason. Absent or empty whenever no reason was received from the peer: an abnormal closure (no close frame at all), this side having initiated the close itself (a peer's echo carries no information and RFC 6455 doesn't require it to copy the reason), or the SDK closing on a peer's `error{}` without reading whatever close frame follows it (OVERVIEW.md section 2.7 allows "logs, surfaces and closes"). The human-readable text is in `message` for all of those cases instead -- consumers SHOULD prefer `closeReason` and fall back to `message`. |
+| `closeReason` | The reason field of the close frame **received from the peer**, verbatim -- never this side's own outgoing reason. Absent or empty whenever no reason was received from the peer: an abnormal closure (no close frame at all), this side having initiated the close itself (a peer's echo carries no information and RFC 6455 doesn't require it to copy the reason), or the SDK closing on a peer's `error{}` without reading whatever close frame follows it (WIRE.md section 2.7 allows "logs, surfaces and closes"). The human-readable text is in `message` for all of those cases instead -- consumers SHOULD prefer `closeReason` and fall back to `message`. |
 | `cause` | The token provider's thrown/rejected error, when that's why the dial failed (including a `TokenUnavailableError`-marked, non-fatal one). |
 
 `sendApp()` returns a `Promise<void>` that resolves once the frame is actually written to the
-socket (OVERVIEW.md section 4), or rejects with the connection's terminal error if the connection
+socket (`docs/DESIGN.md`), or rejects with the connection's terminal error if the connection
 fails before it gets there -- `conn.ts`'s control queue carries a resolver per queued frame the same
 way `sendData()`'s per-stream outbox already does for stream bytes.
 

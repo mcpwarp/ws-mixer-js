@@ -1,7 +1,7 @@
 /**
  * MixerConn unit tests against the FakeWS transport: handshake, dispatch of
  * OPEN/DATA/WINDOW/CLOSE/RESET, credit-violation -> connection error, and
- * the round-robin DATA writer's exact interleaving (OVERVIEW.md section 2.6
+ * the round-robin DATA writer's exact interleaving (WIRE.md section 2.6
  * rule 3).
  */
 import { describe, expect, it } from "vitest";
@@ -689,7 +689,7 @@ describe("MixerConn peer error{} handling (item 4)", () => {
     const close = await closeP;
     expect(close.wsCode).toBe(4000 + ErrorCode.FLOW_CONTROL_ERROR);
     expect(close.errorCode).toBe(ErrorCode.FLOW_CONTROL_ERROR);
-    // Must not reply with its own error{} (OVERVIEW.md section 2.7): no
+    // Must not reply with its own error{} (WIRE.md section 2.7): no
     // stream-0 DATA frame carrying {"t":"error"} was ever sent back.
     const sentErrorReplies = ws.sent.filter((f) => {
       let frame;

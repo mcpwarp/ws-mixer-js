@@ -88,7 +88,7 @@ const state = {
   // grow past the cap -- it error-acks the new command with "queue_full"
   // instead.
   //
-  // RESET (OVERVIEW.md section 2.5: abortive, discards buffered data and
+  // RESET (WIRE.md section 2.5: abortive, discards buffered data and
   // unblocks writers) deliberately does NOT go through this queue --
   // resetStream below marks it aborted and drains any operations still
   // sitting in `items` with an error ack, then calls stream.reset()
@@ -188,7 +188,7 @@ function teardownAllStreams() {
 
 // drainAbortedOps error-acks every item still queued in q.items (queued
 // write/close_write commands that never got to run) after a RESET has
-// marked the queue aborted -- see resetStream and OVERVIEW.md section 2.5
+// marked the queue aborted -- see resetStream and WIRE.md section 2.5
 // ("RESET is abortive; it discards buffered data and unblocks writers").
 function drainAbortedOps(q) {
   const pending = q.items.splice(0, q.items.length);
@@ -199,7 +199,7 @@ function drainAbortedOps(q) {
 
 // resetStream runs RESET out-of-band, immediately, bypassing the
 // write/close_write FIFO (see the streamQueues field comment and
-// OVERVIEW.md section 2.5): it marks the queue aborted and drains anything
+// WIRE.md section 2.5): it marks the queue aborted and drains anything
 // still sitting in it with an error ack, then calls stream.reset(), which
 // discards buffered data, unblocks the peer, and (by destroying the
 // MixerStream) unblocks a write that is already running on the queue and
@@ -248,7 +248,7 @@ function wireStream(stream) {
   stream.on("end", () => {
     emit({ event: "stream_closed", id: stream.id, direction: "read", t_ms: tMs() });
     if (noteHalfClosed(stream.id, "read")) {
-      // Both directions closed: the stream is fully terminal (OVERVIEW.md
+      // Both directions closed: the stream is fully terminal (WIRE.md
       // section 2.5) -- tear down its bookkeeping now.
       emit({ event: "stream_closed", id: stream.id, direction: "both", t_ms: tMs() });
       teardownStream(stream.id);
@@ -465,7 +465,7 @@ async function handleCommand(cmd) {
         emit({ event: "stream_closed", id: cmd.id, direction: "write", t_ms: tMs() });
         if (noteHalfClosed(cmd.id, "write")) {
           // Both directions closed: the stream is fully terminal
-          // (OVERVIEW.md section 2.5) -- tear down its bookkeeping now.
+          // (WIRE.md section 2.5) -- tear down its bookkeeping now.
           emit({ event: "stream_closed", id: cmd.id, direction: "both", t_ms: tMs() });
           teardownStream(cmd.id);
         }
@@ -474,7 +474,7 @@ async function handleCommand(cmd) {
     }
 
     case "reset": {
-      // RESET is abortive (OVERVIEW.md section 2.5) and runs out-of-band,
+      // RESET is abortive (WIRE.md section 2.5) and runs out-of-band,
       // immediately -- it must not wait behind a blocked write on the
       // per-stream FIFO the way write/close_write do. See resetStream.
       const stream = state.streams.get(cmd.id);

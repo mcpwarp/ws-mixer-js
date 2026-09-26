@@ -1,7 +1,7 @@
 /**
  * MixerStream: one ws-mixer byte stream, exposed as a Node Duplex.
  * Mirrors `go/wsmixer/stream.go`'s state machine, credit accounting and
- * half-close semantics (OVERVIEW.md section 2.5-2.6). The JS SDK is always
+ * half-close semantics (WIRE.md section 2.5-2.6). The JS SDK is always
  * the answering peer: it never opens streams, only receives OPEN from the
  * server and reads/writes/closes/resets what arrives.
  *
@@ -24,7 +24,7 @@ import { truncateUtf8 } from "./util.js";
 
 export type StreamState = "idle" | "open" | "half_closed_local" | "half_closed_remote" | "closed";
 
-/** Attached by terminateNoThrow() when nothing else is listening for 'error', purely so Node's own unlistened-'error' crash never fires -- see its doc comment. */
+/** Attached by terminateNoThrow() (and drainWriteQueue's failed-write path) when nothing else is listening for 'error', purely so Node's own unlistened-'error' crash never fires -- see terminateNoThrow's doc comment. */
 const NOOP_ERROR_LISTENER = () => {};
 
 /** Payload of the `'reset'` event: fired once, whenever this stream is RESET by something other than the app's own reset() call -- a peer RESET (handleReset()) or an SDK-detected violation (abort()) -- whether or not an `'error'` listener is attached. */
@@ -61,7 +61,7 @@ export class MixerStream extends Duplex {
   /** Bytes queued via _write, waiting on credit; drives backpressure. */
   private writeQueue: Array<{ chunk: Uint8Array; callback: (err?: Error | null) => void }> = [];
   private draining = false;
-  /** Write callbacks (_write's own terminal-error branch, or drainWriteQueue's catch) whose error must wait until the read side has finished delivering buffered data and emitted 'end' -- see terminateNoThrow's doc comment. Non-null exactly while that wait is pending; flushed (and reset to null) from _destroy(). */
+  /** Write callbacks (_write's own terminal-error branch, or drainWriteQueue's catch) whose error must wait until the read side has finished delivering buffered data and emitted 'end' -- see terminateNoThrow's doc comment. Non-null exactly while that wait is pending; flushed (and reset to null) from _destroy(), or from the 'end' listener drainWriteQueue's catch installs. */
   private heldWriteCallbacks: Array<(err?: Error | null) => void> | null = null;
 
   /** Set once this stream is RESET -- by the peer (handleReset), the SDK (abort()), or the app itself (reset()); undefined until then. Set even when no `'error'` listener is attached. */
@@ -179,14 +179,63 @@ export class MixerStream extends Duplex {
           this.heldWriteCallbacks.push(callback);
           continue;
         }
-        // Otherwise, same rationale as handleReset(): don't hand Node's writable
-        // machinery an error it will re-emit as 'error' with nobody there to
-        // hear it. `hasErrorListener()` can be true here purely because
-        // terminateNoThrow() already attached its own internal no-op
-        // listener (this write is failing precisely because the stream was
-        // just terminated) -- that still makes it safe to pass the real
-        // error through, it just doesn't mean "the app is listening".
-        callback(this.hasErrorListener() ? (e as Error) : undefined);
+        if (this.state === "half_closed_remote") {
+          // Same hazard, reached before terminateNoThrow() has run: the
+          // peer's CLOSE already arrived, so the read side may still be
+          // delivering buffered data, and the only way a send rejects here
+          // is the connection's writer failing this chunk's socket write.
+          // Once 'end' has fired there's nothing left to block, so fail the
+          // callback now. Otherwise hold it until 'end', without relying on
+          // teardown to flush it: the app's closeWrite() can retire the
+          // stream before the socket's 'close' arrives, and then
+          // rejectOutstanding() never reaches it. `failure` is the fallback
+          // for a flush with no terminalError of its own.
+          const failure = e as Error;
+          if (!this.hasErrorListener()) {
+            this.on("error", NOOP_ERROR_LISTENER);
+          }
+          if (this.readableEnded) {
+            callback(failure);
+            continue;
+          }
+          this.heldWriteCallbacks = [(err) => callback(err ?? failure)];
+          // Deferred a tick past 'end' so every 'end' listener -- the app's,
+          // and Node's own for-await/pipeline() handling -- has run before
+          // the callback's error can re-emit as 'error'.
+          this.once("end", () =>
+            process.nextTick(() => {
+              if (this.destroyed || !this.heldWriteCallbacks) return;
+              // Closed by closeWrite(): already retired, so nothing else
+              // will ever destroy it, and 'close' needs a destroy() on an
+              // `autoDestroy: false` Duplex. _destroy() flushes, after
+              // destroy has begun, so Node doesn't re-emit the error.
+              if (this.state === "closed") {
+                this.destroy();
+                return;
+              }
+              // Still half_closed_remote: the teardown that's still coming
+              // destroys it (right away, the buffer being empty now), but
+              // the callback doesn't wait on it; _destroy() then finds the
+              // array null.
+              const held = this.heldWriteCallbacks;
+              this.heldWriteCallbacks = null;
+              for (const cb of held) cb(this.terminalError ?? undefined);
+            }),
+          );
+          continue;
+        }
+        // Otherwise the write failed and its caller must hear that. Node's
+        // Writable machinery re-emits a write callback's error as 'error', so
+        // -- same rationale as terminateNoThrow() -- attach the internal no-op
+        // listener first if nothing else is listening: this catch is also
+        // reachable before terminateNoThrow() has run at all (the connection's
+        // writer failed this chunk's socket write, and teardown follows from
+        // the socket's own 'close'), and a dying connection must not crash a
+        // consumer that never attached its own 'error'.
+        if (!this.hasErrorListener()) {
+          this.on("error", NOOP_ERROR_LISTENER);
+        }
+        callback(e as Error);
       }
     }
   }
@@ -248,7 +297,7 @@ export class MixerStream extends Duplex {
     this.recvWindow -= n;
     // push() delivers bytes to the Duplex's readable side; credit is granted
     // back to the peer as the *application* consumes them (creditConsumed),
-    // not on receipt (OVERVIEW.md section 2.6). The read() override below
+    // not on receipt (WIRE.md section 2.6). The read() override below
     // covers three of the four consumption modes (read(), pipe() and
     // for-await both drive Node's internal flow loop through the public
     // read() method) -- but Node has a "fast path" for on('data')/pipe()
@@ -313,7 +362,7 @@ export class MixerStream extends Duplex {
    */
   handleWindow(increment: number): void {
     // WINDOW must be tolerated on a half-closed or fully-closed stream (the
-    // one race the ordered transport does not remove, OVERVIEW.md section
+    // one race the ordered transport does not remove, WIRE.md section
     // 2.5); only the cumulative overflow case is rejected.
     const newWindow = this.sendWindow + increment;
     if (newWindow > MAX_SEND_WINDOW) {
@@ -347,7 +396,7 @@ export class MixerStream extends Duplex {
   }
 
   // CLOSE preserves buffered data; EOF (push(null)) only follows once every
-  // buffered byte has been delivered to the application (OVERVIEW.md section
+  // buffered byte has been delivered to the application (WIRE.md section
   // 2.5: "deliver those bytes and *then* EOF"). Called both right after
   // handleClose() (buffer may already be empty) and from creditConsumed() as
   // the application keeps draining the buffer.
@@ -358,7 +407,7 @@ export class MixerStream extends Duplex {
     }
   }
 
-  /** True once something is listening for `'error'`: gates whether a peer RESET may destroy(err) (see handleReset). */
+  /** True once something is listening for `'error'`: gates attaching the internal no-op `'error'` listener (terminateNoThrow, drainWriteQueue). */
   private hasErrorListener(): boolean {
     return this.listenerCount("error") > 0;
   }
@@ -578,9 +627,8 @@ export class MixerStream extends Duplex {
    * Aborts the stream in both directions with the given error code and
    * message, discarding buffered data. `code` may be a numeric ws-mixer.v1
    * error code or its wire name (e.g. `"CANCEL"`); `message` is truncated to
-   * 256 UTF-8 bytes on a character boundary (OVERVIEW.md section 2.7's
-   * `drain.message` limit; RESET has no documented cap of its own, so this
-   * mirrors that ceiling defensively).
+   * 256 UTF-8 bytes on a character boundary (WIRE.md section 2.3: a RESET
+   * message SHOULD be <= 256 B).
    *
    * Same "don't throw with nobody listening" rule as handleReset(): an
    * internal no-op 'error' listener (attached by terminateNoThrow() when

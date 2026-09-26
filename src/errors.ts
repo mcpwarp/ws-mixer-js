@@ -1,5 +1,5 @@
 /**
- * ws-mixer.v1 error code table (OVERVIEW.md section 2.8). Shared by stream
+ * ws-mixer.v1 error code table (WIRE.md section 2.8). Shared by stream
  * RESET frames and the connection-level `error` control message.
  *
  * 0x0000_0000-0x0000_0fff is reserved for ws-mixer; codes >= 0x1000_0000 are
@@ -61,7 +61,7 @@ export function parseErrorCode(name: string): number | undefined {
   return namesToCode[name];
 }
 
-/** ws_close = 4000 + error_code, with NO_ERROR mapping to 1000 (OVERVIEW.md section 2.8). */
+/** ws_close = 4000 + error_code, with NO_ERROR mapping to 1000 (WIRE.md section 2.8). */
 export function closeCode(code: number): number {
   return code === ErrorCode.NO_ERROR ? 1000 : 4000 + code;
 }

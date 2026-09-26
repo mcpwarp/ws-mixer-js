@@ -1,6 +1,6 @@
 /**
  * ws-mixer.v1 control channel (stream 0) message types and hand-written
- * validators (OVERVIEW.md section 2.7). Mirrors `go/wsmixer/control.go` and
+ * validators (WIRE.md section 2.7). Mirrors `go/wsmixer/control.go` and
  * `control_messages.go`: dispatch on `t`, then explicit per-field checks —
  * never a JSON Schema validator on the runtime path (decision 9).
  */
@@ -15,7 +15,7 @@ const T_DRAIN = "drain";
 const T_ERROR = "error";
 const T_APP = "app";
 
-// Field bounds from OVERVIEW.md section 2.7's field tables.
+// Field bounds from WIRE.md section 2.7's field tables.
 const MAX_TOKEN_LEN = 4096;
 const MAX_AGENT_FIELD_LEN = 128;
 const WINDOW_MIN = 16384;
@@ -141,7 +141,7 @@ function fieldString(raw: unknown, name: string): string {
 
 /**
  * A JSON integer field. Rejects floats and non-finite values ("No floats
- * anywhere in the control channel", OVERVIEW.md section 2.7) and rejects
+ * anywhere in the control channel", WIRE.md section 2.7) and rejects
  * anything outside Number's safe integer range.
  */
 function fieldInt(raw: unknown, name: string): number {
@@ -319,7 +319,7 @@ function parseApp(top: Record<string, unknown>): AppMsg {
 
 /**
  * Validates and decodes one stream-0 DATA payload (already UTF-8 decoded to
- * a string). Implements OVERVIEW.md section 2.7's envelope table plus every
+ * a string). Implements WIRE.md section 2.7's envelope table plus every
  * message type's per-field checks. Every validation failure is a ConnError
  * with PROTOCOL_ERROR (or ENHANCE_YOUR_CALM for the oversize case).
  */

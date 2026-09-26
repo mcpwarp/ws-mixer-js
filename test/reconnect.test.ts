@@ -1,6 +1,6 @@
 /**
  * Reconnect/backoff policy from docs/research/2026-08-26-control-channel-and-connection-lifecycle.md
- * and OVERVIEW.md section 2.9's reconnect table, exercised end-to-end
+ * and WIRE.md section 2.9's reconnect table, exercised end-to-end
  * against `MixerClient` with fake timers and a fake `ws`-shaped transport
  * injected via the test-only `_wsFactory` option -- no real sockets, no
  * real Go server (that's test/interop.test.ts's job).
@@ -983,7 +983,7 @@ describe("MixerClient drain handling", () => {
     expect(s0.helloToken).toBe("token-1");
 
     // Server drains: the SDK must start a new connection immediately, in
-    // parallel, before the old one closes (OVERVIEW.md section 2.9).
+    // parallel, before the old one closes (WIRE.md section 2.9).
     s0.push(drainFrame());
     await tick();
     await vi.advanceTimersByTimeAsync(2000); // drain's jitter window, random(0, 2000)ms
@@ -1430,7 +1430,7 @@ describe("MixerClient drain respects maxAttempts", () => {
     await vi.advanceTimersByTimeAsync(2000); // the jitter window a normal drain reconnect would have used
 
     // No parallel reconnect dial happened, and the conn is left alone to run
-    // to its own deadline (OVERVIEW.md section 2.9): maxAttempts:0 means
+    // to its own deadline (WIRE.md section 2.9): maxAttempts:0 means
     // this SDK never reconnects, but a drain by itself isn't a disconnect.
     expect(sockets.length).toBe(1);
     expect(client.currentState()).toBe("connected");
@@ -1638,7 +1638,7 @@ describe("MixerClient item 6: reconnectImmediately respects maxAttempts", () => 
   });
 });
 
-// --- v0.2 token provider + 401 refresh-retry (OVERVIEW.md section 4.0) --------
+// --- v0.2 token provider + 401 refresh-retry (CLIENT-SDK.md's "Token provider"/"Rejected token" rows) --------
 describe("MixerClient v0.2: token provider", () => {
   it("calls the provider fresh on every dial, across multiple reconnects", async () => {
     vi.useFakeTimers();
@@ -1854,7 +1854,7 @@ describe("MixerClient v0.2: token provider", () => {
       expect(calls).toBe(1);
       expect(disconnects.at(-1)).toMatchObject({ phase: "dial", httpStatus: status, fatal: true });
       // An HTTP upgrade rejection is never a ws-mixer wire error -- 403 is
-      // grouped with 401 for retry/fatal purposes only (OVERVIEW.md section
+      // grouped with 401 for retry/fatal purposes only (WIRE.md section
       // 2.9), and 404 never was -- neither gets an errorCode/errorName
       // (D-2026-09-20-09).
       expect(disconnects.at(-1)?.errorCode).toBeUndefined();
@@ -1987,7 +1987,7 @@ describe("MixerClient v0.2: token provider", () => {
 
     // ...and now attempt (1) >= maxAttempts (1) -- but the refresh-retry
     // below is NOT one of the ordinary reconnect-attempt paths gated by
-    // maxAttempts (OVERVIEW.md section 4.0's rejected-token row is
+    // maxAttempts (CLIENT-SDK.md's "Rejected token" row is
     // unconditional for a provider, and it does not itself increment
     // `attempt`): a 401 on this dial still gets its one immediate retry.
     sockets[1]!.httpReject(401);

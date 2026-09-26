@@ -1,6 +1,6 @@
 {
   "name": "@mcpwarp/ws-mixer",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "sideEffects": false,
   "publishConfig": {
     "registry": "https://registry.npmjs.org/",

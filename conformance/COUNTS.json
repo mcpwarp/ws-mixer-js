@@ -1,7 +1,8 @@
 {
-  "comment": "Checked-in floor on passing (SDK, fixture) cells for this repo's own conformance job, split from the monorepo's single conformance/COUNTS.json per docs/MIGRATION.md section 2.5 -- this repo only runs the js-server/js-client columns (it has no server role and no pair-mode adapter). See ws-mixer-spec's conformance/runner main.go checkCounts for how a floor here is enforced against a `--sdk js` run.",
+  "comment": "Checked-in floor on passing (SDK, fixture-or-scenario) cells for this repo's conformance jobs, split from the monorepo's single conformance/COUNTS.json per docs/MIGRATION.md section 2.5. js-server/js-client are the JS adapter's fixture columns (it has no server role, so js-server is all SKIP and never floor-checked). go->js is the pair matrix with ws-mixer-go (at goserver.pin, built with -tags conformance) as server and this SDK as client, exercised by the pair-go-js job (`--sdk go,js --mode pair`) in .github/workflows/conformance.yml; 10 = all 10 pair scenarios at spec.pin v0.4.0, observed passing against ws-mixer-go v0.6.0 on 2026-09-26. As of spec.pin v0.4.1, ws-mixer-spec's runner (main.go enforceCounts) checks these floors on any run with --fixture left at \"*\", regardless of --sdk/--mode, holding each key to its floor only if the run produced rows for it; so the fixture-matrix job's `--sdk js --mode fixture` run enforces js-client, and pair-go-js enforces go->js. Keys this file omits (go-server, go-client, go->go) belong to ws-mixer-go's own COUNTS.json and are not checked here.",
   "floors": {
     "js-server": 0,
-    "js-client": 24
+    "js-client": 24,
+    "go->js": 10
   }
 }

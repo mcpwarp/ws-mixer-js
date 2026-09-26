@@ -2,7 +2,7 @@
  * Public client entry point: `connect(url, opts)`. Owns the WebSocket
  * handshake (subprotocol, headers, size limits), and the reconnect/backoff
  * policy from docs/research/2026-08-26-control-channel-and-connection-lifecycle.md
- * and OVERVIEW.md section 2.9's reconnect table. `MixerConn` (conn.ts) owns
+ * and WIRE.md section 2.9's reconnect table. `MixerConn` (conn.ts) owns
  * everything about one already-connected socket; this file owns the loop
  * that replaces it.
  *
@@ -26,7 +26,7 @@ export const SUBPROTOCOL = "ws-mixer.v1";
 // asserts the two match, so a release bump that forgets this one fails CI
 // instead of silently going stale on the wire in hello.agent.sdk_version /
 // the User-Agent header).
-export const SDK_VERSION = "0.5.0";
+export const SDK_VERSION = "0.6.0";
 
 export type ClientState = "idle" | "dialing" | "connected" | "backoff" | "closed";
 
@@ -102,7 +102,7 @@ export type WSFactory = (url: string, protocols: string[], options: WSFactoryOpt
 
 /**
  * A ws-mixer token: either a static string or a callback returning a fresh
- * token (sync or `Promise`). Per OVERVIEW.md section 4.0, the callback MUST
+ * token (sync or `Promise`). Per CLIENT-SDK.md's "Token provider" and "Provider failure" rows, the callback MUST
  * be invoked on every dial, never cached across reconnects, and a
  * throw/rejection is fatal -- surfaced verbatim as `DisconnectReason.cause` --
  * UNLESS it's a `TokenUnavailableError` (thrown directly, or reachable by
@@ -112,12 +112,12 @@ export type WSFactory = (url: string, protocols: string[], options: WSFactoryOpt
  */
 export type TokenProvider = string | (() => Promise<string> | string);
 
-/** Where a disconnect originated, per OVERVIEW.md section 4.0's disconnect reason shape. */
+/** Where a disconnect originated, per CLIENT-SDK.md's "Disconnect reason shape" row. */
 export type DisconnectPhase = "dial" | "handshake" | "connected";
 
 /**
  * The shape every disconnect (recoverable or fatal) is reported with, per
- * OVERVIEW.md section 4.0. `httpStatus` is set only for a dial failure whose
+ * CLIENT-SDK.md's "Disconnect reason shape" row. `httpStatus` is set only for a dial failure whose
  * response was an HTTP status (401/403/404/429); `cause` is set only when a
  * token provider threw/rejected.
  */
@@ -151,7 +151,7 @@ export interface DisconnectReason {
    * having initiated the close itself (a peer's echo carries no information
    * and RFC 6455 doesn't require it to copy the reason), and the SDK closing
    * on a peer's `error{}` without reading whatever close frame follows it,
-   * as OVERVIEW.md section 2.7 allows ("logs, surfaces and closes"). The
+   * as WIRE.md section 2.7 allows ("logs, surfaces and closes"). The
    * human-readable text is in `message` for all of those cases instead --
    * consumers SHOULD prefer `closeReason` and fall back to `message`.
    */
@@ -200,7 +200,7 @@ interface DisconnectContext {
  * report (`cancelled: true`), or failed with everything connectOnce's retry
  * loop and failure-reporting path need -- `unauthorized` marks exactly the
  * two pre-welcome rejection shapes eligible for the one-time token-provider
- * refresh-retry (OVERVIEW.md section 4.0): an HTTP 401 on the upgrade, or a
+ * refresh-retry (CLIENT-SDK.md's "Rejected token" row): an HTTP 401 on the upgrade, or a
  * handshake-phase UNAUTHORIZED (4011, with or without a preceding
  * `error{}`).
  */
@@ -247,9 +247,9 @@ export interface ConnectOptions {
   onConnect?: (welcome: WelcomeMsg) => void;
   /**
    * Fires on every disconnect, recoverable or not (see stats() note in
-   * OVERVIEW.md section 4). This is the SDK's loud, always-invoked channel
+   * docs/DESIGN.md). This is the SDK's loud, always-invoked channel
    * -- unlike `'error'`, it is not gated on a listener being attached, so a
-   * `4001`/`4003`/`4004` close (OVERVIEW.md section 2.9: "these mean an SDK
+   * `4001`/`4003`/`4004` close (WIRE.md section 2.9: "these mean an SDK
    * bug and a silent retry loop hides it") always reaches an `onDisconnect`
    * the caller supplied, with `protocolError: true` plus the offending
    * `code`/`name` to make it impossible to miss.
@@ -301,15 +301,15 @@ const DEFAULT_RECONNECT: Required<ReconnectOptions> = {
   stableAfter: 10000,
 };
 
-/** Close codes the client must never retry after (OVERVIEW.md section 2.9's reconnect table). */
+/** Close codes the client must never retry after (WIRE.md section 2.9's reconnect table). */
 const FATAL_WS_CODES = new Set([4000 + ErrorCode.UNSUPPORTED, 4000 + ErrorCode.UNAUTHORIZED]);
 const GOING_AWAY_WS_CODE = 4000 + ErrorCode.GOING_AWAY; // 4012
 const KEEPALIVE_TIMEOUT_WS_CODE = 4000 + ErrorCode.KEEPALIVE_TIMEOUT; // 4013
 const ENHANCE_YOUR_CALM_WS_CODE = 4000 + ErrorCode.ENHANCE_YOUR_CALM; // 4009
 const APPLICATION_CLOSE_WS_CODE = 4000 + ErrorCode.APPLICATION_CLOSE; // 4014
-const ABNORMAL_CLOSURE_WS_CODE = 1001; // non-ws-mixer close treated as 4012, OVERVIEW.md section 2.8
+const ABNORMAL_CLOSURE_WS_CODE = 1001; // non-ws-mixer close treated as 4012, WIRE.md section 2.8
 /**
- * Close codes that mean "SDK bug", per OVERVIEW.md section 2.9's reconnect
+ * Close codes that mean "SDK bug", per WIRE.md section 2.9's reconnect
  * table: "normal backoff and a loud developer-facing error -- these mean an
  * SDK bug and a silent retry loop hides it." Backoff already happens via the
  * normal scheduleReconnect() path below; onDisconnect (never gated on a
@@ -372,7 +372,7 @@ export declare interface MixerClient {
  * docs/research/2026-08-26-control-channel-and-connection-lifecycle.md.
  *
  * In-flight streams are lost on reconnect -- there is no resumption
- * (OVERVIEW.md section 2.9). A handler must tell "the response ended" (EOF)
+ * (WIRE.md section 2.9). A handler must tell "the response ended" (EOF)
  * from "the tunnel died" (its stream is destroyed with an error) itself;
  * this SDK does not paper over the difference.
  */
@@ -402,17 +402,17 @@ export class MixerClient extends EventEmitter {
   private drainReconnectScheduled = false;
   /**
    * Set when `drain` arrives with reconnect disabled (`maxAttempts:0`):
-   * OVERVIEW.md section 2.9 says in-flight streams finish normally until the
+   * WIRE.md section 2.9 says in-flight streams finish normally until the
    * server's own deadline, at which point it closes with 4012 -- so the conn
    * stays up and this flag just tells the eventual close handler to report
    * that close as the one fatal "drained; reconnect disabled" disconnect
    * instead of treating 4012 as an ordinary going-away reconnect trigger.
    */
   private drainedNoReconnect = false;
-  /** OVERVIEW.md section 2.9: close 4013 gets exactly one immediate retry before falling back to normal backoff. Re-armed at stability, not at welcome -- see armStabilityTimer. */
+  /** WIRE.md section 2.9: close 4013 gets exactly one immediate retry before falling back to normal backoff. Re-armed at stability, not at welcome -- see armStabilityTimer. */
   private keepaliveImmediateRetryUsed = false;
   /**
-   * OVERVIEW.md section 4.0: a pre-welcome token rejection (an HTTP 401 on
+   * CLIENT-SDK.md's "Rejected token" row: a pre-welcome token rejection (an HTTP 401 on
    * the upgrade, or a handshake-phase UNAUTHORIZED/4011, with or without a
    * preceding `error{}`) gets exactly one immediate provider refresh-retry
    * -- ONE budget shared across both rejection shapes, and across every
@@ -491,7 +491,7 @@ export class MixerClient extends EventEmitter {
 
   /**
    * Writes an `app` frame; resolves once `ws.send`'s callback confirms it
-   * actually reached the socket (OVERVIEW.md section 4), or rejects with the
+   * actually reached the socket (docs/DESIGN.md), or rejects with the
    * connection's terminal error if it fails first -- conn.ts's control queue
    * carries the same per-write resolver `sendData()` already uses for stream
    * bytes.
@@ -653,8 +653,8 @@ export class MixerClient extends EventEmitter {
 
     this.state = "dialing";
 
-    // One retry, covering EITHER pre-welcome rejection shape (OVERVIEW.md
-    // section 4.0): an HTTP 401 on the upgrade, or a handshake-phase
+    // One retry, covering EITHER pre-welcome rejection shape (CLIENT-SDK.md's
+    // "Rejected token" row): an HTTP 401 on the upgrade, or a handshake-phase
     // UNAUTHORIZED (4011, with or without a preceding `error{}`) --
     // `dialAndHandshakeOnce` surfaces both as `attempt.unauthorized` so this
     // one loop covers both instead of two parallel mechanisms. Only a token
@@ -720,7 +720,7 @@ export class MixerClient extends EventEmitter {
       // Reset backoff (and the once-only budgets it gates, e.g. 4013's one
       // immediate retry and the token-refresh retry above) only once THIS
       // conn has stayed up for `stableAfter` ms past welcome, never on
-      // welcome itself or on a bare dial/101 success (OVERVIEW.md/WIRE.md
+      // welcome itself or on a bare dial/101 success (WIRE.md
       // section 2.9's `stable`) -- see armStabilityTimer's own doc comment
       // for why.
       this.armStabilityTimer(conn);
@@ -731,8 +731,7 @@ export class MixerClient extends EventEmitter {
 
       // A `drain`-triggered parallel reconnect just succeeded: the old
       // connection is no longer needed, so tear it down now instead of
-      // waiting on the server's own deadline (OVERVIEW.md section 2.9's
-      // "old MixerConn fully torn down" requirement).
+      // waiting on the server's own deadline.
       if (this.retiringConn && this.retiringConn !== conn) {
         const old = this.retiringConn;
         this.retiringConn = null;
@@ -793,7 +792,7 @@ export class MixerClient extends EventEmitter {
     if (this.closing || this.isClosed()) return;
     // Non-fatal handshake failure (e.g. no `welcome` within the hello
     // timeout, or the peer closing the socket before it ever arrived):
-    // still "every disconnect...is reported" (OVERVIEW.md section 4.0) --
+    // still "every disconnect...is reported" (CLIENT-SDK.md's "Disconnect reason shape" row) --
     // exactly once, whether that's this retry's report or (if maxAttempts
     // is already exhausted) the single merged exhaustion report
     // scheduleReconnect emits via giveUp instead.
@@ -802,7 +801,7 @@ export class MixerClient extends EventEmitter {
 
   /**
    * One dial + handshake attempt: resolves the token provider (fresh, per
-   * OVERVIEW.md section 4.0), opens the socket, and -- if that succeeds --
+   * CLIENT-SDK.md's "Token provider" row), opens the socket, and -- if that succeeds --
    * builds a `MixerConn` and waits for `welcome`. Returns a discriminated
    * result rather than throwing, so connectOnce's retry loop above can
    * decide what to do with a failure (retry once, or finalize it) without a
@@ -821,7 +820,7 @@ export class MixerClient extends EventEmitter {
       return {
         ok: false,
         ctx: { phase: "dial", cause: e.cause, message: e.message },
-        // Fatal by default (OVERVIEW.md section 4.0) -- UNLESS the provider
+        // Fatal by default (CLIENT-SDK.md's "Provider failure" row) -- UNLESS the provider
         // explicitly marked this as a temporary failure to obtain a token
         // (TokenUnavailableError, thrown directly or reachable via `cause`),
         // in which case it's treated exactly like a failed dial: normal
@@ -966,14 +965,14 @@ export class MixerClient extends EventEmitter {
       // legitimate close-driven reconnect.
       if (this.conn === conn && !this.closing && this.state !== "closed" && !this.drainReconnectScheduled) {
         if (this.reconnectOpts.maxAttempts > 0) {
-          // Reconnect immediately and in parallel, before the old connection closes (OVERVIEW.md section 2.9).
+          // Reconnect immediately and in parallel, before the old connection closes (WIRE.md section 2.9).
           this.drainReconnectScheduled = true;
           this.retiringConn = conn;
           void this.connectOnce(Math.random() * 2000, "drain");
         } else {
-          // maxAttempts:0 means this SDK will never reconnect (OVERVIEW.md
-          // section 4.0's reconnect table), but that doesn't make `drain` an
-          // immediate fatal event: section 2.9 says in-flight streams finish
+          // maxAttempts:0 means this SDK will never reconnect (WIRE.md section
+          // 2.9's bounded retry count), but that doesn't make `drain` an
+          // immediate fatal event: WIRE.md section 2.9 says in-flight streams finish
           // normally until the server's own deadline, then the server closes
           // with 4012. So we let the conn run to that close instead of
           // tearing it down here -- the close handler below reports that
@@ -1118,7 +1117,7 @@ export class MixerClient extends EventEmitter {
       if (this.drainedNoReconnect) {
         // The drain handler above saw maxAttempts:0 and let this conn run to
         // its own deadline instead of reconnecting; this is that deadline's
-        // close (4012 per OVERVIEW.md section 2.9) arriving now. One report,
+        // close (4012 per WIRE.md section 2.9) arriving now. One report,
         // fatal, with a message that says why -- not a going-away reconnect.
         this.drainedNoReconnect = false;
         this.state = "closed";
@@ -1209,7 +1208,7 @@ export class MixerClient extends EventEmitter {
     }
   }
 
-  /** Fatal per OVERVIEW.md section 2.9: never reconnect, surface loudly, and fail start() if it never got a first connection. One report only. */
+  /** Fatal per WIRE.md section 2.9: never reconnect, surface loudly, and fail start() if it never got a first connection. One report only. */
   private goFatal(ctx: DisconnectContext): void {
     if (this.state === "closed") return;
     this.state = "closed";
@@ -1307,7 +1306,7 @@ export class MixerClient extends EventEmitter {
 
   /**
    * Close 4013 KEEPALIVE_TIMEOUT: one immediate attempt, then normal backoff
-   * (OVERVIEW.md section 2.9). The immediate attempt goes through
+   * (WIRE.md section 2.9). The immediate attempt goes through
    * reportAndSchedule -- same as the 4012 path (reconnectImmediately) -- so
    * it respects the maxAttempts ceiling too: a 4013 flap loop with no budget
    * left gives up (one merged `fatal: true` report) instead of dialing a
@@ -1350,7 +1349,7 @@ export function fullJitterDelay(attempt: number, base: number, cap: number): num
 interface DialError extends Error {
   fatal: boolean;
   /**
-   * Which ws-mixer error code a fatal dial failure maps to (OVERVIEW.md
+   * Which ws-mixer error code a fatal dial failure maps to (WIRE.md
    * section 2.9). Only ever set for a missing/mismatched subprotocol echo
    * (UNSUPPORTED) -- an SDK-raised, local ws-mixer error, no close frame or
    * HTTP status involved. `undefined` for everything else: a plain network
@@ -1385,7 +1384,7 @@ function dialError(
 
 /**
  * Wraps a token provider's thrown/rejected error as a dial failure
- * (OVERVIEW.md section 4.0: "the thrown/rejected error is surfaced
+ * (CLIENT-SDK.md's "Provider failure" row: "the thrown/rejected error is surfaced
  * verbatim"), fatal by default -- the caller (dialAndHandshakeOnce) is what
  * actually decides `fatal` via `isTokenUnavailable`, this just builds the
  * `message`/`cause` pair either outcome shares. Deliberately carries no
@@ -1448,7 +1447,7 @@ function defaultWsFactory(url: string, protocols: string[], options: WSFactoryOp
 }
 
 /**
- * Opens the WebSocket per OVERVIEW.md section 2.1: binary, no compression,
+ * Opens the WebSocket per WIRE.md section 2.1: binary, no compression,
  * `ws-mixer.v1` subprotocol offered and required to be echoed, Bearer auth
  * header. Fatal (never retried by this function itself) on a missing/
  * mismatched subprotocol echo or an HTTP 401/403/404 handshake response --
@@ -1503,7 +1502,7 @@ function dialWebSocket(url: string, token: string, opts: ConnectOptions, connect
           return;
         }
         if (status === 401 || status === 403) {
-          // Auth/authorization failure (OVERVIEW.md section 2.9 groups it
+          // Auth/authorization failure (WIRE.md section 2.9 groups it
           // with UNAUTHORIZED, 4011, for retry/fatal purposes only). Fatal by
           // default -- connectOnce's retry loop is the one place that knows
           // whether a token provider is present and this connect attempt
@@ -1551,7 +1550,7 @@ function dialWebSocket(url: string, token: string, opts: ConnectOptions, connect
         clearTimeout(timer);
         ws.close(1002);
         // Missing/mismatched subprotocol echo is UNSUPPORTED (4010), not
-        // UNAUTHORIZED (4011) -- OVERVIEW.md section 2.9 lists it alongside
+        // UNAUTHORIZED (4011) -- WIRE.md section 2.9 lists it alongside
         // 4010 in the "fatal, never reconnect" row, distinct from the
         // 401/403/404 auth-failure row above.
         reject(

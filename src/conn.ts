@@ -1,7 +1,7 @@
 /**
  * MixerConn: the per-connection ws-mixer.v1 protocol engine. Owns the
  * handshake, the read-dispatch loop, the control-priority + round-robin
- * write scheduler (OVERVIEW.md section 2.6 rule 3), keepalive and drain.
+ * write scheduler (WIRE.md section 2.6 rule 3), keepalive and drain.
  * The JS SDK is always the answering peer (client): it never calls
  * OpenStream, only receives OPEN from the server.
  *
@@ -51,11 +51,11 @@ export interface ConnOptions {
   window?: number;
   maxStreams?: number;
   capabilities?: string[];
-  /** Timeout waiting for `welcome` after sending `hello`. Default 10000ms per OVERVIEW.md section 2.9. */
+  /** Timeout waiting for `welcome` after sending `hello`. Default 10000ms per WIRE.md section 2.9. */
   helloTimeoutMs?: number;
   /**
    * @internal Test-only: lets a test's `welcome` use keepalive values below
-   * the wire floors (OVERVIEW.md section 2.9: `ping_interval` floor 5000ms,
+   * the wire floors (WIRE.md section 2.7: `ping_interval` floor 5000ms,
    * `ping_timeout` >= 2x `ping_interval`) so keepalive/sequence tests can run
    * with real timers in well under a second. Never set this in production.
    */
@@ -181,7 +181,7 @@ export class MixerConn extends EventEmitter {
   /**
    * Minimal "ignore and count" counters (item 11 of the review: full
    * escalation/STREAM_LIMIT bucketing is intentionally out of scope for v1 --
-   * see README.md and OVERVIEW.md section 4). Exposed via `stats()`.
+   * see README.md and docs/DESIGN.md). Exposed via `stats()`.
    */
   private readonly counters = {
     unknownFrameTypes: 0,
@@ -189,21 +189,21 @@ export class MixerConn extends EventEmitter {
     duplicatePongs: 0,
     refusedOpens: 0,
     /**
-     * OPENs received above the drain's `last_stream_id` (OVERVIEW.md section
+     * OPENs received above the drain's `last_stream_id` (WIRE.md section
      * 2.9 / the 2026-08-27 decision log): connection-fatal `PROTOCOL_ERROR`,
      * not a stream-scoped refusal -- the server already promised not to send
      * one, so this is it breaking that promise, not a benign race.
      */
     drainViolations: 0,
-    /** `drain.reason` values outside the closed enum, normalized to "maintenance" (OVERVIEW.md section 2.7). */
+    /** `drain.reason` values outside the closed enum, normalized to "maintenance" (WIRE.md section 2.7). */
     unknownDrainReasons: 0,
     /** A `'stream'`/`'app'`/`'drain'` listener that threw or rejected; delivery continued with the next event regardless. */
     handlerErrors: 0,
-    /** ConnError-triggered connection failures: malformed/out-of-sequence control traffic (OVERVIEW.md section 4). */
+    /** ConnError-triggered connection failures: malformed/out-of-sequence control traffic (CLIENT-SDK.md's "Stats / counters" row). */
     protocolViolations: 0,
     /**
-     * Raw WS message bytes received/sent, cumulative (OVERVIEW.md section
-     * 4): the full ws-mixer frame on the wire, header included, for every
+     * Raw WS message bytes received/sent, cumulative (CLIENT-SDK.md's
+     * "Stats / counters" row): the full ws-mixer frame on the wire, header included, for every
      * message -- not just DATA payload bytes. This differs from Go's
      * `BytesTransferred` metric, which counts payload only; do not compare
      * the two directly.
@@ -407,7 +407,7 @@ export class MixerConn extends EventEmitter {
     }
 
     if (!this.handshakeDone) {
-      // "The server may send nothing at all before welcome" (OVERVIEW.md
+      // "The server may send nothing at all before welcome" (WIRE.md
       // section 2.9): any non-stream-0 frame here means the server jumped
       // the gun on the handshake.
       throw new ConnError(ErrorCode.PROTOCOL_ERROR, `${frameTypeName(frame.type)} frame received before welcome completed the handshake`);
@@ -419,7 +419,7 @@ export class MixerConn extends EventEmitter {
         throw new ConnError(ErrorCode.PROTOCOL_ERROR, `duplicate or out-of-order OPEN for stream ${id}`);
       }
       this.highestOpened = id;
-      // Drain enforcement (OVERVIEW.md section 2.9 and the 2026-08-27
+      // Drain enforcement (WIRE.md section 2.9 and the 2026-08-27
       // decision log): "endpoints MUST NOT increase last_stream_id" and
       // "after sending drain the server MUST NOT send OPEN". An OPEN above
       // the announced last_stream_id is the server breaking a boundary it
@@ -434,7 +434,7 @@ export class MixerConn extends EventEmitter {
         );
       }
       // OPEN beyond the negotiated max_streams: stream-scoped STREAM_LIMIT,
-      // not a connection error (OVERVIEW.md section 2.8's error table). Only
+      // not a connection error (WIRE.md section 2.8's error table). Only
       // the server opens streams, so only the client is ever in a position
       // to detect this (mirrors spec/fixtures/sequences/max_streams_exceeded.json).
       if (this.streams.size >= this.maxStreams) {
@@ -476,7 +476,7 @@ export class MixerConn extends EventEmitter {
   }
 
   private dispatchControl(payload: Uint8Array): void {
-    // Stream-0 flood limit (item 4, OVERVIEW.md section 2.7): checked before
+    // Stream-0 flood limit (item 4, WIRE.md section 2.7): checked before
     // parsing, mirroring go/wsmixer's handleControlData, so a flood of junk
     // can't burn CPU on top of exhausting the bucket.
     if (!this.stream0Bucket.allow()) {
@@ -492,17 +492,17 @@ export class MixerConn extends EventEmitter {
         throw new ConnError(ErrorCode.PROTOCOL_ERROR, "unexpected hello: only the client sends hello");
       case "ping":
         // Item 6: a ping before welcome completes is treated like any other
-        // pre-welcome control frame (OVERVIEW.md sections 2.9/2.10: "the
+        // pre-welcome control frame (WIRE.md sections 2.9/2.10: "the
         // server may send nothing at all before welcome").
         if (!this.handshakeDone) {
           throw new ConnError(ErrorCode.PROTOCOL_ERROR, "ping received before welcome completed the handshake");
         }
-        // pong jumps to the head of the control queue (item 6 / OVERVIEW.md
+        // pong jumps to the head of the control queue (item 6 / WIRE.md
         // section 2.7: "A pong MUST ... jump ahead of queued DATA").
         void this.sendControlPriority({ t: "pong", id: msg.id, ...(msg.ts !== undefined ? { ts: msg.ts } : {}) } as ControlMessage).catch(() => {});
         return;
       case "pong":
-        // OVERVIEW.md section 2.7 defines two verdicts for an incoming pong
+        // WIRE.md section 2.7 defines two verdicts for an incoming pong
         // -- id never sent -> PROTOCOL_ERROR, duplicate -> ignore + count --
         // and nothing beyond "MUST carry the same id and ts" about a
         // mismatched `ts` specifically. RTT here is measured off this side's
@@ -518,14 +518,14 @@ export class MixerConn extends EventEmitter {
         return;
       case "drain": {
         // Item 1: like ping/app above, drain before welcome completes the
-        // handshake is a protocol violation (OVERVIEW.md sections 2.9/2.10:
+        // handshake is a protocol violation (WIRE.md sections 2.9/2.10:
         // "the server may send nothing at all before welcome"), mirroring
         // Go dispatch.go's blanket !handshakeDone check.
         if (!this.handshakeDone) {
           throw new ConnError(ErrorCode.PROTOCOL_ERROR, "drain received before welcome completed the handshake");
         }
         // Unknown reason: tolerated, degrade to "maintenance" and count
-        // (OVERVIEW.md section 2.7) -- both for the connection's own
+        // (WIRE.md section 2.7) -- both for the connection's own
         // draining decision and for whatever the app sees via the 'drain'
         // event, so a consumer never has to recognize a reason outside the
         // documented closed enum.
@@ -537,7 +537,7 @@ export class MixerConn extends EventEmitter {
         const normalized: DrainMsg = reason === msg.reason ? msg : { ...msg, reason };
         this.draining = true;
         // Endpoints MUST NOT increase last_stream_id across drains
-        // (OVERVIEW.md section 2.9); keep the smaller value if we somehow
+        // (WIRE.md section 2.9); keep the smaller value if we somehow
         // saw more than one.
         this.lastStreamId = this.lastStreamId === undefined ? normalized.last_stream_id : Math.min(this.lastStreamId, normalized.last_stream_id);
         this.enqueueDelivery({ kind: "drain", msg: normalized });
@@ -932,14 +932,14 @@ export class MixerConn extends EventEmitter {
    * that order every time. `sendErrorFrame` controls whether an
    * `error{code,message}` control frame is sent first -- true for a
    * locally-detected failure (fail()), false when the peer already sent its
-   * own `error` and OVERVIEW.md section 2.7 forbids replying with another
+   * own `error` and WIRE.md section 2.7 forbids replying with another
    * one (handlePeerError()). Either way `this.closed` is set *before*
    * `ws.close()` is called, so the peer's echo of this close (or any close
    * frame it happens to send around the same time) is ignored by
    * onSocketClose below rather than reported as `closeReason` -- per
    * CLIENT-SDK.md's `closeReason` row, an outgoing reason this side sent is
    * never legitimate `closeReason` data, and there is nothing to gain by
-   * waiting for the peer's own close frame here: OVERVIEW.md section 2.7
+   * waiting for the peer's own close frame here: WIRE.md section 2.7
    * already allows closing on `error` "without reading the close frame that
    * followed".
    */
@@ -977,7 +977,7 @@ export class MixerConn extends EventEmitter {
     // closeReason is deliberately absent here in both branches: this side
     // initiated the close (either directly, or -- sendErrorFrame:false, from
     // handlePeerError -- reacting to error{} without reading whatever close
-    // frame the peer sends behind it, per OVERVIEW.md section 2.7). Only
+    // frame the peer sends behind it, per WIRE.md section 2.7). Only
     // onSocketClose, for a close frame this side actually *received*, ever
     // has a real closeReason to report.
     this.emit("close", { wsCode, errorCode: err.code, message: err.message });
@@ -985,7 +985,7 @@ export class MixerConn extends EventEmitter {
 
   /**
    * Connection-fatal failure path: error{code,message} on stream 0, WS close
-   * 4000+code, teardown. Three steps, in order (OVERVIEW.md section 2.8).
+   * 4000+code, teardown. Three steps, in order (WIRE.md section 2.8).
    *
    * `streamErrorFactory`, when given, overrides the error every live stream
    * is torn down with (`err` is still used for the connection-level frame/
@@ -1006,7 +1006,7 @@ export class MixerConn extends EventEmitter {
    * The peer sent `error{code,message}`: record it and close with
    * `4000 + code` immediately, without waiting for the peer to do anything
    * else -- mirrors go/wsmixer/dispatch.go's handlePeerError. `error` is
-   * always the last message on the wire (OVERVIEW.md section 2.7), so
+   * always the last message on the wire (WIRE.md section 2.7), so
    * there is nothing left to negotiate.
    */
   private handlePeerError(code: number, message: string, streamId?: number): void {

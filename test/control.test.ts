@@ -12,7 +12,7 @@
  *
  * The two intentionally diverge on exactly one shape: a well-formed message
  * carrying an extra unrecognized field is wire_valid (forward-compatibility,
- * OVERVIEW.md section 2.7) but not schema_valid (the strict schema's
+ * WIRE.md section 2.7) but not schema_valid (the strict schema's
  * additionalProperties:false typo-catcher).
  */
 import { readFileSync, readdirSync } from "node:fs";

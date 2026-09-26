@@ -1,5 +1,5 @@
 /**
- * ws-mixer.v1 mux frame codec (OVERVIEW.md section 2.2-2.4). Mirrors
+ * ws-mixer.v1 mux frame codec (WIRE.md section 2.2-2.4). Mirrors
  * `go/wsmixer/frame.go` exactly: same header layout, same validation, same
  * error split between connection-fatal (ConnError) and stream-scoped
  * (StreamError).
@@ -43,7 +43,7 @@ export const MAX_STREAM_ZERO_PAYLOAD = 16384;
 /** Recommended DATA chunk size: a sender-side default, not a wire limit. */
 export const MAX_CHUNK = 16384;
 const STREAM_ID_HIGH_BIT = 0x8000_0000;
-/** Largest legal cumulative send-credit window: 2^31-1 (OVERVIEW.md section 2.6 decision 1). */
+/** Largest legal cumulative send-credit window: 2^31-1 (WIRE.md section 2.6 decision 1). */
 export const MAX_SEND_WINDOW = 0x7fff_ffff;
 
 /** One decoded ws-mixer mux frame: the 8-byte header plus its payload. */
@@ -55,7 +55,7 @@ export interface Frame {
 }
 
 /**
- * Decodes one WebSocket message into a Frame per OVERVIEW.md sections
+ * Decodes one WebSocket message into a Frame per WIRE.md sections
  * 2.2-2.4. Throws ConnError (connection-fatal) or StreamError (scoped to the
  * frame's stream id).
  */
