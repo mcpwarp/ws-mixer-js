@@ -4,22 +4,70 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:  # Allows manual triggering from GitHub UI
 
 jobs:
   npm-publish:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write  # Required for npm OIDC trusted publishing
+
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
-          node-version: 20
-          registry-url: https://registry.npmjs.org
-      - run: npm ci
+          node-version: '24'
+          cache: 'npm'
+          registry-url: 'https://registry.npmjs.org'
+
+      # npm >= 11.5.1 is required for OIDC trusted publishing; don't rely on
+      # whatever npm the runner's Node 24 happens to bundle.
+      - name: Upgrade npm
+        run: npm install -g npm@11.12.1
+
+      - name: Verify npm version supports OIDC
+        run: |
+          NPM_VERSION=$(npm --version)
+          echo "npm version: $NPM_VERSION"
+          # npm >= 11.5.1 is required for trusted publishing
+          node -e "
+            const v = '$NPM_VERSION'.split('.').map(Number);
+            if (v[0] < 11 || (v[0] === 11 && v[1] < 5) || (v[0] === 11 && v[1] === 5 && v[2] < 1)) {
+              console.error('ERROR: npm >= 11.5.1 required for trusted publishing, got $NPM_VERSION');
+              process.exit(1);
+            }
+            console.log('npm version OK for trusted publishing');
+          "
+
+      - name: Install dependencies
+        run: npm ci
+
+      # No separate build step: package.json's prepublishOnly runs
+      # `node scripts/check-registry.mjs && npm run build` during npm publish.
+      #
       # publishConfig.registry (the public npm registry) plus
       # scripts/check-registry.mjs's prepublishOnly guard together pin the
       # actual publish target -- see package.json and the flag in
       # docs/MIGRATION.md section 4.1 about that pairing with an Apache-2.0
       # license.
-      - run: npm publish
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      #
+      # IMPORTANT: Do NOT set NODE_AUTH_TOKEN here.
+      # With trusted publishing, npm authenticates via OIDC automatically.
+      # Setting NODE_AUTH_TOKEN (even empty) would bypass OIDC and cause 404.
+      - name: Publish to npm
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          echo "Package version: $VERSION"
+
+          # Extract prerelease tag (e.g., "beta" from "0.12.0-beta.1")
+          if [[ "$VERSION" =~ -([a-zA-Z]+) ]]; then
+            NPM_TAG="${BASH_REMATCH[1]}"
+            echo "Publishing prerelease to tag: $NPM_TAG"
+            npm publish --access public --provenance --tag "$NPM_TAG"
+          else
+            echo "Publishing stable release to latest"
+            npm publish --access public --provenance
+          fi
