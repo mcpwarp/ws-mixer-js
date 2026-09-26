@@ -1,6 +1,6 @@
 /**
  * ws-mixer.v1 mux frame codec (WIRE.md section 2.2-2.4). Mirrors
- * `go/wsmixer/frame.go` exactly: same header layout, same validation, same
+ * `ws-mixer-go/wsmixer/frame.go` exactly: same header layout, same validation, same
  * error split between connection-fatal (ConnError) and stream-scoped
  * (StreamError).
  */

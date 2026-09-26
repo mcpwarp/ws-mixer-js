@@ -40,9 +40,6 @@ jobs:
         with:
           go-version: "1.24"
       - run: npm ci
-      # spec.pin/goserver.pin do not resolve until ws-mixer-spec / ws-mixer-go
-      # are pushed to GitHub -- until then these two steps fail and the job
-      # is expected to be red; see docs/MIGRATION.md section 6 step 15.
       - run: npm run fetch-spec
       - run: npm run fetch-goserver
       - run: npm test

@@ -254,11 +254,22 @@ Also true regardless of trigger:
   preserves buffered data; `RESET` discards it" rule:
   - The peer's `CLOSE` had already arrived (its read side had already legitimately finished on the
     wire, independent of the connection dying): the response DID complete. Whatever was buffered is
-    still delivered, `'end'` still fires once it's drained, `stream.errored` stays `null`, and no
-    `'error'` event fires -- exactly as if the connection hadn't died. Only the **write** side fails:
-    a write already pending, or started afterward, fails promptly (its callback receives the
-    connection's error) instead of hanging or silently succeeding, since the connection is gone even
-    though this stream's response was already complete.
+    still delivered, `'end'` still fires once it's drained, and no `'error'` event fires -- exactly
+    as if the connection hadn't died. Only the **write** side fails: a write already pending, or
+    started afterward, fails (its callback receives the connection's `ConnError`, or
+    `StreamError(CANCEL, "connection drained")` on a drain hand-over) instead of hanging or silently
+    succeeding, since the connection is gone even though this stream's response was already
+    complete. `stream.errored` stays `null` unless such a write failed, in which case Node's own
+    Writable machinery sets it to that same error. If this side had also already closed its
+    write side (`closeWrite()`/`end()`), the stream's exchange was complete before the connection
+    died: a write fails with its own `StreamError(STREAM_CLOSED)` (or its own socket error) instead.
+    When the callback is called: with nothing left unread, as part of the teardown, and `'close'`
+    fires then too; with data still unread, only once the reader drains it and `'end'` fires (an
+    error any earlier would discard that data and suppress `'end'`), or when the app calls
+    `destroy()`/`reset()`. A stream with unread data that nobody ever reads keeps both pending until
+    the app does one or the other. The connection tracks a stream CLOSE'd both ways only weakly,
+    except while it owes a write callback: one the app dropped with no write pending may be
+    garbage-collected before the teardown, and then its `'close'` listeners never run.
   - Otherwise (a peer `RESET`, or the connection ending abnormally -- `1006`, or any other way other
     than that stream's own clean `CLOSE` -- with this stream's read side never having legitimately
     finished): the stream always ends with an error, never a false clean end. `stream.errored`
@@ -315,6 +326,19 @@ fields exist for the same reason as the identically-named `DisconnectReason` fie
 only when this particular error was built from an actually-observed close frame (as opposed to a
 locally-raised protocol violation), and under the same "never this side's own outgoing reason" rule
 as `closeReason`.
+
+On a stream (`stream.errored`, its `'error'` event, a write callback) the subclass says what ended
+it (a `sendApp()` rejection is always the `ConnError` case):
+
+- `ConnError` -- the connection under it ended: an abnormal closure, a graceful `close()`, a
+  protocol failure, or a failed socket write. Whatever the connection's own terminal error was
+  (the socket's `WsMixerError`, a raw `ws` send error) is kept as `cause`; `code`, `wsCode` and
+  `closeReason` are copied from it.
+- `StreamError` -- this stream alone was reset: a peer `RESET`, the app's own `reset()`/
+  `destroy()`/`close()` (`CANCEL`), a write after `closeWrite()` (`STREAM_CLOSED`), or a drain
+  hand-over (`CANCEL`, `"connection drained"`, see above).
+- `null` (`stream.errored`) -- a clean end: the peer's `CLOSE` arrived and nothing pending failed,
+  or the app's own `destroy()` with no error and no write pending.
 
 The `'fatal'` event's `WsMixerError.code` follows the same "present only when a ws-mixer error code
 actually applies" rule as `DisconnectReason.errorCode` above (D-2026-09-20-09) -- it is `INTERNAL_ERROR`

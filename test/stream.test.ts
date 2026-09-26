@@ -380,6 +380,44 @@ describe("MixerStream state machine", () => {
     await closeP;
   });
 
+  it("CLOSE both ways (peer CLOSE with data buffered, then end()): 'finish' and 'end' both fire before 'close', and finished() resolves instead of a premature close", async () => {
+    const { finished } = await import("node:stream/promises");
+    const host = fakeHost();
+    const s = new MixerStream(1, host, 1024, 1024);
+    s.handleData(new TextEncoder().encode("hello"));
+    s.handleClose();
+    const events: string[] = [];
+    for (const ev of ["finish", "end", "close"]) s.on(ev, () => events.push(ev));
+    const done = finished(s);
+    s.end();
+    await new Promise((r) => setImmediate(r));
+    expect(s.getState()).toBe("closed");
+    expect(s.destroyed).toBe(false); // "hello" is still unread: no 'end' yet, so no 'close' yet
+
+    const chunks: Buffer[] = [];
+    for await (const chunk of s) chunks.push(chunk as Buffer);
+    expect(Buffer.concat(chunks).toString()).toBe("hello");
+    await done;
+    await new Promise((r) => setImmediate(r));
+    expect(events.slice().sort()).toEqual(["close", "end", "finish"]);
+    expect(events[2]).toBe("close");
+    expect(s.destroyed).toBe(true);
+    expect(s.errored).toBeNull();
+  });
+
+  it("closeWrite() on a peer-CLOSE'd stream whose read side already ended destroys it right away: 'close' fires", async () => {
+    const host = fakeHost();
+    const s = new MixerStream(1, host, 1024, 1024);
+    s.handleClose();
+    for await (const _ of s) void _;
+    expect(s.readableEnded).toBe(true);
+    const closeP = new Promise<void>((resolve) => s.on("close", resolve));
+    s.closeWrite();
+    await closeP;
+    expect(s.destroyed).toBe(true);
+    expect(host.retired).toEqual([1]);
+  });
+
   it("toWeb() returns a Web Streams readable/writable pair", () => {
     const host = fakeHost();
     const s = new MixerStream(1, host, 1024, 1024);

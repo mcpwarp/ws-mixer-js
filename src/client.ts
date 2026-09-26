@@ -1,7 +1,7 @@
 /**
  * Public client entry point: `connect(url, opts)`. Owns the WebSocket
  * handshake (subprotocol, headers, size limits), and the reconnect/backoff
- * policy from docs/research/2026-08-26-control-channel-and-connection-lifecycle.md
+ * policy from ws-mixer-spec/docs/research/2026-08-26-control-channel-and-connection-lifecycle.md
  * and WIRE.md section 2.9's reconnect table. `MixerConn` (conn.ts) owns
  * everything about one already-connected socket; this file owns the loop
  * that replaces it.
@@ -26,7 +26,7 @@ export const SUBPROTOCOL = "ws-mixer.v1";
 // asserts the two match, so a release bump that forgets this one fails CI
 // instead of silently going stale on the wire in hello.agent.sdk_version /
 // the User-Agent header).
-export const SDK_VERSION = "0.6.0";
+export const SDK_VERSION = "0.7.0";
 
 export type ClientState = "idle" | "dialing" | "connected" | "backoff" | "closed";
 
@@ -131,7 +131,7 @@ export interface DisconnectReason {
    * application-layer code that is legal for a stream RESET but never was
    * for a connection close), that can differ from the *actual* bytes this
    * side puts on the wire, which are clamped to `4000+INTERNAL_ERROR` (4002)
-   * instead (conn.ts's `wireCloseCode`, mirroring go/wsmixer's
+   * instead (conn.ts's `wireCloseCode`, mirroring ws-mixer-go/wsmixer's
    * `wsCloseCode`) -- `errorCode` always keeps the real, unclamped code
    * either way. When instead observed directly from a bare close frame
    * (`onSocketClose`, no preceding `error{}`), `wsCode` is exactly what was
@@ -369,7 +369,7 @@ export declare interface MixerClient {
 /**
  * MixerClient owns the reconnect loop: it replaces `conn` with a fresh
  * MixerConn on every disconnect, per the policy in
- * docs/research/2026-08-26-control-channel-and-connection-lifecycle.md.
+ * ws-mixer-spec/docs/research/2026-08-26-control-channel-and-connection-lifecycle.md.
  *
  * In-flight streams are lost on reconnect -- there is no resumption
  * (WIRE.md section 2.9). A handler must tell "the response ended" (EOF)

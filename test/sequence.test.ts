@@ -90,7 +90,7 @@ describe("sequence fixtures", () => {
       // This fixture's two "send DATA" steps require driving a real
       // app-level MixerStream.write() call (ws-mixer only emits DATA in
       // response to application code writing to a stream, never on its
-      // own) -- go/wsmixer/sequence_test.go and the conformance runner both
+      // own) -- ws-mixer-go/wsmixer/sequence_test.go and the conformance runner both
       // have that hook (Stream.WriteContext / the adapter's `write`
       // command), but this loop only replays a fixture's `send` steps by
       // asserting against ws.sent, with no equivalent call into the actual
@@ -223,7 +223,7 @@ describe("sequence fixtures", () => {
             expect(lastClose?.wsCode).toBe(step.expect.close_code);
           }
           if (step.expect.stream_reset_code !== undefined) {
-            // Two sources, mirroring go/wsmixer/sequence_test.go's checkExpect:
+            // Two sources, mirroring ws-mixer-go/wsmixer/sequence_test.go's checkExpect:
             // streamResetCodes (scanned from ws.sent) covers a RESET the
             // client itself autonomously transmitted; a RESET the client
             // instead *received* (e.g. reset_on_closed_stream_toward_client.json)

@@ -284,7 +284,7 @@ function wireStream(stream) {
   });
 }
 
-// codeNameOf mirrors go/wsmixer's ErrorCode.String() / the runner's own
+// codeNameOf mirrors ws-mixer-go/wsmixer's ErrorCode.String() / the runner's own
 // codes.Name -- kept tiny and local rather than importing errors.ts's
 // codeName, since a RESET's numeric code is all a peer ever needs here.
 const CODE_NAMES = {

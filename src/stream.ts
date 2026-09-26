@@ -1,6 +1,6 @@
 /**
  * MixerStream: one ws-mixer byte stream, exposed as a Node Duplex.
- * Mirrors `go/wsmixer/stream.go`'s state machine, credit accounting and
+ * Mirrors `ws-mixer-go/wsmixer/stream.go`'s state machine, credit accounting and
  * half-close semantics (WIRE.md section 2.5-2.6). The JS SDK is always
  * the answering peer: it never opens streams, only receives OPEN from the
  * server and reads/writes/closes/resets what arrives.
@@ -24,7 +24,7 @@ import { truncateUtf8 } from "./util.js";
 
 export type StreamState = "idle" | "open" | "half_closed_local" | "half_closed_remote" | "closed";
 
-/** Attached by terminateNoThrow() (and drainWriteQueue's failed-write path) when nothing else is listening for 'error', purely so Node's own unlistened-'error' crash never fires -- see terminateNoThrow's doc comment. */
+/** Attached by terminateNoThrow() (and failWrite()) when nothing else is listening for 'error', purely so Node's own unlistened-'error' crash never fires -- see terminateNoThrow's doc comment. */
 const NOOP_ERROR_LISTENER = () => {};
 
 /** Payload of the `'reset'` event: fired once, whenever this stream is RESET by something other than the app's own reset() call -- a peer RESET (handleReset()) or an SDK-detected violation (abort()) -- whether or not an `'error'` listener is attached. */
@@ -39,8 +39,10 @@ export interface StreamHost {
   sendData(streamId: number, chunk: Uint8Array): Promise<void>;
   /** Send a control-priority frame (WINDOW/CLOSE/RESET) immediately. */
   sendControlFrame(frame: Uint8Array): void;
-  /** Called when the stream is fully closed so the connection can retire its id. */
+  /** Called when the stream is fully closed so the connection can retire its id (a connection teardown still reaches it until it is destroyed). */
   retireStream(streamId: number): void;
+  /** Called when the stream starts holding a write callback, so the connection holds a retired stream strongly until that callback is settled (a no-op for one not yet retired). Optional: a host that tracks no retired streams has nothing to pin. */
+  pinRetired?(streamId: number): void;
 }
 
 export class MixerStream extends Duplex {
@@ -61,7 +63,7 @@ export class MixerStream extends Duplex {
   /** Bytes queued via _write, waiting on credit; drives backpressure. */
   private writeQueue: Array<{ chunk: Uint8Array; callback: (err?: Error | null) => void }> = [];
   private draining = false;
-  /** Write callbacks (_write's own terminal-error branch, or drainWriteQueue's catch) whose error must wait until the read side has finished delivering buffered data and emitted 'end' -- see terminateNoThrow's doc comment. Non-null exactly while that wait is pending; flushed (and reset to null) from _destroy(), or from the 'end' listener drainWriteQueue's catch installs. */
+  /** Write callbacks (_write's own terminal-error branch, or failWrite()) whose error must wait until the read side has finished delivering buffered data and emitted 'end' -- see terminateNoThrow's doc comment. Non-null exactly while that wait is pending; flushed (and reset to null) from _destroy(), or from the 'end' listener failWrite() installs. */
   private heldWriteCallbacks: Array<(err?: Error | null) => void> | null = null;
 
   /** Set once this stream is RESET -- by the peer (handleReset), the SDK (abort()), or the app itself (reset()); undefined until then. Set even when no `'error'` listener is attached. */
@@ -104,9 +106,9 @@ export class MixerStream extends Duplex {
       // A write issued during or after termination: if the read side is
       // still mid-delivery of buffered data (heldWriteCallbacks non-null,
       // see terminateNoThrow), hold this callback too instead of calling it
-      // with an error now -- same reasoning as drainWriteQueue's catch
-      // below. Otherwise the read side is long done and there's nothing left
-      // to block, so fail it immediately.
+      // with an error now -- same reasoning as failWrite(). Otherwise the
+      // read side is long done and there's nothing left to block, so fail
+      // it immediately.
       if (this.heldWriteCallbacks) {
         this.heldWriteCallbacks.push(callback);
       } else {
@@ -115,7 +117,7 @@ export class MixerStream extends Duplex {
       return;
     }
     if (this.state !== "open" && this.state !== "half_closed_remote") {
-      callback(new StreamError(ErrorCode.STREAM_CLOSED, this.id, "write on a stream that is not open for sending"));
+      this.failWrite(callback, new StreamError(ErrorCode.STREAM_CLOSED, this.id, "write on a stream that is not open for sending"));
       return;
     }
     this.writeQueue.push({ chunk, callback });
@@ -162,6 +164,13 @@ export class MixerStream extends Duplex {
       try {
         while (chunk.length > 0) {
           const n = await this.reserveSendCredit(chunk.length);
+          // Credit can be reserved synchronously, before a closeWrite()/
+          // reset()/destroy() in the same tick; resuming past this await is
+          // the first point that can see it. Past here the stream may also
+          // be retired from MixerConn's table, where nothing else stops the
+          // chunk from going out after this stream's CLOSE/RESET.
+          const { done, error } = this.sendDone();
+          if (done) throw error;
           const piece = chunk.subarray(0, n);
           chunk = chunk.subarray(n);
           await this.host.sendData(this.id, piece);
@@ -170,74 +179,81 @@ export class MixerStream extends Duplex {
         callback();
       } catch (e) {
         this.writeQueue.shift();
-        if (this.heldWriteCallbacks) {
-          // terminateNoThrow is holding write errors until the read side
-          // finishes delivering buffered data and emits 'end' (calling this
-          // callback with an error right now would mark the readable side
-          // errored too, per Node's own Writable/Duplex machinery, and block
-          // that 'end' from ever firing) -- see its doc comment.
-          this.heldWriteCallbacks.push(callback);
-          continue;
-        }
-        if (this.state === "half_closed_remote") {
-          // Same hazard, reached before terminateNoThrow() has run: the
-          // peer's CLOSE already arrived, so the read side may still be
-          // delivering buffered data, and the only way a send rejects here
-          // is the connection's writer failing this chunk's socket write.
-          // Once 'end' has fired there's nothing left to block, so fail the
-          // callback now. Otherwise hold it until 'end', without relying on
-          // teardown to flush it: the app's closeWrite() can retire the
-          // stream before the socket's 'close' arrives, and then
-          // rejectOutstanding() never reaches it. `failure` is the fallback
-          // for a flush with no terminalError of its own.
-          const failure = e as Error;
-          if (!this.hasErrorListener()) {
-            this.on("error", NOOP_ERROR_LISTENER);
-          }
-          if (this.readableEnded) {
-            callback(failure);
-            continue;
-          }
-          this.heldWriteCallbacks = [(err) => callback(err ?? failure)];
-          // Deferred a tick past 'end' so every 'end' listener -- the app's,
-          // and Node's own for-await/pipeline() handling -- has run before
-          // the callback's error can re-emit as 'error'.
-          this.once("end", () =>
-            process.nextTick(() => {
-              if (this.destroyed || !this.heldWriteCallbacks) return;
-              // Closed by closeWrite(): already retired, so nothing else
-              // will ever destroy it, and 'close' needs a destroy() on an
-              // `autoDestroy: false` Duplex. _destroy() flushes, after
-              // destroy has begun, so Node doesn't re-emit the error.
-              if (this.state === "closed") {
-                this.destroy();
-                return;
-              }
-              // Still half_closed_remote: the teardown that's still coming
-              // destroys it (right away, the buffer being empty now), but
-              // the callback doesn't wait on it; _destroy() then finds the
-              // array null.
-              const held = this.heldWriteCallbacks;
-              this.heldWriteCallbacks = null;
-              for (const cb of held) cb(this.terminalError ?? undefined);
-            }),
-          );
-          continue;
-        }
-        // Otherwise the write failed and its caller must hear that. Node's
-        // Writable machinery re-emits a write callback's error as 'error', so
-        // -- same rationale as terminateNoThrow() -- attach the internal no-op
-        // listener first if nothing else is listening: this catch is also
-        // reachable before terminateNoThrow() has run at all (the connection's
-        // writer failed this chunk's socket write, and teardown follows from
-        // the socket's own 'close'), and a dying connection must not crash a
-        // consumer that never attached its own 'error'.
-        if (!this.hasErrorListener()) {
-          this.on("error", NOOP_ERROR_LISTENER);
-        }
-        callback(e as Error);
+        // A send that fails after this stream was torn down (its socket
+        // dying under the in-flight write) reports the teardown's error,
+        // the one `stream.errored` already holds.
+        this.failWrite(callback, this.terminalError ?? (e as Error));
       }
     }
+  }
+
+  /**
+   * Settles a failed write's callback with `failure` -- now, or held until
+   * the read side can no longer be hurt by it. Calling a write callback with
+   * an error marks the READABLE side errored too (Node's own Writable/Duplex
+   * machinery), which drops whatever is still buffered and blocks 'end'.
+   *
+   * - terminateNoThrow is already holding write errors for the read side
+   *   (`heldWriteCallbacks` non-null): join that hold -- see its doc comment.
+   * - The peer's CLOSE has arrived and 'end' hasn't fired yet, whatever this
+   *   side's own write state (`half_closed_remote`, or `closed` after
+   *   closeWrite()): the read side may still be delivering buffered data, so
+   *   hold the callback until 'end', without relying on teardown to flush it
+   *   -- there may be no teardown at all. A connection teardown that does
+   *   come (it also reaches a stream closeWrite() retired) flushes it once
+   *   nothing is left unread; so do destroy()/reset(). `failure` is the
+   *   fallback for a flush with no terminalError of its own (always, on a
+   *   stream CLOSE'd both ways -- see terminateNoThrow).
+   * - Otherwise (peer still sending, 'end' already fired or never will --
+   *   destroyed, or already errored): fail it now.
+   *
+   * Node's Writable machinery re-emits a write callback's error as 'error',
+   * so -- same rationale as terminateNoThrow() -- the internal no-op listener
+   * is attached first if nothing else is listening: a failure is also
+   * reachable before terminateNoThrow() has run at all (the connection's
+   * writer failed this chunk's socket write, and teardown follows from the
+   * socket's own 'close'), and a dying connection must not crash a consumer
+   * that never attached its own 'error'.
+   */
+  private failWrite(callback: (err?: Error | null) => void, failure: Error): void {
+    if (this.heldWriteCallbacks) {
+      this.heldWriteCallbacks.push((err) => callback(err ?? failure));
+      return;
+    }
+    if (!this.hasErrorListener()) {
+      this.on("error", NOOP_ERROR_LISTENER);
+    }
+    if (!this.remoteClosed || this.readableEnded || this.destroyed || this.errored) {
+      callback(failure);
+      return;
+    }
+    this.heldWriteCallbacks = [(err) => callback(err ?? failure)];
+    // Held after closeWrite() retired this stream: the connection's weak
+    // ref must become strong, or a stream the app dropped would be
+    // collected with this callback never settled.
+    this.host.pinRetired?.(this.id);
+    // Deferred a tick past 'end' so every 'end' listener -- the app's, and
+    // Node's own for-await/pipeline() handling -- has run before the
+    // callback's error can re-emit as 'error'.
+    this.once("end", () =>
+      process.nextTick(() => {
+        if (this.destroyed || !this.heldWriteCallbacks) return;
+        // Closed by closeWrite(): retired, so only a connection teardown
+        // (which may never come) would otherwise destroy it, and 'close'
+        // needs a destroy() on an `autoDestroy: false` Duplex. _destroy()
+        // flushes, after destroy has begun, so Node doesn't re-emit the error.
+        if (this.state === "closed") {
+          this.destroy();
+          return;
+        }
+        // Still half_closed_remote: the teardown that's still coming
+        // destroys it (right away, the buffer being empty now), but the
+        // callback doesn't wait on it; _destroy() then finds the array null.
+        const held = this.heldWriteCallbacks;
+        this.heldWriteCallbacks = null;
+        for (const cb of held) cb(this.terminalError ?? undefined);
+      }),
+    );
   }
 
   /** Waits until send credit is available, then reserves and returns min(want, sendWindow, MAX_CHUNK). */
@@ -378,12 +394,14 @@ export class MixerStream extends Duplex {
    * @internal
    */
   handleClose(): void {
+    let closedNow = false;
     switch (this.state) {
       case "open":
         this.state = "half_closed_remote";
         break;
       case "half_closed_local":
         this.state = "closed";
+        closedNow = true;
         this.host.retireStream(this.id);
         break;
       case "half_closed_remote":
@@ -393,6 +411,42 @@ export class MixerStream extends Duplex {
     }
     this.remoteClosed = true;
     this.maybeDeliverEOF();
+    if (closedNow) this.destroyWhenDone();
+  }
+
+  /**
+   * Both directions CLOSE'd cleanly (closeWrite() + the peer's CLOSE, in
+   * either order): the stream is retired, so only a connection teardown
+   * (which may never come) would otherwise reach it, and 'close' needs a
+   * destroy() on an `autoDestroy: false` Duplex. Mirrors
+   * what autoDestroy itself would do: destroy once the readable has emitted
+   * 'end' (a tick later, like failWrite()'s hold, so every 'end' listener
+   * runs first and 'end' always precedes 'close'), and, when the write side
+   * was closed by end(), once 'finish' has fired too -- destroying inside
+   * _final() would suppress 'finish' and turn finished()/pipeline() into a
+   * premature close. A readable that already errored never emits 'end', so
+   * that destroys right away. A consumer that never reads never sees 'end',
+   * and so never 'close' -- same as any other Readable.
+   */
+  private destroyWhenDone(): void {
+    if (this.destroyed) return;
+    if (this.errored) {
+      this.destroy();
+      return;
+    }
+    if (this.writableEnded && !this.writableFinished) {
+      this.once("finish", () => this.destroyWhenDone());
+      return;
+    }
+    if (this.readableEnded) {
+      this.destroy();
+      return;
+    }
+    this.once("end", () =>
+      process.nextTick(() => {
+        if (!this.destroyed) this.destroy();
+      }),
+    );
   }
 
   // CLOSE preserves buffered data; EOF (push(null)) only follows once every
@@ -407,7 +461,7 @@ export class MixerStream extends Duplex {
     }
   }
 
-  /** True once something is listening for `'error'`: gates attaching the internal no-op `'error'` listener (terminateNoThrow, drainWriteQueue). */
+  /** True once something is listening for `'error'`: gates attaching the internal no-op `'error'` listener (terminateNoThrow, failWrite). */
   private hasErrorListener(): boolean {
     return this.listenerCount("error") > 0;
   }
@@ -496,8 +550,8 @@ export class MixerStream extends Duplex {
    *   too, permanently blocking 'end' regardless of whether an 'error'
    *   listener is attached. So instead of calling those callbacks here,
    *   `heldWriteCallbacks` (non-null for exactly this stretch) collects them
-   *   -- pushed onto by `drainWriteQueue`'s catch and by `_write`'s
-   *   terminal-error branch -- and `_destroy()` flushes them with `err`
+   *   -- pushed onto by failWrite() and by `_write`'s terminal-error
+   *   branch -- and `_destroy()` flushes them with `err`
    *   right after `destroy()` actually runs (whether that's the 'end'-
    *   triggered `destroy()` below, or the read side never gets there because
    *   something else destroys the stream first): by then the readable side
@@ -524,9 +578,13 @@ export class MixerStream extends Duplex {
    * loop, so no separate queue-flushing step is needed here.
    *
    * A stream already fully, cleanly closed (both directions CLOSE'd) has
-   * already called `retireStream()` and is no longer tracked by MixerConn,
-   * so `rejectOutstanding` never reaches it here at all -- only a stream
-   * still genuinely open, or half-closed one way, ever is.
+   * already called `retireStream()`, but MixerConn keeps it for
+   * `rejectOutstanding` until it is destroyed: it lands in the branch above
+   * (`remoteClosed`), so its read side still ends cleanly, and 'close' fires
+   * once nothing is left unread. Its exchange already completed, so `err`
+   * is not adopted (no `terminalError`, no `resetCode`): a write callback it
+   * holds keeps its own failure (STREAM_CLOSED, or its socket send's error).
+   * Without a teardown, destroyWhenDone() is what ends it.
    *
    * `resetCode` is set here too, but only when `err` is a `StreamError`
    * (mirrors handleReset()/applyReset(), which construct one for exactly
@@ -538,15 +596,18 @@ export class MixerStream extends Duplex {
    * otherwise wrongly discard a response that had already completed on
    * every drain hand-over. From the stream's own perspective a `StreamError`
    * IS a fourth way it ends in RESET, on top of the three the class doc
-   * above lists, distinct from an ordinary `WsMixerError`/`ConnError`
-   * connection failure, which is not RESET-shaped and leaves `resetCode`
-   * unset.
+   * above lists, distinct from an ordinary connection failure (always a
+   * `ConnError` by the time rejectOutstanding() hands it here), which is not
+   * RESET-shaped and leaves `resetCode` unset.
    * @internal
    */
   terminateNoThrow(err: WsMixerError, opts?: { discardBuffered?: boolean }): void {
+    const closedCleanly = this.state === "closed" && !this.terminalError;
     this.state = "closed";
-    this.terminalError = err;
-    if (err instanceof StreamError) this.resetCode = err.code;
+    if (!closedCleanly) {
+      this.terminalError = err;
+      if (err instanceof StreamError) this.resetCode = err.code;
+    }
     const deferWriteErrors = !opts?.discardBuffered && this.remoteClosed;
     if (deferWriteErrors) this.heldWriteCallbacks = this.heldWriteCallbacks ?? [];
     this.wakeSendWaiters();
@@ -587,9 +648,23 @@ export class MixerStream extends Duplex {
     return { done: false };
   }
 
+  /**
+   * True while a write callback is held back for the read side (see failWrite()).
+   * @internal
+   */
+  hasHeldWriteCallbacks(): boolean {
+    return this.heldWriteCallbacks !== null && this.heldWriteCallbacks.length > 0;
+  }
+
   // --- public half-close / reset API -----------------------------------------
 
-  /** Sends CLOSE: "I will send no more DATA on this stream." end() is sugar for this via _final. */
+  /**
+   * Sends CLOSE: "I will send no more DATA on this stream." end() is sugar
+   * for this via _final. A write still waiting on send credit can never go
+   * out now, so it is woken to fail with STREAM_CLOSED (reserveSendCredit)
+   * instead of waiting on a WINDOW that, once this stream is retired, would
+   * never reach it.
+   */
   closeWrite(): void {
     switch (this.state) {
       case "open":
@@ -604,14 +679,18 @@ export class MixerStream extends Duplex {
     }
     const closedNow = this.state === "closed";
     this.host.sendControlFrame(encodeClose(this.id));
-    if (closedNow) this.host.retireStream(this.id);
+    this.wakeSendWaiters();
+    if (closedNow) {
+      this.host.retireStream(this.id);
+      this.destroyWhenDone();
+    }
   }
 
   /**
    * Sends CLOSE (if not already sent) and stops delivering further reads. If
    * the peer has not yet half-closed its own send side, a plain closeWrite()
    * would leave it writing into a window nobody drains, so close() also
-   * RESETs with CANCEL in that case (mirrors go/wsmixer/stream.go Close()).
+   * RESETs with CANCEL in that case (mirrors ws-mixer-go/wsmixer/stream.go Close()).
    */
   close(): void {
     if (!this.remoteClosed) {
@@ -652,7 +731,8 @@ export class MixerStream extends Duplex {
    * MixerConn's dispatch loop). Identical effect to reset(), but also emits
    * `'reset'` the same way handleReset() does for a peer-sent RESET: in both
    * cases the stream's owner didn't choose this, so it needs to hear about
-   * it. No-ops (and does not emit) if the stream is already closed.
+   * it. Sends nothing and does not emit if the stream is already closed
+   * (applyReset then only finishes a pending local destroy()).
    * @internal
    */
   abort(code: number | string, message = ""): void {
@@ -661,14 +741,15 @@ export class MixerStream extends Duplex {
     }
   }
 
-  /** Shared implementation behind reset()/abort(); returns false (no-op) if the stream was already closed. */
+  /** Shared implementation behind reset()/abort(); returns false (nothing sent) if the stream was already closed. */
   private applyReset(code: number | string, message: string): boolean {
     if (this.state === "closed") {
-      // terminateNoThrow may have left this stream closed but not yet
-      // destroy()'d, holding write callbacks back for the read side to drain
-      // (see its doc comment). reset() is documented to flush those
-      // callbacks, so nudge the stream the rest of the way there.
-      if (this.heldWriteCallbacks && !this.destroyed) this.destroy();
+      // Nothing left to RESET on the wire, but the stream may be closed and
+      // not yet destroy()'d: terminateNoThrow holding write callbacks back
+      // for the read side to drain (see its doc comment), or a clean CLOSE
+      // both ways waiting on 'end' (destroyWhenDone). reset() discards
+      // buffered data and flushes held callbacks, so finish it here.
+      if (!this.destroyed) this.destroy();
       return false;
     }
     const numericCode = typeof code === "string" ? parseErrorCode(code) : code;

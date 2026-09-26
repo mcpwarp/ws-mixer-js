@@ -92,9 +92,9 @@ export class WsMixerError extends Error {
   constructor(
     code: number,
     message: string,
-    opts?: { fatal?: boolean; streamId?: number; wsCode?: number; closeReason?: string },
+    opts?: { fatal?: boolean; streamId?: number; wsCode?: number; closeReason?: string; cause?: unknown },
   ) {
-    super(message);
+    super(message, opts?.cause !== undefined ? { cause: opts.cause } : undefined);
     this.code = code;
     this.fatal = opts?.fatal ?? false;
     this.streamId = opts?.streamId;
@@ -111,10 +111,20 @@ export class WsMixerError extends Error {
   }
 }
 
-/** A connection-fatal error: desynchronizes shared connection state. Always error{code} + WS close. */
+/**
+ * A connection-level error: a locally-detected violation that desynchronizes
+ * shared connection state (always error{code} + WS close), and also what every
+ * stream still live when the connection ends -- and every write/send pending
+ * on it -- is failed with, whatever ended it (MixerConn.rejectOutstanding
+ * wraps a non-ConnError teardown error, keeping the original as `cause`).
+ */
 export class ConnError extends WsMixerError {
   readonly lastStreamId?: number;
-  constructor(code: number, message: string, opts?: { streamId?: number; lastStreamId?: number; fatal?: boolean }) {
+  constructor(
+    code: number,
+    message: string,
+    opts?: { streamId?: number; lastStreamId?: number; fatal?: boolean; wsCode?: number; closeReason?: string; cause?: unknown },
+  ) {
     super(code, message, opts);
     this.name = "ConnError";
     this.lastStreamId = opts?.lastStreamId;

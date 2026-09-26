@@ -1,6 +1,6 @@
 /**
  * ws-mixer.v1 control channel (stream 0) message types and hand-written
- * validators (WIRE.md section 2.7). Mirrors `go/wsmixer/control.go` and
+ * validators (WIRE.md section 2.7). Mirrors `ws-mixer-go/wsmixer/control.go` and
  * `control_messages.go`: dispatch on `t`, then explicit per-field checks —
  * never a JSON Schema validator on the runtime path (decision 9).
  */

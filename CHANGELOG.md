@@ -2,6 +2,69 @@
 
 All notable changes to `@mcpwarp/ws-mixer` (the JS/TypeScript client SDK) are documented here.
 
+## 0.7.0 - 2026-09-26
+
+- A write issued in the same tick as the app's own `destroy()`/`reset()` (or `closeWrite()`) no
+  longer puts its DATA on the wire after the stream's `RESET`/`CLOSE` and reports success: the chunk
+  is never sent, and the write callback gets the stream's error exactly once --
+  `StreamError(CANCEL)` for `destroy()`/`reset()`, `StreamError(STREAM_CLOSED)` after
+  `closeWrite()`. DATA still queued when a stream is retired is now rejected the same way instead of
+  being dropped (its write callback used to hang forever).
+- A stream CLOSE'd in both directions (the peer's `CLOSE` plus the app's own `closeWrite()`/`end()`,
+  in either order) is now destroyed once its read side has emitted `'end'` (and, after `end()`, once
+  `'finish'` has fired), so `'close'` fires; previously it never did. `'end'` still precedes
+  `'close'` when data is buffered. `reset()` on such a stream, before it gets there, now destroys it
+  (discarding what is still buffered) instead of doing nothing.
+- `closeWrite()` now fails a write that was waiting on send credit with `StreamError(STREAM_CLOSED)`
+  instead of leaving it waiting for a `WINDOW` -- forever, once the stream was CLOSE'd both ways, not
+  even `destroy()` settled it. The callback is called right away unless the peer's `CLOSE` has
+  arrived and its data is still unread; then it is held like the writes in the next item.
+- A failed write on a stream whose peer `CLOSE` already arrived is now held whatever this side's own
+  write state: after `closeWrite()` it used to fail immediately, erroring the read side and losing
+  the peer's buffered data (and `'end'`). The same now applies to a write issued after
+  `closeWrite()`. A held write callback is settled once `'end'` fires, when the app calls
+  `destroy()`/`reset()`, or when the connection is torn down with nothing left unread on the stream;
+  while data is still unread it waits for `'end'` (or `destroy()`/`reset()`), even past the
+  connection's teardown.
+- A stream CLOSE'd both ways but not yet destroyed (its reader hasn't reached `'end'`) is now still
+  reached by the connection's teardown: with nothing left unread it is destroyed there, so `'close'`
+  fires and a held write callback settles. It keeps its clean end: the teardown's error is not
+  applied to it (no `resetCode`, a held write keeps its own `STREAM_CLOSED` or socket error).
+  Previously such a stream was never reached, and a write held on it hung (0.6.0 failed it
+  immediately instead, losing the peer's buffered data and `'end'`). The connection tracks such
+  streams only weakly, except while one owes a write callback: that one is held until its callback
+  settles, even if the app dropped it. One the app dropped with no write pending (say, `end()`'d but
+  never read) can still be garbage-collected on a long-lived connection, in which case its `'close'`
+  listeners never run -- as in 0.6.0, where such streams were unreachable from the teardown
+  entirely.
+- On a drain hand-over, a write whose DATA was still queued behind another stream's in-flight write,
+  or whose in-flight socket send failed after the hand-over, now fails with its stream's own
+  `StreamError(CANCEL, "connection drained")`, the same error as `stream.errored`. Previously it got
+  the superseded connection's `NO_ERROR`, or the raw socket error.
+- Connection-death errors seen by a stream are now always a `ConnError` (`stream.errored`, its
+  `'error'`, write callbacks, and `sendApp()` rejections): the socket's own close (previously a plain
+  `WsMixerError`), a graceful `close()`'s `NO_ERROR` (likewise), and a raw `ws` send failure such as
+  `Error("WebSocket is not open")` (previously leaked as-is) are wrapped, keeping the original as
+  `cause` and copying `code`/`wsCode`/`closeReason`. `ConnError`/`WsMixerError` accept `cause`. A
+  drain hand-over still gives `StreamError(CANCEL, "connection drained")`; README's "Errors" section
+  now spells out which class means what.
+- `conn.once(...)` listeners for `'stream'`/`'app'`/`'drain'` (and `events.once(conn, ...)`) were
+  never detached: the ordered delivery loop called the unwrapped listener, so it fired again on every
+  later event and leaked, pinning whatever it closed over (e.g. its stream) for the connection's lifetime.
+  Fixed; they now fire once and detach.
+- An incoming `RESET` message longer than 256 UTF-8 bytes is now clamped to 256 bytes on a character
+  boundary (in `'reset'` and the stream's `StreamError`). WIRE.md section 2.3's limit is a
+  sender-side SHOULD, so it stays tolerated, not a protocol error.
+- Tests: `test/stream-matrix.test.ts`, a generated 600-cell matrix over the stream teardown seam
+  (state x trigger x `'error'` listener x read buffer x pending write, including DATA queued behind
+  a second stream's in-flight write, plus a no-reader variant for peer-CLOSE'd streams) through a
+  real `MixerConn`, checking write callbacks settle exactly once and only report success for bytes
+  on the wire, no DATA after `CLOSE`/`RESET`, buffered data and `'end'` before `'close'`, `'close'`
+  exactly once and last, and the class and code of `stream.errored` and of any write-callback error
+  per trigger.
+- ci: publish workflow now runs typecheck + tests (test job, on Node 20 and 24) before npm publish; a failing tag no longer ships.
+- Code comments now point to ws-mixer-go (`ws-mixer-go/wsmixer/...`) and ws-mixer-spec (`ws-mixer-spec/docs/research/...`) instead of the old monorepo paths.
+
 ## 0.6.0 - 2026-09-26
 
 - A stream write that fails outside stream termination now reports that error to its write callback,

@@ -1,5 +1,5 @@
 /**
- * Reconnect/backoff policy from docs/research/2026-08-26-control-channel-and-connection-lifecycle.md
+ * Reconnect/backoff policy from ws-mixer-spec/docs/research/2026-08-26-control-channel-and-connection-lifecycle.md
  * and WIRE.md section 2.9's reconnect table, exercised end-to-end
  * against `MixerClient` with fake timers and a fake `ws`-shaped transport
  * injected via the test-only `_wsFactory` option -- no real sockets, no
