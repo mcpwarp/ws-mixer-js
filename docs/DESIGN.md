@@ -66,7 +66,7 @@ await conn.sendApp({ mcpwarp: { v: 1, op: "unregister", id: "anki" } });
 await conn.close();                              // drain{client_requested}, 5 s grace, close 1000
 // or, for an application-level reason instead of the default graceful drain (no drain, no grace
 // period; one non-fatal report when a connection had actually been established this cycle):
-// await conn.close({ code: ErrorCode.APPLICATION_CLOSE, message: "operator requested shutdown" });
+// await conn.close({ message: "operator requested shutdown" }); // APPLICATION_CLOSE, WS close 4014
 ```
 
 | Event | Fires when |

@@ -509,31 +509,19 @@ async function handleCommand(cmd) {
 
     case "close": {
       if (!state.client) return cmdErr(seq, "close before connection established");
-      // A NON-ZERO numeric `code` (docs/CONFORMANCE.md's `close` command:
-      // `code`, `message`, both roles) is an application-initiated close
-      // (CLIENT-SDK.md's "Application close" row) -- MixerClient.close()'s
-      // opts.code performs the error{}+WS-close+socket sequence directly,
-      // immediately, with no drain. An absent code, or `code: 0`
-      // (NO_ERROR -- e.g. graceful_close.json), is the ordinary graceful
-      // path: plain `client.close()`, drain{client_requested} -> grace ->
-      // error{NO_ERROR} -> close 1000 (WIRE.md section 2.10 step 14). `0` is
-      // deliberately NOT routed through opts.code: MixerClient.close({code:
-      // 0}) would skip the drain entirely, and this pair scenario is the
-      // only place that sequence gets exercised at all.
-      const opts = cmd.code !== undefined && cmd.code !== 0 ? { code: cmd.code, message: cmd.message } : undefined;
-      try {
-        // close() validates opts.code SYNCHRONOUSLY (a RangeError for an
-        // out-of-range code throws before any Promise even exists), so this
-        // must be inside the try -- a bare `.catch()` on its return value
-        // only ever sees an async rejection, and handleCommand is `void`'d
-        // by its caller (main()'s `rl.on("line", ...)`), so an uncaught
-        // synchronous throw here would surface only as an unhandled
-        // rejection and kill the whole adapter process instead of a normal
-        // command-error reply.
-        state.client.close(opts).catch(() => {});
-      } catch (e) {
-        return cmdErr(seq, "close: " + (e && e.message ? e.message : String(e)));
+      // docs/CONFORMANCE.md's `close` command: `code` absent or `0`
+      // (NO_ERROR) is the SDK's own graceful shutdown -- plain
+      // `client.close()`, drain{client_requested} -> grace ->
+      // error{NO_ERROR} -> close 1000 (WIRE.md section 2.10 step 14). `14`
+      // is the only other accepted value -- an immediate close via the
+      // SDK's application-close API (CLIENT-SDK.md's "Application close"
+      // row, D-2026-09-25-01): `error{code:14,message}` + WS close `4014`,
+      // no drain. Any other value is a scenario error.
+      if (cmd.code !== undefined && cmd.code !== 0 && cmd.code !== 14) {
+        return cmdErr(seq, "close: only 0 or 14");
       }
+      const opts = cmd.code === 14 ? { message: cmd.message ?? "" } : undefined;
+      state.client.close(opts).catch(() => {});
       ack(seq);
       return;
     }

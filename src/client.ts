@@ -26,7 +26,7 @@ export const SUBPROTOCOL = "ws-mixer.v1";
 // asserts the two match, so a release bump that forgets this one fails CI
 // instead of silently going stale on the wire in hello.agent.sdk_version /
 // the User-Agent header).
-export const SDK_VERSION = "0.4.0";
+export const SDK_VERSION = "0.5.0";
 
 export type ClientState = "idle" | "dialing" | "connected" | "backoff" | "closed";
 
@@ -236,7 +236,7 @@ export interface ConnectOptions {
    * or with themselves (CLIENT-SDK.md's "Handler delivery" row). An event
    * already received when the connection ends is still owed to this
    * callback: it MAY therefore still fire shortly after `close()`/
-   * `close({code})`'s own promise has resolved, for a stream/message/drain
+   * `close({message})`'s own promise has resolved, for a stream/message/drain
    * that arrived before whatever ended the connection.
    */
   onStream?: (stream: MixerStream) => void;
@@ -279,14 +279,17 @@ export interface ConnectOptions {
 /** Options for an application-initiated `MixerClient.close()` (CLIENT-SDK.md's "Application close" row). See `close()`'s doc comment. */
 export interface CloseOptions {
   /**
-   * A ws-mixer error code (OVERVIEW.md section 2.8); the connection closes
-   * with `error{code, message}` then WS close `4000+code`, instead of the
-   * default graceful drain. Must be an integer in `[0, 999]` so `4000+code`
-   * is a legal WS close code -- `close()` throws a `RangeError` synchronously
-   * otherwise, before any close is attempted.
+   * The mode is chosen by presence, not value: supplying `message` (even
+   * `""`) closes the connection with `error{code: ErrorCode.APPLICATION_CLOSE,
+   * message}` then WS close `4014`, instead of the default graceful drain --
+   * WIRE.md section 2.8 makes `APPLICATION_CLOSE` the only code an
+   * application may close a *connection* with, so there is no caller-chosen
+   * code (D-2026-09-25-01). Truncated to 123 UTF-8 bytes on a character
+   * boundary for the WS close reason. Leaving `message` undefined -- `close()`
+   * or `close({})` -- takes the graceful path instead. A `code` key (e.g. a
+   * plain-JS caller still passing `{code: 14}`) makes `close()` throw a
+   * `TypeError` synchronously, with or without `message`.
    */
-  code?: number;
-  /** The `error{}` message and (truncated to 123 UTF-8 bytes on a character boundary) the WS close reason. Defaults to "". */
   message?: string;
 }
 
@@ -432,7 +435,7 @@ export class MixerClient extends EventEmitter {
    * (`keepaliveImmediateRetryUsed`, `unauthorizedRetryUsed`) reset.
    * `unref()`'d so it never keeps the process alive, and cleared on every
    * path that ends a conn or the client itself (conn close, close()/
-   * close({code}), goFatal, a drain hand-over's retired conn) so a stale
+   * close({message}), goFatal, a drain hand-over's retired conn) so a stale
    * timer can never fire against a conn that's no longer the active one --
    * though the `this.conn === conn` check inside it is also always
    * re-verified regardless, belt and suspenders. Per-connection: a
@@ -450,8 +453,8 @@ export class MixerClient extends EventEmitter {
     this.url = url;
     this.opts = opts;
     this.reconnectOpts = { ...DEFAULT_RECONNECT, ...opts.reconnect };
-    // Validated the same way close()'s code is (RangeError, synchronously,
-    // before anything else happens): silently letting a non-finite or
+    // Validated synchronously, before anything else happens (RangeError):
+    // silently letting a non-finite or
     // negative value through would either never fire (NaN: Node clamps
     // setTimeout's delay to a minimum of 1ms rather than rejecting it, so a
     // NaN stableAfter would still schedule a timer -- but comparing `attempt`
@@ -509,15 +512,17 @@ export class MixerClient extends EventEmitter {
    * is closed as soon as it resolves (see connectOnce); nothing reconnects
    * after this returns.
    *
-   * With `opts.code`, this is instead an application-initiated close
-   * (CLIENT-SDK.md's "Application close" row, e.g. `code:
-   * ErrorCode.APPLICATION_CLOSE`): `error{code, message}` on stream 0, WS
-   * close `4000+code` (message truncated to 123 UTF-8 bytes on a character
-   * boundary), then the socket -- `MixerConn.fail()`'s `teardownConn`
-   * already performs exactly those three steps in order. No `drain`, no
-   * grace period. Validated synchronously (before either connection is
-   * touched): `code` must be an integer in `[0, 999]` so `4000+code` is a
-   * legal WS close code, or this throws a `RangeError`.
+   * With `opts.message`, this is instead an application-initiated close
+   * (CLIENT-SDK.md's "Application close" row): `error{code:
+   * ErrorCode.APPLICATION_CLOSE, message}` on stream 0, WS close `4014`
+   * (message truncated to 123 UTF-8 bytes on a character boundary), then
+   * the socket -- `MixerConn.fail()`'s `teardownConn` already performs
+   * exactly those three steps in order. No `drain`, no grace period.
+   * `APPLICATION_CLOSE` is the only code an application may close a
+   * *connection* with (WIRE.md section 2.8), so there is no caller-chosen
+   * code here (D-2026-09-25-01): an `opts` with a `code` key (a plain-JS
+   * caller still on the old `close({code, message})` shape) throws a
+   * `TypeError` synchronously, before either connection is touched.
    *
    * A callback for a stream/`app`/`drain` event received before this close
    * can still fire shortly after this promise resolves: it doesn't wait for
@@ -526,9 +531,9 @@ export class MixerClient extends EventEmitter {
    * options' own doc comments.
    */
   close(opts?: CloseOptions): Promise<void> {
-    if (opts?.code !== undefined && (!Number.isInteger(opts.code) || opts.code < 0 || opts.code > 999)) {
-      throw new RangeError(
-        `ws-mixer: close() code must be an integer in [0, 999] (so 4000+code is a legal WS close code); got ${opts.code}`,
+    if (typeof opts === "object" && opts !== null && Object.prototype.hasOwnProperty.call(opts, "code")) {
+      throw new TypeError(
+        "ws-mixer: close() no longer takes a code (D-2026-09-25-01); use close({message}) -- it always closes with APPLICATION_CLOSE",
       );
     }
     return this.closeImpl(opts);
@@ -552,11 +557,12 @@ export class MixerClient extends EventEmitter {
     this.clearReconnectTimer();
     this.clearStabilityTimer();
     // Built once and reused for every conn this call tears down, so a
-    // code/message given to close() isn't silently dropped for a
+    // message given to close() isn't silently dropped for a
     // retiring/dialing conn just because it wasn't yet the primary `conn`
     // (previously these two always hard-coded NO_ERROR/"client closing"
     // regardless of opts).
-    const closeErr = opts?.code !== undefined ? new WsMixerError(opts.code, opts.message ?? "") : new WsMixerError(ErrorCode.NO_ERROR, "client closing");
+    const closeErr =
+      opts?.message !== undefined ? new WsMixerError(ErrorCode.APPLICATION_CLOSE, opts.message) : new WsMixerError(ErrorCode.NO_ERROR, "client closing");
     if (this.retiringConn) {
       const old = this.retiringConn;
       this.retiringConn = null;
@@ -568,7 +574,7 @@ export class MixerClient extends EventEmitter {
       dialing.fail(closeErr);
     }
     if (this.conn) {
-      if (opts?.code !== undefined) {
+      if (opts?.message !== undefined) {
         this.conn.fail(closeErr);
       } else {
         await this.conn.close();

@@ -2,6 +2,23 @@
 
 All notable changes to `@mcpwarp/ws-mixer` (the JS/TypeScript client SDK) are documented here.
 
+## 0.5.0 - 2026-09-25
+
+- **Breaking:** `MixerClient.close()`'s options no longer take a `code` — `close({message})` always
+  closes the connection with `APPLICATION_CLOSE` (`0x0e`/WS close `4014`), never a caller-chosen
+  code. WIRE.md section 2.8 makes `APPLICATION_CLOSE` the only code an application may close a
+  *connection* with, so a caller-supplied code could previously close a healthy connection with a
+  protocol-fault code and produce an `errorCode`/`errorName` pair outside that table (D-2026-09-25-01).
+  Which path runs is chosen by whether `message` is present, not by any `code`: `close({message})`
+  is the application close, and `close()`/`close({})`/`message: undefined` is the default graceful
+  drain-then-close. Passing a `code` key at all (e.g. a plain-JS caller still on
+  `close({code: 14})`, with or without `message`) now throws a `TypeError` synchronously, before
+  any close is attempted, instead of silently taking either path. The `[0, 999]` `RangeError`
+  validation is gone along with `code`.
+- Conformance adapter: the `close` command's `code` now accepts only `0`/absent (graceful close) or
+  `14` (application close via the new `close({message})`) — any other value replies with a
+  command-error, `"close: only 0 or 14"`.
+
 ## 0.4.0 - 2026-09-25
 
 - New `TokenUnavailableError` (exported from the package root): a token provider that throws or

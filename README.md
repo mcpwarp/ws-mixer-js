@@ -63,7 +63,7 @@ An event already received when the connection ends is still owed to its handler:
 always the *last* message on the wire, so a stream `OPEN`/`app`/`drain` queued ahead of it arrived
 before the connection ended and is still delivered, even after `close()`/the underlying `MixerConn`
 has already torn down. Concretely: **a handler MAY still fire shortly after `client.close()` (or
-`close({code})`)'s own promise has already resolved -- or after `onDisconnect`/the `'close'` event
+`close({message})`)'s own promise has already resolved -- or after `onDisconnect`/the `'close'` event
 already reported that disconnect**, for a message that arrived before it. A `drain` delivered this
 way never starts a reconnect for a connection that is no longer the live one: on a client that is
 already closing/closed it never does (an app-initiated shutdown); on a conn that instead died for
@@ -195,7 +195,7 @@ Three phases, referenced throughout this section and in `DisconnectReason.phase`
 | A pre-`welcome` token rejection (HTTP `401` on the upgrade, or handshake-phase `4011`), with a token provider present, and the once-only refresh-retry budget not yet spent | One immediate refresh-retry: the provider is called again and the dial redialed right away (no backoff). Unlike every other row here, this is **not** gated by `reconnect.maxAttempts`/reconnect being disabled (it applies to the very first connect too, and matches `ws-mixer-go`'s own `dialAndHandshake`), and it does **not** itself increment the attempt counter -- it's an immediate redial within the same connect attempt, not a new reconnect cycle. See "Authentication" above -- this is ONE budget shared by both rejection shapes. |
 | Close `4010` (`UNSUPPORTED`) in any phase; close `4011` (`UNAUTHORIZED`) *after* `welcome`; a pre-`welcome` token rejection (`401`/`4011`) on its second occurrence with a token provider, or on its very first occurrence with a static string; HTTP `403`/`404`; missing/mismatched subprotocol echo; a token provider that throws/rejects an UNMARKED error | **Fatal.** Surfaced on the `fatal` event and via `onDisconnect({ ..., fatal: true })`; `close()` is issued; **never retried**. `connect()` rejects if this happens before any `welcome`. |
 | A token provider that throws/rejects a `TokenUnavailableError` (directly, or reachable via `cause`) | Treated exactly like a failed dial: phase `"dial"`, `fatal: false`, normal full-jitter backoff via the ordinary path -- it counts as a failed attempt (`reconnect.maxAttempts` applies, the stability rule is unaffected). Not gated by whether `token` is a provider or static string. See "Authentication" above. |
-| Close `4014` (`APPLICATION_CLOSE`), connected phase | Same "start at the cap" treatment as `4009` above (WIRE.md section 2.9): it is by nature sent *after* `welcome` (the app accepted, then refused -- e.g. a per-account connection cap) -- another "refused on purpose" signal, handled the same way regardless of how recently the attempt counter last reset. Applies to both the `error{14}+close` and bare-`4014` shapes. Never emitted by ws-mixer itself -- reserved for the application above to close a connection for its own reason (the reason text is in `error.message`/the WS close reason). See `close({ code, message })` below. A **handshake-phase** `4014` (before `welcome`) is not special-cased: it follows the ordinary handshake-failure path, where the attempt counter climbs normally. |
+| Close `4014` (`APPLICATION_CLOSE`), connected phase | Same "start at the cap" treatment as `4009` above (WIRE.md section 2.9): it is by nature sent *after* `welcome` (the app accepted, then refused -- e.g. a per-account connection cap) -- another "refused on purpose" signal, handled the same way regardless of how recently the attempt counter last reset. Applies to both the `error{14}+close` and bare-`4014` shapes. Never emitted by ws-mixer itself -- reserved for the application above to close a connection for its own reason (the reason text is in `error.message`/the WS close reason). See `close({ message })` below. A **handshake-phase** `4014` (before `welcome`) is not special-cased: it follows the ordinary handshake-failure path, where the attempt counter climbs normally. |
 | `reconnect.maxAttempts` exhausted | Stops reconnecting. `connect()` rejects if it never connected once. `maxAttempts` counts *consecutive reconnect attempts without a stable connection in between* -- since the attempt counter itself only resets at stability (see below), a server that always welcomes and then disconnects before a connection ever proves stable exhausts this ceiling and goes fatal exactly like a server that never welcomes at all. |
 | `close()` called while a dial is in flight | The in-flight socket is closed as soon as the dial resolves; nothing reconnects afterward. |
 
@@ -296,16 +296,15 @@ way `sendData()`'s per-stream outbox already does for stream bytes.
 ### Application-initiated close
 
 `close()` normally performs the default graceful shutdown shown above (`drain{client_requested}`,
-a grace period, then close `1000`). Pass `{ code, message }` instead to close the connection for an
-application-level reason (e.g. `ErrorCode.APPLICATION_CLOSE`, `0x0e`/WS close `4014` -- reserved for
-this and never emitted by ws-mixer itself): `error{code, message}` on stream 0, then WS close
-`4000+code` with `message` truncated to 123 UTF-8 bytes on a character boundary, then the socket --
-no `drain`, no grace period, and no reconnect is scheduled (matches the default `close()`'s
-one-report-then-done shape). `code` must be an integer in `[0, 999]` so `4000+code` is a legal WS
-close code; anything else throws a `RangeError` synchronously, before either connection is touched.
+a grace period, then close `1000`). Pass `{ message }` instead to close the connection with
+`APPLICATION_CLOSE` (`0x0e`/WS close `4014` -- the only code an application may close a *connection*
+with, WIRE.md section 2.8; there is no caller-chosen code, D-2026-09-25-01): `error{code: 14,
+message}` on stream 0, then WS close `4014` with `message` truncated to 123 UTF-8 bytes on a
+character boundary, then the socket -- no `drain`, no grace period, and no reconnect is scheduled
+(matches the default `close()`'s one-report-then-done shape).
 
 ```ts
-await client.close({ code: ErrorCode.APPLICATION_CLOSE, message: "operator requested shutdown" });
+await client.close({ message: "operator requested shutdown" });
 ```
 
 ### Errors

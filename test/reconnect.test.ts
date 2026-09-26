@@ -3972,8 +3972,8 @@ describe("MixerClient change 3: handshake-phase 'error'/'close' converge on one 
   });
 });
 
-describe("MixerClient close({ code, message })", () => {
-  it("performs error{code,message} + WS close 4000+code (message truncated to 123 bytes), no drain, no reconnect", async () => {
+describe("MixerClient close({ message })", () => {
+  it("performs error{code:14,message} + WS close 4014 (message truncated to 123 bytes), no drain, no reconnect", async () => {
     vi.useFakeTimers();
     const sockets: FakeSocket[] = [];
     const disconnects: DisconnectPayload[] = [];
@@ -3989,7 +3989,7 @@ describe("MixerClient close({ code, message })", () => {
     await started;
 
     const longMessage = "x".repeat(200);
-    await client.close({ code: ErrorCode.APPLICATION_CLOSE, message: longMessage });
+    await client.close({ message: longMessage });
 
     const errorFrames = s0.sent
       .map((frame) => {
@@ -4012,6 +4012,9 @@ describe("MixerClient close({ code, message })", () => {
     expect(client.currentState()).toBe("closed");
     expect(disconnects).toHaveLength(1);
     expect(disconnects[0]!.fatal).toBe(false);
+    expect(disconnects[0]!.wsCode).toBe(4000 + ErrorCode.APPLICATION_CLOSE);
+    expect(disconnects[0]!.errorCode).toBe(ErrorCode.APPLICATION_CLOSE);
+    expect(disconnects[0]!.errorName).toBe("APPLICATION_CLOSE");
 
     await vi.advanceTimersByTimeAsync(120000);
     expect(sockets.length).toBe(1); // never reconnected
@@ -4032,7 +4035,7 @@ describe("MixerClient close({ code, message })", () => {
     // odd) -- truncateUtf8's character-boundary walk has to actually back
     // off from a mid-character byte, not just slice(0, 123).
     const multiByteMessage = "é".repeat(100);
-    await client.close({ code: ErrorCode.APPLICATION_CLOSE, message: multiByteMessage });
+    await client.close({ message: multiByteMessage });
 
     const reason = s0.closedWith?.reason ?? "";
     const reasonBytes = new TextEncoder().encode(reason);
@@ -4041,7 +4044,7 @@ describe("MixerClient close({ code, message })", () => {
     expect(reason).toBe("é".repeat(Math.floor(reasonBytes.length / 2))); // every "é" in the result is whole
   });
 
-  it("defaults to today's graceful drain-then-close when no code is given", async () => {
+  it("defaults to today's graceful drain-then-close when no message is given", async () => {
     vi.useFakeTimers();
     const sockets: FakeSocket[] = [];
     const client = new MixerClient("wss://x/tunnel", { token: "t", _wsFactory: makeFactory(sockets) });
@@ -4054,18 +4057,43 @@ describe("MixerClient close({ code, message })", () => {
     await client.close();
     await tick();
 
-    // Unchanged from before opts.code existed: NO_ERROR, WS close 1000.
+    // Unchanged from before opts.message existed: NO_ERROR, WS close 1000.
     expect(s0.closedWith?.code).toBe(1000);
   });
 
-  it("throws a RangeError synchronously for an out-of-range code, before touching either connection", () => {
-    const client = new MixerClient("wss://x/tunnel", { token: "t" });
-    expect(() => client.close({ code: 1000 })).toThrow(RangeError);
-    expect(() => client.close({ code: -1 })).toThrow(RangeError);
-    expect(() => client.close({ code: 1.5 })).toThrow(RangeError);
+  it("throws a TypeError synchronously for a leftover `code` key (with or without message), before touching the connection", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    const disconnects: DisconnectPayload[] = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: "t",
+      _wsFactory: makeFactory(sockets),
+      onDisconnect: (r) => disconnects.push(r),
+    });
+
+    const started = client.start();
+    started.catch(() => {});
+    const s0 = await connectSocket(sockets, 0);
+    await started;
+    const sentBefore = s0.sent.length;
+
+    expect(() => client.close({ code: 14 } as any)).toThrow(TypeError);
+    expect(() => client.close({ code: 14 } as any)).toThrow(/D-2026-09-25-01/);
+    expect(() => client.close({ code: 14 } as any)).toThrow(/message/);
+    expect(() => client.close({ code: 0, message: "x" } as any)).toThrow(TypeError);
+    await tick();
+
+    // No side effects: still connected, nothing sent, socket open, no report.
+    expect(client.currentState()).toBe("connected");
+    expect(s0.sent.length).toBe(sentBefore);
+    expect(s0.closedWith).toBeNull();
+    expect(disconnects).toHaveLength(0);
+
+    await client.close({ message: "bye" });
+    expect(s0.closedWith?.code).toBe(4000 + ErrorCode.APPLICATION_CLOSE);
   });
 
-  it("close({code:14}) while the handshake is still in flight (mid-dial): the app's code/message reach the wire; no report and no redial, matching the pre-existing no-args close() behaviour in this window", async () => {
+  it("close({message}) while the handshake is still in flight (mid-dial): the app's message reaches the wire; no report and no redial, matching the pre-existing no-args close() behaviour in this window", async () => {
     vi.useFakeTimers();
     const sockets: FakeSocket[] = [];
     const disconnects: DisconnectPayload[] = [];
@@ -4082,7 +4110,7 @@ describe("MixerClient close({ code, message })", () => {
     await tick();
     // hello sent, no welcome yet -- MixerConn exists as dialingConn, not yet promoted to conn.
 
-    await client.close({ code: ErrorCode.APPLICATION_CLOSE, message: "APP-BYE" });
+    await client.close({ message: "APP-BYE" });
     await tick();
 
     const errorFrames = sockets[0]!.sent
@@ -4096,7 +4124,7 @@ describe("MixerClient close({ code, message })", () => {
         }
       })
       .filter((m): m is { t: string; code?: number; message?: string } => !!m && m.t === "error");
-    // The app's code/message, not the hard-coded NO_ERROR/"client closing"
+    // The app's message, not the hard-coded NO_ERROR/"client closing"
     // dialingConn.fail() used before this fix.
     expect(errorFrames).toHaveLength(1);
     expect(errorFrames[0]!.code).toBe(ErrorCode.APPLICATION_CLOSE);
@@ -4107,8 +4135,8 @@ describe("MixerClient close({ code, message })", () => {
     // own 'close' handler both treat it as "already handled elsewhere" and
     // stay silent once `this.closing` is set) -- this is pre-existing
     // behaviour, identical to the no-args close() mid-handshake case (see
-    // the sibling "close() during an in-flight dial" test above); opts.code
-    // does not change it, only which code/message actually reach the wire.
+    // the sibling "close() during an in-flight dial" test above); opts.message
+    // does not change it, only what actually reaches the wire.
     expect(disconnects).toHaveLength(0);
 
     expect(client.currentState()).toBe("closed");
@@ -4116,7 +4144,7 @@ describe("MixerClient close({ code, message })", () => {
     expect(sockets.length).toBe(1); // never reconnected
   });
 
-  it("close({code,message}) mid-backoff: stops reconnecting and clears every timer, but -- like plain close() in the same window -- reports nothing (no connection was ever established for this cycle)", async () => {
+  it("close({message}) mid-backoff: stops reconnecting and clears every timer, but -- like plain close() in the same window -- reports nothing (no connection was ever established for this cycle)", async () => {
     vi.useFakeTimers();
     const sockets: FakeSocket[] = [];
     const disconnects: DisconnectPayload[] = [];
@@ -4140,17 +4168,95 @@ describe("MixerClient close({ code, message })", () => {
     // The 1006 above already produced its own one non-fatal report.
     expect(disconnects).toHaveLength(1);
 
-    await client.close({ code: ErrorCode.APPLICATION_CLOSE, message: "operator shutdown" });
+    await client.close({ message: "operator shutdown" });
     expect(client.currentState()).toBe("closed");
     expect(vi.getTimerCount()).toBe(0);
-    // No live connection existed to send error{}/close 4000+code over --
-    // close({code}) mid-backoff degrades to the same "closes, stays closed,
+    // No live connection existed to send error{}/close 4014 over --
+    // close({message}) mid-backoff degrades to the same "closes, stays closed,
     // reports nothing" shape as plain close() in this window (there is no
     // second report for the backoff itself ending).
     expect(disconnects).toHaveLength(1);
 
     await vi.advanceTimersByTimeAsync(120000);
     expect(sockets.length).toBe(1); // never reconnected
+  });
+
+  it("close({message: \"\"}) still takes the application-close path -- error{code:14,message:\"\"} + WS close 4014, not the graceful default", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    const disconnects: DisconnectPayload[] = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: "t",
+      _wsFactory: makeFactory(sockets),
+      onDisconnect: (r) => disconnects.push(r),
+    });
+
+    const started = client.start();
+    started.catch(() => {});
+    const s0 = await connectSocket(sockets, 0);
+    await started;
+
+    await client.close({ message: "" });
+
+    const errorFrames = s0.sent
+      .map((frame) => {
+        try {
+          const decoded = decodeFrame(frame);
+          if (decoded.streamId !== 0 || decoded.type !== FrameType.DATA) return null;
+          return JSON.parse(Buffer.from(decoded.payload).toString("utf8")) as { t: string; code?: number; message?: string };
+        } catch {
+          return null;
+        }
+      })
+      .filter((m): m is { t: string; code?: number; message?: string } => !!m && m.t === "error");
+    expect(errorFrames).toHaveLength(1);
+    expect(errorFrames[0]!.code).toBe(ErrorCode.APPLICATION_CLOSE);
+    expect(errorFrames[0]!.message).toBe("");
+
+    expect(s0.closedWith?.code).toBe(4000 + ErrorCode.APPLICATION_CLOSE);
+
+    expect(disconnects).toHaveLength(1);
+    expect(disconnects[0]!.fatal).toBe(false);
+    expect(disconnects[0]!.wsCode).toBe(4000 + ErrorCode.APPLICATION_CLOSE);
+    expect(disconnects[0]!.errorCode).toBe(ErrorCode.APPLICATION_CLOSE);
+    expect(disconnects[0]!.errorName).toBe("APPLICATION_CLOSE");
+  });
+
+  it("close({}) -- no message key at all -- takes the graceful drain-then-close path, WS close 1000, no error frame", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    const disconnects: DisconnectPayload[] = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: "t",
+      _wsFactory: makeFactory(sockets),
+      onDisconnect: (r) => disconnects.push(r),
+    });
+
+    const started = client.start();
+    started.catch(() => {});
+    const s0 = await connectSocket(sockets, 0);
+    await started;
+
+    await client.close({});
+    await tick();
+
+    const errorFrames = s0.sent
+      .map((frame) => {
+        try {
+          const decoded = decodeFrame(frame);
+          if (decoded.streamId !== 0 || decoded.type !== FrameType.DATA) return null;
+          return JSON.parse(Buffer.from(decoded.payload).toString("utf8")) as { t: string; code?: number; message?: string };
+        } catch {
+          return null;
+        }
+      })
+      .filter((m): m is { t: string; code?: number; message?: string } => !!m && m.t === "error");
+    // No APPLICATION_CLOSE error frame -- the graceful path's own error{NO_ERROR}
+    // (drain-then-close) is expected and unrelated to this fix.
+    expect(errorFrames.some((f) => f.code === ErrorCode.APPLICATION_CLOSE)).toBe(false);
+
+    // Unchanged from before opts.message existed: NO_ERROR, WS close 1000.
+    expect(s0.closedWith?.code).toBe(1000);
   });
 });
 
