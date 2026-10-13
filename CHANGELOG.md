@@ -2,6 +2,133 @@
 
 All notable changes to `@mcpwarp/ws-mixer` (the JS/TypeScript client SDK) are documented here.
 
+## 0.8.0 - 2026-10-12
+
+### Breaking
+
+- ESM only (no CJS build). Sub-path entries: `.`, `./mcpwarp`, `./node`, `./testing`. On Node,
+  `require()` of the package needs Node >= 22.12.
+- Node >= 22 (`engines`); the package now runs on any runtime with a WHATWG `WebSocket` (Deno, Bun,
+  browsers with a `webSocket` factory).
+- The `ws` dependency is gone; the package has no runtime dependencies. The WebSocket is the runtime's
+  global one, or whatever the new `webSocket` factory option returns. `_wsFactory` is removed.
+  `NOTICE` says so and is now included in the package.
+- `package.json` no longer declares `"sideEffects": false`: code splitting emits bare chunk imports,
+  which esbuild would warn about (`ignored-bare-import`). Bundlers lose the whole-module pruning hint;
+  export-level tree shaking still works.
+- `MixerStream` is no longer a Node `Duplex`: it has `read()` (async iteration), `write()` (returns a
+  promise), `closeWrite()`, `reset()`, `close()`, `refuse()` and a `closed` promise
+  (`finished`/`reset`/`connection_lost`). Streams emit no events (`'data'`, `'end'`, `'reset'`,
+  `'error'`, `'close'` are gone; use `read()`/`closed`). `toWeb()` is replaced by `toWebStreams()`;
+  a Node `Duplex` is available via `toDuplex()` from `@mcpwarp/ws-mixer/node`.
+- `closeWrite()` now waits for queued writes to flush before sending CLOSE (it no longer fails a
+  write waiting on send credit) and returns a promise.
+- `MixerConn` takes a `WebSocketLike`; `WSLike` and the `DialSocket`/`DialRequest`/`DialResponse`/
+  `WSFactory`/`WSFactoryOptions` types are removed. `sendApp()` and stream writes resolve once the
+  frame is handed to the socket (the socket's `bufferedAmount` gates the writer above 1 MiB).
+- With the default backend, an HTTP upgrade rejection is reported without `httpStatus` and retried
+  as an ordinary dial failure: 401/403/404 are no longer fatal unless the factory reports the status
+  via `WebSocketLike.upgradeFailure`. A `4011` after `hello` is still fatal.
+- `MixerClient`/`MixerConn` are no longer `node:events` `EventEmitter`s; they keep the same method
+  names (`on`/`once`/`off`/`emit`/`listenerCount`/...) and work with `events.once()`. Emitting
+  `'error'` with no listener no longer throws.
+- A subprotocol-echo failure now closes with `4010` instead of `1002`.
+- `MixerStream.close()` with the peer still sending sends only `RESET(CANCEL)` (0.7.0 sent CLOSE, then RESET).
+- `User-Agent` is now `ws-mixer-js/<version> (<runtime> <os>)`, and `hello.agent` gains `runtime`/`os`.
+- TypeScript consumers on `module: node16`/`nodenext` from a CommonJS package get a type error on
+  `require()` of this ESM-only package, even on Node >= 22.12.
+
+### Fixed
+
+- `MixerClient.close()` / `MixerConn.close()` now write `drain{client_requested}` (also with no
+  stream open; it was never sent) and any queued CLOSE before the teardown.
+
+- Drain hand-over: in-flight streams on the drained connection now finish normally after the
+  replacement welcomes (WIRE.md section 2.9), instead of being cancelled with `StreamError(CANCEL,
+  "connection drained")` right then. The drained connection closes itself once empty, or at the
+  drain deadline + 1 s (then cancelling what is left). Its end is now reported once, non-fatal, and
+  never schedules a reconnect.
+
+### Added
+
+- `@mcpwarp/ws-mixer/mcpwarp`: `expose({ token, name, integration, handler | target })` publishes a
+  local MCP server at its public mcpwarp URL. `integration` (your integration's registration UUID,
+  for usage attribution) is required and must be an RFC 4122 text-form UUID, the set zod's
+  `z.uuid()` accepts (version 1-8, variant 8/9/a/b, or the nil/max UUID, any case): anything else
+  throws a `TypeError`, since the tunnel would drop it silently. It is sent lowercased. `expose()`
+  rejects, and the handle's `close` event carries, only `McpwarpError` for fatal failures (or an
+  `AbortError` from `signal`): a rejected token (close `4011`) is `code: "UNAUTHORIZED"`, any other
+  fatal transport failure `DISCONNECTED_FATAL`, with the transport's error or disconnect payload as
+  `cause`.
+  `handle.registration` (`{ url, serverId, created }`, the latest successful register) makes the
+  first `registered`, which fires before `expose()` resolves, readable. `maxRequestBodyBytes`
+  (default 4 MiB, `413` above it) applies to every adapter. Registration on every welcome, disable/enable,
+  transient-error retries, unregister on close, identity in `hello.meta` (`client`, `version`, `os`,
+  `integration`) and the `X-Mcpwarp-Integration` upgrade header (no `X-Mcpwarp-Client` header: the
+  tunnel does not read it), one HTTP/1.1 request per stream with streamed (SSE-capable)
+  responses. `signal` aborts a pending `expose()` (AbortError) or closes the handle; `onRetry` reports
+  every scheduled retry. When `reconnect.maxAttempts` runs out, `expose()` rejects with
+  `McpwarpError("DISCONNECTED_FATAL")` before the first registration, and after it the handle emits
+  `close { error }` and goes `closed`. A response body that fails mid-stream RESETs its stream and is
+  reported on `error`; a throwing handle listener is reported on `error` instead of reaching the
+  transport, and does not keep later listeners for the same event from running. `targetTimeoutMs`
+  (default 30000) sets the `target` adapter's `504` deadline. Only `/mcp` is forwarded, in every
+  adapter: the public URL is `handle.url` and nothing else is reachable. Any other path (exact,
+  case-sensitive match, query ignored) is answered `404 {"error":"not_found"}` by the SDK before the
+  app sees it, ahead of the disabled/closing `503`; `handle.path` is `"/mcp"`, for logging. Also the envelope codec
+  (`encodeRegister`, `decodeEnvelope`, ...) and `McpwarpError`.
+- mcpwarp tunnel 0.5.0 alignment (docs/MCPWARP.md section 9):
+  - The `conflict` op (`{"mcpwarp":{"v":1,"op":"conflict","id","name","reason":"taken_over"}}`),
+    sent by the tunnel to the old holder when another connection of the same account registers the
+    same name, is decoded (`InboundEnvelope` gains `op: "conflict"`). The handle emits `conflict`
+    (`ExposeConflict`: `{ serverId, name, reason }`) and moves to the new, sticky `ExposeState`
+    `"conflict"`: it never registers again (not on reconnect, drain or `enable`), any stream that
+    still arrives is RESET with `CANCEL`, and `close()` skips the unregister. Restarting the loser is
+    left to a human or the app. `FakeEdge.conflict(name)` simulates the take-over. A `conflict`
+    that overtakes the first `registered` makes `expose()` reject with a fatal `McpwarpError` code
+    `TAKEN_OVER` and close the client; `FakeEdge.withholdRegistered(name)` drops the `registered`
+    reply to test it.
+  - ws-mixer spec v0.5.0 (`spec.pin`): the `Authorization` upgrade header is optional and
+    `hello.token` authoritative, so header-less runtimes (browsers, Electron renderers, Zotero)
+    connect through `webSocketFactory(ctor, { headers: false })`. The SDK still sends the header
+    wherever the runtime can.
+  - `goserver.pin` v0.7.0 -> v0.8.0: interop and the go->js pair conformance run against ws-mixer-go
+    v0.8.0, which adopts spec v0.5.0.
+  - The tunnel's pre-upgrade `429`/`503` (with `Retry-After`) are retried as recoverable dial failures
+    with the SDK's own backoff and reported through `onRetry`; a standard WebSocket cannot read
+    `Retry-After`.
+- `@mcpwarp/ws-mixer/node`: `expose({ server })` for an `http.Server` or `(req, res)` listener
+  (Express, MCP SDK v1's `StreamableHTTPServerTransport`), and `toDuplex()`. `maxRequestBodyBytes`
+  caps chunked request bodies too (`413`, or a RESET once the app has started its response).
+  `server` needs Node's `http` internals (each stream reaches a private server through
+  `emit("connection", socket)`, which Bun's `node:http` ignores), so it does not work on Bun:
+  `expose({ server })` throws an `Error` there; use `target` or `handler`, which work on Bun.
+  `./node` re-exports all of `./mcpwarp` (except its `expose`, which it replaces) plus
+  `ErrorCode`, `WsMixerError`, `TokenUnavailableError` and the `ErrorCodeValue`/`WebSocketFactory`/
+  `TokenProvider`/`ReconnectOptions`/`DisconnectPayload` types, so a Node integration needs one import path.
+- docs/MCPWARP.md and README: the edge strips the caller's `Authorization` header (an app's own
+  bearer auth cannot be enforced behind the tunnel), and how the SDK's body cap interacts with the
+  app's own limits.
+- `@mcpwarp/ws-mixer/testing`: `FakeEdge`, an in-process fake of the mcpwarp edge for integration tests.
+- `webSocketFactory()` (overloaded: `(ctor, { headers: false })` takes any standard constructor, such
+  as the DOM `WebSocket`; `(ctor)` takes one accepting `{protocols, headers}`), `defaultWebSocketFactory`,
+  `WebSocketLike`, `WebSocketConstructorLike`, `WebSocketConstructorWithInit`; `toWebStreams()`;
+  `stream.refuse()`; runtime detection in `hello.agent` and the `User-Agent` (`node/`, `deno/`,
+  `bun/`, `electron/`, `browser`). An Electron renderer is not treated as Node: its WebSocket gets
+  protocols only. The `ws` package's class or a subclass (as the global or passed to
+  `webSocketFactory`; recognised by `ws`'s statics on a non-native constructor, so Bun's native
+  `WebSocket` still gets `{protocols, headers}`) is called as `(url, protocols, { headers })`.
+- docs/MCPWARP.md: the mcpwarp control plane as implemented.
+- Works with a `WebSocket` from another JS realm (a Zotero plugin's `Cu.Sandbox` using the main
+  window's `WebSocket`, an iframe, `node:vm`): message data and errors from it are not checked with
+  `instanceof`, so a foreign `ArrayBuffer` is read as binary and a foreign `Error` keeps its plain
+  `message` and is kept as `cause`.
+- `expose({ agent: { runtime?, os? } })` overrides the detected runtime/OS in `hello.agent`,
+  `hello.meta.os` and the `User-Agent`, for sandboxes where detection says `unknown` (Zotero:
+  `agent: { runtime: "zotero", os: Services.appinfo.OS }`); each field must be 1-64 printable ASCII
+  characters (`TypeError` otherwise). `MixerClient`'s `agent.runtime`/`agent.os`
+  now also reach the `User-Agent`, not only `hello.agent`.
+
 ## 0.7.0 - 2026-09-26
 
 - A write issued in the same tick as the app's own `destroy()`/`reset()` (or `closeWrite()`) no

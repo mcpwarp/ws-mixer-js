@@ -3,8 +3,4 @@ Copyright 2026 Anatoly Tarnavsky
 
 This product is licensed under the Apache License, Version 2.0 (see LICENSE).
 
-This package's runtime depends on:
-
-  - ws (MIT License) — https://github.com/websockets/ws
-
-The MIT License is compatible with Apache-2.0 (used by this repo).
+This package has no runtime dependencies and bundles no third-party code.

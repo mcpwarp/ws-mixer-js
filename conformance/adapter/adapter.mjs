@@ -75,7 +75,7 @@ const state = {
   streamHalfClosed: new Map(),
   // streamQueues serializes write/close_write per stream id (mirrors
   // conformance/adapters/go/main.go's streamWorkers): `write` acks
-  // asynchronously (stream.write()'s callback) while `close_write` used to
+  // asynchronously (stream.write()'s promise) while `close_write` used to
   // run synchronously as soon as their command line was read, so a
   // close_write issued before an in-flight write's callback fired could
   // race ahead of it on the wire, truncating the stream. Each stream id
@@ -92,10 +92,9 @@ const state = {
   // unblocks writers) deliberately does NOT go through this queue --
   // resetStream below marks it aborted and drains any operations still
   // sitting in `items` with an error ack, then calls stream.reset()
-  // directly. stream.reset() itself destroys the MixerStream, which
-  // unblocks a write already in flight on the queue by having Node's
-  // Writable machinery invoke its pending write() callback with the
-  // terminal error, rather than adapter.mjs waiting behind it.
+  // directly. stream.reset() fails a write already in flight on the queue
+  // (its promise rejects with the RESET's StreamError), rather than
+  // adapter.mjs waiting behind it.
   streamQueues: new Map(),
 };
 
@@ -201,10 +200,10 @@ function drainAbortedOps(q) {
 // write/close_write FIFO (see the streamQueues field comment and
 // WIRE.md section 2.5): it marks the queue aborted and drains anything
 // still sitting in it with an error ack, then calls stream.reset(), which
-// discards buffered data, unblocks the peer, and (by destroying the
-// MixerStream) unblocks a write that is already running on the queue and
-// blocked on exhausted send credit -- that write's own pending callback
-// still settles it, so its own error ack is reported from there, not here.
+// discards buffered data, unblocks the peer, and fails a write that is
+// already running on the queue and blocked on exhausted send credit --
+// that write's own promise still settles it, so its own error ack is
+// reported from there, not here.
 function resetStream(id, stream, code, message, seq) {
   const q = state.streamQueues.get(id);
   if (q) {
@@ -213,6 +212,7 @@ function resetStream(id, stream, code, message, seq) {
   }
   teardownStream(id);
   try {
+    if (typeof stream === "object" && stream !== null) locallyReset.add(stream);
     stream.reset(code, message);
     ack(seq);
   } catch (e) {
@@ -242,47 +242,47 @@ function noteHalfClosed(id, direction) {
 function wireStream(stream) {
   state.streams.set(stream.id, stream);
   emit({ event: "stream_opened", id: stream.id });
-  stream.on("data", (chunk) => {
-    emit({ event: "data", id: stream.id, data_b64: Buffer.from(chunk).toString("base64"), t_ms: tMs() });
-  });
-  stream.on("end", () => {
-    emit({ event: "stream_closed", id: stream.id, direction: "read", t_ms: tMs() });
-    if (noteHalfClosed(stream.id, "read")) {
-      // Both directions closed: the stream is fully terminal (WIRE.md
-      // section 2.5) -- tear down its bookkeeping now.
-      emit({ event: "stream_closed", id: stream.id, direction: "both", t_ms: tMs() });
-      teardownStream(stream.id);
+  // Read loop: every chunk is a `data` event; a clean EOF (the peer's CLOSE,
+  // buffer drained) is the read half-close. A rejected read (RESET, or the
+  // connection lost) ends the loop; RESET is reported via `closed` below and
+  // a lost connection by this adapter's own `disconnected` event.
+  void (async () => {
+    for (;;) {
+      let chunk;
+      try {
+        chunk = await stream.read();
+      } catch {
+        return;
+      }
+      if (chunk === null) {
+        emit({ event: "stream_closed", id: stream.id, direction: "read", t_ms: tMs() });
+        if (noteHalfClosed(stream.id, "read")) {
+          // Both directions closed: the stream is fully terminal (WIRE.md
+          // section 2.5) -- tear down its bookkeeping now.
+          emit({ event: "stream_closed", id: stream.id, direction: "both", t_ms: tMs() });
+          teardownStream(stream.id);
+        }
+        return;
+      }
+      emit({ event: "data", id: stream.id, data_b64: Buffer.from(chunk).toString("base64"), t_ms: tMs() });
     }
-  });
-  // stream.ts's own doc comments: a PEER-received RESET (handleReset) emits
-  // 'reset' synchronously *and* (since something is listening for 'error'
-  // here) destroy()s with the error, which Node surfaces as an 'error'
-  // event on a later tick; a LOCALLY autonomous abort (e.g. this side's own
-  // dispatch detecting an illegal DATA-after-CLOSE, stream.ts's reset())
-  // only ever surfaces its code/message through that same destroy(err) path
-  // -- it never emits 'reset' at all (mutation-testing gap: see
-  // spec/fixtures/sequences/data_after_close_toward_client.json). So both
-  // listeners are needed for full coverage; reported carries whichever
-  // fires first so a peer-received RESET (both fire) is reported exactly
-  // once.
-  let reported = false;
-  const reportReset = (code, message) => {
-    if (reported || typeof code !== "number") return;
-    reported = true;
-    emit({ event: "stream_reset", id: stream.id, code, name: codeNameOf(code), message, t_ms: tMs() });
-    teardownStream(stream.id);
-  };
-  stream.on("reset", ({ code, message }) => reportReset(code, message));
-  stream.on("error", (err) => {
-    // Only a StreamError is a stream_reset: rejectOutstanding() (conn.ts)
-    // destroys every live stream with the *connection's* terminal ConnError
-    // the same way, which must not be misreported as a per-stream reset --
-    // that case is already covered by this adapter's own `disconnected`
-    // event.
-    if (err.name !== "StreamError") return;
-    reportReset(err.code, err.message);
+  })();
+  // A RESET in either direction not issued by this adapter's own `reset`
+  // command: a peer RESET, or one the SDK sent on its own (e.g. DATA after
+  // CLOSE, spec/fixtures/sequences/data_after_close_toward_client.json).
+  // `closed` settles a microtask after the RESET, possibly after a
+  // following error{} already ran onDisconnect's teardownAllStreams, so this
+  // must not depend on the stream still being tracked.
+  void stream.closed.then((r) => {
+    if (r.kind !== "reset" || locallyReset.has(stream)) return;
+    emit({ event: "stream_reset", id: stream.id, code: r.code, name: codeNameOf(r.code), message: r.message, t_ms: tMs() });
+    if (state.streams.get(stream.id) === stream) teardownStream(stream.id);
   });
 }
+
+// Streams this adapter's own `reset` command reset: their RESET is the
+// command's own effect, not a `stream_reset` event.
+const locallyReset = new WeakSet();
 
 // codeNameOf mirrors ws-mixer-go/wsmixer's ErrorCode.String() / the runner's own
 // codes.Name -- kept tiny and local rather than importing errors.ts's
@@ -441,17 +441,11 @@ async function handleCommand(cmd) {
       // acks asynchronously, so a close_write for the same id that arrives
       // before this ack must still wait behind this write's bytes actually
       // reaching the wire.
-      enqueueStreamOp(
-        cmd.id,
-        seq,
-        () =>
-          new Promise((resolve) => {
-            stream.write(buf, (err) => {
-              if (err) cmdErr(seq, "write: " + err.message);
-              else ack(seq);
-              resolve();
-            });
-          }),
+      enqueueStreamOp(cmd.id, seq, () =>
+        stream.write(buf).then(
+          () => ack(seq),
+          (err) => cmdErr(seq, "write: " + err.message),
+        ),
       );
       return;
     }
@@ -459,8 +453,8 @@ async function handleCommand(cmd) {
     case "close_write": {
       const stream = state.streams.get(cmd.id);
       if (!stream) return cmdErr(seq, `close_write: no such stream ${cmd.id}`);
-      enqueueStreamOp(cmd.id, seq, () => {
-        stream.closeWrite();
+      enqueueStreamOp(cmd.id, seq, async () => {
+        await stream.closeWrite();
         ack(seq);
         emit({ event: "stream_closed", id: cmd.id, direction: "write", t_ms: tMs() });
         if (noteHalfClosed(cmd.id, "write")) {

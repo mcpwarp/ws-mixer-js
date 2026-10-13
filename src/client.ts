@@ -13,20 +13,21 @@
  * back to `dialing` on success; every terminal transition happens exactly
  * once, in `terminal()`/`goFatal()`/`giveUp()`.
  */
-import { EventEmitter } from "node:events";
-import { WebSocket } from "ws";
 import type { AgentInfo, DrainMsg, WelcomeMsg } from "./control.js";
-import { ErrorCode, StreamError, TokenUnavailableError, WsMixerError, closeCode, codeName } from "./errors.js";
-import { MixerConn, type WSLike } from "./conn.js";
-import { MAX_MESSAGE_SIZE } from "./frame.js";
+import { Emitter } from "./emitter.js";
+import { ErrorCode, TokenUnavailableError, WsMixerError, closeCode, codeName } from "./errors.js";
+import { MixerConn } from "./conn.js";
+import { detectRuntime } from "./runtime.js";
+import { SUBPROTOCOL, dialError, dialWebSocket, type DialError, type WebSocketFactory, type WebSocketLike } from "./socket.js";
 import type { MixerStream } from "./stream.js";
+import { errorMessage } from "./util.js";
 
-export const SUBPROTOCOL = "ws-mixer.v1";
+export { SUBPROTOCOL };
 // Kept in sync with package.json's "version" by hand (test/version.test.ts
 // asserts the two match, so a release bump that forgets this one fails CI
 // instead of silently going stale on the wire in hello.agent.sdk_version /
 // the User-Agent header).
-export const SDK_VERSION = "0.7.0";
+export const SDK_VERSION = "0.8.0";
 
 export type ClientState = "idle" | "dialing" | "connected" | "backoff" | "closed";
 
@@ -61,45 +62,6 @@ export interface ReconnectOptions {
   stableAfter?: number;
 }
 
-/** Structural subset of `ws`'s WebSocket needed during the dial (before a MixerConn exists). Lets tests inject a fake transport via `_wsFactory`. */
-/**
- * Structural subset of Node's `http.ClientRequest`, as seen on `ws`'s
- * `unexpected-response` event. `ws` only calls its own `abortHandshake`
- * cleanup when nothing is listening for `unexpected-response` -- since this
- * SDK does listen (to read `statusCode`/`Retry-After`), it owns draining and
- * destroying `req`/`res` itself, or the request/socket leaks.
- */
-export interface DialRequest {
-  destroy?(err?: Error): void;
-}
-
-/** Structural subset of Node's `http.IncomingMessage`, as seen on `ws`'s `unexpected-response` event. */
-export interface DialResponse {
-  statusCode?: number;
-  headers: Record<string, string | string[] | undefined>;
-  resume?(): void;
-  destroy?(err?: Error): void;
-}
-
-export interface DialSocket extends WSLike {
-  readonly protocol: string;
-  once(event: "open", listener: () => void): this;
-  once(
-    event: "unexpected-response",
-    listener: (req: DialRequest, res: DialResponse) => void,
-  ): this;
-  once(event: "error", listener: (err: Error) => void): this;
-}
-
-export interface WSFactoryOptions {
-  perMessageDeflate: boolean;
-  maxPayload: number;
-  headers: Record<string, string>;
-}
-
-/** Test-only dial hook: replaces `new WebSocket(url, [SUBPROTOCOL], options)`. */
-export type WSFactory = (url: string, protocols: string[], options: WSFactoryOptions) => DialSocket;
-
 /**
  * A ws-mixer token: either a static string or a callback returning a fresh
  * token (sync or `Promise`). Per CLIENT-SDK.md's "Token provider" and "Provider failure" rows, the callback MUST
@@ -118,8 +80,10 @@ export type DisconnectPhase = "dial" | "handshake" | "connected";
 /**
  * The shape every disconnect (recoverable or fatal) is reported with, per
  * CLIENT-SDK.md's "Disconnect reason shape" row. `httpStatus` is set only for a dial failure whose
- * response was an HTTP status (401/403/404/429); `cause` is set only when a
- * token provider threw/rejected.
+ * response was an HTTP status (401/403/404/429) -- and only when the
+ * `webSocket` factory exposes it (`WebSocketLike.upgradeFailure`); a
+ * standard WebSocket never does, so the default backend never sets it.
+ * `cause` is set only when a token provider (or the factory) threw.
  */
 export interface DisconnectReason {
   phase: DisconnectPhase;
@@ -233,13 +197,16 @@ export interface ConnectOptions {
   /**
    * Delivered, along with `onApp`/`onDrain`, in wire order from one delivery
    * loop per connection, one at a time -- never concurrently with each other
-   * or with themselves (CLIENT-SDK.md's "Handler delivery" row). An event
+   * or with themselves (CLIENT-SDK.md's "Handler delivery" row). A returned
+   * promise is awaited before the next event is delivered: return quickly
+   * and serve the stream in the background (`void serve(stream)`); a handler
+   * that awaits the whole exchange blocks every other stream. An event
    * already received when the connection ends is still owed to this
    * callback: it MAY therefore still fire shortly after `close()`/
    * `close({message})`'s own promise has resolved, for a stream/message/drain
    * that arrived before whatever ended the connection.
    */
-  onStream?: (stream: MixerStream) => void;
+  onStream?: (stream: MixerStream) => void | Promise<void>;
   /** See `onStream`'s doc comment: same wire-order/post-close-flush guarantees. */
   onApp?: (body: Record<string, unknown>) => void;
   /** See `onStream`'s doc comment: same wire-order/post-close-flush guarantees. */
@@ -258,8 +225,13 @@ export interface ConnectOptions {
 
   reconnect?: ReconnectOptions;
 
-  /** Test-only: injects a fake WebSocket-like transport for the dial. Never used in production. */
-  _wsFactory?: WSFactory;
+  /**
+   * Creates the WebSocket for each dial. Defaults to `defaultWebSocketFactory`
+   * (the runtime's global `WebSocket`, with headers where supported); pass
+   * `webSocketFactory(win.WebSocket, { headers: false })` in runtimes
+   * without a global WebSocket.
+   */
+  webSocket?: WebSocketFactory;
 
   /**
    * @internal Test-only: forwarded verbatim to `MixerConn`'s `ConnOptions._timing`
@@ -376,7 +348,7 @@ export declare interface MixerClient {
  * from "the tunnel died" (its stream is destroyed with an error) itself;
  * this SDK does not paper over the difference.
  */
-export class MixerClient extends EventEmitter {
+export class MixerClient extends Emitter {
   private readonly url: string;
   private readonly opts: ConnectOptions;
   private readonly reconnectOpts: Required<ReconnectOptions>;
@@ -389,10 +361,20 @@ export class MixerClient extends EventEmitter {
   /**
    * Set only while a `drain`-triggered parallel reconnect is in flight: the
    * connection that sent `drain`, still alive and finishing in-flight
-   * streams. Torn down (fail()) as soon as its replacement's `welcome`
-   * lands, so a superseded connection never lingers past that point.
+   * streams. Moves to `supersededConns` once its replacement's `welcome`
+   * lands.
    */
   private retiringConn: MixerConn | null = null;
+  /**
+   * Drained connections whose replacement has already welcomed, still
+   * finishing their in-flight streams (WIRE.md section 2.9: "in-flight
+   * streams finish normally"); each closes itself once empty or at its
+   * drain deadline (MixerConn.retire), and its end is reported once,
+   * non-fatal, without scheduling a reconnect.
+   */
+  private readonly supersededConns = new Set<MixerConn>();
+  /** `drain.deadline_ms` per draining connection, for retire()'s client-side deadline. */
+  private readonly drainDeadlines = new WeakMap<MixerConn, number | undefined>();
 
   private attempt = 0;
   private everConnected = false;
@@ -465,7 +447,7 @@ export class MixerClient extends EventEmitter {
     // the pre-`stableAfter` (pre-0.4) behaviour.
     if (!Number.isFinite(this.reconnectOpts.stableAfter) || this.reconnectOpts.stableAfter < 0) {
       throw new RangeError(
-        `ws-mixer: reconnect.stableAfter must be a finite number >= 0; got ${this.reconnectOpts.stableAfter}`,
+        `ws-mixer: reconnect.stableAfter must be a finite number >= 0; got ${typeof this.reconnectOpts.stableAfter === "number" ? this.reconnectOpts.stableAfter : typeof this.reconnectOpts.stableAfter}`,
       );
     }
   }
@@ -563,6 +545,7 @@ export class MixerClient extends EventEmitter {
     // regardless of opts).
     const closeErr =
       opts?.message !== undefined ? new WsMixerError(ErrorCode.APPLICATION_CLOSE, opts.message) : new WsMixerError(ErrorCode.NO_ERROR, "client closing");
+    this.failSuperseded(closeErr);
     if (this.retiringConn) {
       const old = this.retiringConn;
       this.retiringConn = null;
@@ -604,6 +587,13 @@ export class MixerClient extends EventEmitter {
     }
   }
 
+  /** Ends every superseded (drained, replaced) connection now; cleared first, so their own 'close' reports nothing. */
+  private failSuperseded(err: WsMixerError): void {
+    const conns = [...this.supersededConns];
+    this.supersededConns.clear();
+    for (const c of conns) c.fail(err);
+  }
+
   /** Cancels the pending stability timer, if any (see the field's own doc comment). Idempotent. */
   private clearStabilityTimer(): void {
     if (this.stabilityTimer) {
@@ -615,10 +605,10 @@ export class MixerClient extends EventEmitter {
   /**
    * Arms the one-shot stability timer for `conn`, replacing (and so
    * implicitly clearing) whatever timer was pending before -- there is only
-   * ever one conn worth timing at once: a drain-superseded predecessor is
-   * torn down as soon as the replacement's own `welcome` lands (connectOnce),
-   * which is exactly the moment this is called for the replacement, so the
-   * predecessor's own now-irrelevant timer never outlives this call.
+   * ever one conn worth timing at once: a drain-superseded predecessor stops
+   * being the active conn the moment the replacement's own `welcome` lands
+   * (connectOnce), which is exactly when this is called for the
+   * replacement, so the predecessor's timer never outlives this call.
    */
   private armStabilityTimer(conn: MixerConn): void {
     this.clearStabilityTimer();
@@ -633,7 +623,7 @@ export class MixerClient extends EventEmitter {
         this.unauthorizedRetryUsed = false;
       }
     }, this.reconnectOpts.stableAfter);
-    timer.unref?.();
+    (timer as { unref?: () => void }).unref?.();
     this.stabilityTimer = timer;
   }
 
@@ -729,32 +719,23 @@ export class MixerClient extends EventEmitter {
       this.conn = conn;
       this.state = "connected";
 
-      // A `drain`-triggered parallel reconnect just succeeded: the old
-      // connection is no longer needed, so tear it down now instead of
-      // waiting on the server's own deadline.
+      // A `drain`-triggered parallel reconnect just succeeded: new streams
+      // now go to `conn`, while the old connection keeps finishing its
+      // in-flight streams (WIRE.md section 2.9) until it is empty or its
+      // drain deadline passes (MixerConn.retire).
       if (this.retiringConn && this.retiringConn !== conn) {
         const old = this.retiringConn;
         this.retiringConn = null;
         // Blocker 3: this drain cycle's parallel reconnect has now landed,
-        // so its "suppress one extra reconnect" job is done. Clearing it
-        // here -- not in old's close handler below -- matters because
-        // `old.fail()` fires that handler synchronously, and by then
-        // `this.retiringConn` is already null (just cleared above), so the
-        // handler can no longer tell "this was the retiring conn" from
-        // `this.retiringConn === conn`. Left uncleared, the flag would still
-        // be true the next time the (now active) replacement disconnects for
-        // an unrelated reason, silently swallowing that reconnect too.
+        // so its "suppress one extra reconnect" job is done. Cleared here --
+        // not in old's close handler -- so the flag can't outlive this cycle
+        // and silently swallow the replacement's own later reconnect.
         this.drainReconnectScheduled = false;
-        // In-flight streams on the superseded conn are still live -- they
-        // didn't fail, the *connection* they were riding on was replaced.
-        // Give each one a stream-scoped CANCEL ("connection drained"), not
-        // the connection-level NO_ERROR used to tear the socket itself down,
-        // so an app distinguishes "this stream was cancelled" from "the
-        // whole conn errored" (see MixerStream.terminateNoThrow).
-        old.fail(
-          new WsMixerError(ErrorCode.NO_ERROR, "superseded by a new connection"),
-          (streamId) => new StreamError(ErrorCode.CANCEL, streamId, "connection drained"),
-        );
+        this.supersededConns.add(old);
+        const deadlineMs = this.drainDeadlines.get(old);
+        // One second of slack past the server's own deadline, so the
+        // server's RESET(CANCEL) + close 4012 normally arrives first.
+        old.retire(deadlineMs !== undefined ? deadlineMs + 1000 : 30_000);
       }
 
       this.opts.onConnect?.(welcome);
@@ -831,9 +812,23 @@ export class MixerClient extends EventEmitter {
       };
     }
 
-    let ws: DialSocket;
+    const detected = detectRuntime();
+    const runtime = { runtime: this.opts.agent?.runtime ?? detected.runtime, os: this.opts.agent?.os ?? detected.os };
+    let ws: WebSocketLike;
     try {
-      ws = await dialWebSocket(this.url, token, this.opts, connectTimeoutMs);
+      ws = await dialWebSocket(
+        this.url,
+        {
+          protocols: [SUBPROTOCOL],
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "User-Agent": `ws-mixer-js/${SDK_VERSION} (${runtime.runtime} ${runtime.os})`,
+            ...this.opts.headers,
+          },
+        },
+        this.opts.webSocket,
+        connectTimeoutMs,
+      );
     } catch (e) {
       if (this.closing || this.isClosed()) return { ok: false, cancelled: true };
       const err = e as DialError;
@@ -862,19 +857,19 @@ export class MixerClient extends EventEmitter {
       try {
         ws.close(1000, "client closing");
       } catch {
-        ws.terminate?.();
+        // already closing
       }
       return { ok: false, cancelled: true };
     }
 
-    const conn = new MixerConn(ws as unknown as WSLike, {
+    const conn = new MixerConn(ws, {
       token,
       agent: {
-        sdk: "ws-mixer-js",
-        sdk_version: SDK_VERSION,
-        runtime: `node/${process.version.replace(/^v/, "")}`,
-        os: `${process.platform}/${process.arch}`,
         ...this.opts.agent,
+        sdk: this.opts.agent?.sdk ?? "ws-mixer-js",
+        sdk_version: this.opts.agent?.sdk_version ?? SDK_VERSION,
+        runtime: runtime.runtime,
+        os: runtime.os,
       },
       meta: this.opts.meta,
       window: this.opts.window,
@@ -968,6 +963,7 @@ export class MixerClient extends EventEmitter {
           // Reconnect immediately and in parallel, before the old connection closes (WIRE.md section 2.9).
           this.drainReconnectScheduled = true;
           this.retiringConn = conn;
+          this.drainDeadlines.set(conn, d.deadline_ms);
           void this.connectOnce(Math.random() * 2000, "drain");
         } else {
           // maxAttempts:0 means this SDK will never reconnect (WIRE.md section
@@ -1008,13 +1004,6 @@ export class MixerClient extends EventEmitter {
       // the timer for the new conn) is never the timer's current owner and
       // must NOT clear the replacement's still-ticking one.
       if (wasActive) this.clearStabilityTimer();
-
-      // A conn that never became the active connection either had its
-      // handshake() promise already handled in connectOnce's catch (a normal
-      // dial/handshake failure), or was fail()'d directly by close()/the
-      // retiring-conn teardown above (which already know why) -- either way,
-      // scheduling a second reconnect here would race the one already in flight.
-      if (!wasActive) return;
 
       const fatal = info.wsCode !== undefined && FATAL_WS_CODES.has(info.wsCode);
       const protocolBug = info.wsCode !== undefined && PROTOCOL_BUG_WS_CODES.has(info.wsCode);
@@ -1060,6 +1049,22 @@ export class MixerClient extends EventEmitter {
             closeReason: info.closeReason,
           };
 
+      // A drain-superseded conn ending -- by its own idle close, the
+      // client-side deadline, or the server's 4012 -- is reported exactly
+      // once, non-fatal, and never schedules a reconnect or touches the
+      // stability timer: its replacement is already the active conn.
+      if (this.supersededConns.delete(conn)) {
+        if (!this.closing && this.state !== "closed") this.notifyDisconnect(this.buildPayload(ctx, false));
+        return;
+      }
+
+      // A conn that never became the active connection either had its
+      // handshake() promise already handled in connectOnce's catch (a normal
+      // dial/handshake failure), or was fail()'d directly by close()/
+      // goFatal()/giveUp() (which already know why) -- either way,
+      // scheduling a second reconnect here would race the one already in flight.
+      if (!wasActive) return;
+
       if (fatal) {
         // Exactly one report for this close: it's fatal, so there's no
         // separate "exhaustion" report to merge it with.
@@ -1088,6 +1093,8 @@ export class MixerClient extends EventEmitter {
           this.dialingConn = null;
           dialing.fail(new WsMixerError(ErrorCode.NO_ERROR, "client closing"));
         }
+        // Drain-superseded conns still finishing streams end with the client.
+        this.failSuperseded(new WsMixerError(ErrorCode.NO_ERROR, "client closing"));
         this.emit("fatal", err);
         this.rejectStartIfNeverConnected(err);
         return;
@@ -1097,9 +1104,8 @@ export class MixerClient extends EventEmitter {
         // Already reported this disconnect fatally -- the wsCode branch
         // above on this very call. This conn's close finally catching up is
         // not a second disconnect. (A *superseded* conn's close never
-        // reaches this far at all: it's caught by the `!wasActive` return
-        // above, since `this.conn` was already reassigned to its replacement
-        // before old.fail() ran.)
+        // reaches this far at all: it's caught by the `supersededConns`
+        // check above.)
         return;
       }
       if (this.closing || this.state === "closed") {
@@ -1225,6 +1231,7 @@ export class MixerClient extends EventEmitter {
     this.conn = null;
     const err = new WsMixerError(ctx.errorCode ?? ErrorCode.INTERNAL_ERROR, ctx.message, { fatal: true });
     if (conn) conn.fail(err);
+    this.failSuperseded(err);
     this.emit("fatal", err);
     this.notifyDisconnect(this.buildPayload(ctx, true));
     this.rejectStartIfNeverConnected(err);
@@ -1266,6 +1273,7 @@ export class MixerClient extends EventEmitter {
     if (conn) conn.fail(err);
     if (dialing && dialing !== conn) dialing.fail(err);
     if (retiring && retiring !== conn && retiring !== dialing) retiring.fail(err);
+    this.failSuperseded(err);
     this.notifyDisconnect(this.buildPayload(ctx, true, message));
     this.rejectStartIfNeverConnected(new Error(message));
   }
@@ -1346,42 +1354,6 @@ export function fullJitterDelay(attempt: number, base: number, cap: number): num
   return Math.random() * exp;
 }
 
-interface DialError extends Error {
-  fatal: boolean;
-  /**
-   * Which ws-mixer error code a fatal dial failure maps to (WIRE.md
-   * section 2.9). Only ever set for a missing/mismatched subprotocol echo
-   * (UNSUPPORTED) -- an SDK-raised, local ws-mixer error, no close frame or
-   * HTTP status involved. `undefined` for everything else: a plain network
-   * failure (no wire error occurred), an HTTP upgrade rejection of any kind
-   * including 401/403/404 (never a ws-mixer wire code -- D-2026-09-20-09),
-   * and a token-provider throw/reject (an application error, not a wire
-   * error) -- none of those get `errorCode`/`errorName` on the disconnect
-   * reason, only `httpStatus`/`cause` as applicable (nit 5).
-   */
-  errorCode?: number;
-  /** Present only for HTTP 429 with a parseable Retry-After header. */
-  retryAfterMs?: number;
-  /** The HTTP status of the upgrade response, when the dial failed at the HTTP layer (401/403/404/429). */
-  httpStatus?: number;
-  /** The token provider's thrown/rejected error, when the dial failed there instead of at the socket. */
-  cause?: unknown;
-}
-
-function dialError(
-  message: string,
-  fatal: boolean,
-  opts?: { retryAfterMs?: number; errorCode?: number; httpStatus?: number; cause?: unknown },
-): DialError {
-  const err = new Error(message) as DialError;
-  err.fatal = fatal;
-  if (opts?.errorCode !== undefined) err.errorCode = opts.errorCode;
-  if (opts?.retryAfterMs !== undefined) err.retryAfterMs = opts.retryAfterMs;
-  if (opts?.httpStatus !== undefined) err.httpStatus = opts.httpStatus;
-  if (opts?.cause !== undefined) err.cause = opts.cause;
-  return err;
-}
-
 /**
  * Wraps a token provider's thrown/rejected error as a dial failure
  * (CLIENT-SDK.md's "Provider failure" row: "the thrown/rejected error is surfaced
@@ -1392,14 +1364,9 @@ function dialError(
  * error (nit 5) -- `cause` is how the caller gets at it.
  */
 function providerDialError(err: unknown): DialError {
-  let message: string;
-  try {
-    message = err instanceof Error ? err.message : String(err);
-  } catch {
-    // A throwing `message` getter must not escape as an unhandled rejection
-    // -- fall back to a fixed string so this still yields one fatal report.
-    message = "token provider failed";
-  }
+  // A throwing `message` getter must not escape as an unhandled rejection
+  // -- fall back to a fixed string so this still yields one fatal report.
+  const message = errorMessage(err, "token provider failed");
   return dialError(message, /* overridden by dialAndHandshakeOnce's isTokenUnavailable check */ true, { cause: err });
 }
 
@@ -1429,142 +1396,6 @@ function isTokenUnavailable(err: unknown): boolean {
     }
   }
   return false;
-}
-
-/** Parses a `Retry-After` header: either delta-seconds or an HTTP-date (RFC 9110 section 10.2.3). */
-function parseRetryAfter(value: string | string[] | undefined): number | undefined {
-  const v = Array.isArray(value) ? value[0] : value;
-  if (v === undefined) return undefined;
-  const seconds = Number(v);
-  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
-  const dateMs = Date.parse(v);
-  if (!Number.isNaN(dateMs)) return Math.max(0, dateMs - Date.now());
-  return undefined;
-}
-
-function defaultWsFactory(url: string, protocols: string[], options: WSFactoryOptions): DialSocket {
-  return new WebSocket(url, protocols, options) as unknown as DialSocket;
-}
-
-/**
- * Opens the WebSocket per WIRE.md section 2.1: binary, no compression,
- * `ws-mixer.v1` subprotocol offered and required to be echoed, Bearer auth
- * header. Fatal (never retried by this function itself) on a missing/
- * mismatched subprotocol echo or an HTTP 401/403/404 handshake response --
- * connectOnce's retry loop is what decides whether a 401 gets the one
- * token-provider refresh-retry before treating that fatal verdict as final;
- * HTTP 429 carries `Retry-After` (if present) back to the caller instead of
- * our own jittered delay.
- */
-function dialWebSocket(url: string, token: string, opts: ConnectOptions, connectTimeoutMs: number): Promise<DialSocket> {
-  return new Promise((resolve, reject) => {
-    const factory = opts._wsFactory ?? defaultWsFactory;
-    const ws = factory(url, [SUBPROTOCOL], {
-      perMessageDeflate: false,
-      maxPayload: MAX_MESSAGE_SIZE,
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "User-Agent": `ws-mixer-js/${SDK_VERSION} (node/${process.version.replace(/^v/, "")} ${process.platform}/${process.arch})`,
-        ...opts.headers,
-      },
-    });
-
-    const timer = setTimeout(() => {
-      ws.terminate?.();
-      reject(dialError(`connect timed out after ${connectTimeoutMs}ms`, false));
-    }, connectTimeoutMs);
-
-    let settled = false;
-    ws.once("unexpected-response", (req, res) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      try {
-        // `ws` skips its own abortHandshake cleanup whenever an
-        // 'unexpected-response' listener is attached (ours is, right here) --
-        // it assumes we'll do it ourselves. Drain the response so its
-        // underlying socket can be reused/closed cleanly, then destroy the
-        // request and the `ws` wrapper so nothing lingers (item 2). `req`/
-        // `res` are optional-chained throughout: some transports/mocks omit
-        // one or both, and a defensive cleanup here must never itself throw.
-        res?.resume?.();
-        req?.destroy?.();
-        res?.destroy?.();
-        ws.terminate?.();
-        const status = res?.statusCode;
-        if (status === 429) {
-          reject(
-            dialError(`HTTP 429 (rate limited) during handshake`, false, {
-              retryAfterMs: parseRetryAfter(res?.headers?.["retry-after"]),
-              httpStatus: 429,
-            }),
-          );
-          return;
-        }
-        if (status === 401 || status === 403) {
-          // Auth/authorization failure (WIRE.md section 2.9 groups it
-          // with UNAUTHORIZED, 4011, for retry/fatal purposes only). Fatal by
-          // default -- connectOnce's retry loop is the one place that knows
-          // whether a token provider is present and this connect attempt
-          // hasn't already used its one refresh-retry, and overrides this by
-          // retrying instead of treating it as final (401 only; 403 is fatal
-          // always). No `errorCode`: an HTTP upgrade rejection is never a
-          // ws-mixer wire error, so it's never entitled to one (D-2026-09-20-09)
-          // -- httpStatus alone.
-          reject(
-            dialError(`unexpected HTTP response during handshake: ${status}`, true, {
-              httpStatus: status,
-            }),
-          );
-          return;
-        }
-        if (status === 404) {
-          // Not found is fatal (retrying the same URL can't fix it). Like
-          // every HTTP upgrade rejection -- 401/403 included -- it's never a
-          // ws-mixer wire error (D-2026-09-20-09): no errorCode, only
-          // httpStatus.
-          reject(dialError(`unexpected HTTP response during handshake: ${status}`, true, { httpStatus: status }));
-          return;
-        }
-        // Any other status (5xx, or none at all) looks transient rather than
-        // a hard rejection: retry with normal backoff instead of giving up.
-        // No errorCode -- this never came from a ws-mixer wire error.
-        reject(dialError(`unexpected HTTP response during handshake: ${status}`, false, { httpStatus: status }));
-      } catch (e) {
-        // Never let a throw escape out of `ws`'s emit (item 3): always
-        // settle the dial with something, even when we don't know what the
-        // response actually was.
-        reject(dialError(e instanceof Error ? e.message : String(e), false));
-      }
-    });
-    ws.once("error", (err) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      reject(dialError(err.message, false));
-    });
-    ws.once("open", () => {
-      if (settled) return;
-      if (ws.protocol !== SUBPROTOCOL) {
-        settled = true;
-        clearTimeout(timer);
-        ws.close(1002);
-        // Missing/mismatched subprotocol echo is UNSUPPORTED (4010), not
-        // UNAUTHORIZED (4011) -- WIRE.md section 2.9 lists it alongside
-        // 4010 in the "fatal, never reconnect" row, distinct from the
-        // 401/403/404 auth-failure row above.
-        reject(
-          dialError(`server did not echo the ${SUBPROTOCOL} subprotocol; failing fatally, do not retry`, true, {
-            errorCode: ErrorCode.UNSUPPORTED,
-          }),
-        );
-        return;
-      }
-      settled = true;
-      clearTimeout(timer);
-      resolve(ws);
-    });
-  });
 }
 
 /** Connects to a ws-mixer.v1 server and starts the reconnect-managed client. Resolves once the first `welcome` lands. */

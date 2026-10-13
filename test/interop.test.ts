@@ -233,12 +233,13 @@ describe.skipIf(skip)(skip ? `interop: real Go server (skipped: ${skipReason})` 
         agent: { sdk: "ws-mixer-js-interop-test", sdk_version: "0.0.0" },
         onStream: (stream) => {
           streamsSeen.push(stream);
-          const chunks: Buffer[] = [];
-          stream.on("data", (c: Buffer) => chunks.push(c));
-          stream.on("end", () => {
+          void (async () => {
+            const chunks: Uint8Array[] = [];
+            for await (const c of stream) chunks.push(c);
             const req = Buffer.concat(chunks).toString();
-            stream.end(Buffer.from(`resp:${req}`));
-          });
+            await stream.write(`resp:${req}`);
+            await stream.closeWrite();
+          })();
         },
         onApp: (body) => {
           client.sendApp({ echo: body });

@@ -74,15 +74,17 @@ test("FIFO order: write/write/close_write for one stream run in the order they w
   resetState();
   const order = [];
   const fakeStream = {
-    write(buf, cb) {
-      // Async, like the real stream.write()'s callback -- so a naive
+    write(buf) {
+      // Async, like the real stream.write()'s promise -- so a naive
       // dispatch-without-queuing implementation could let these race.
-      setImmediate(() => {
-        order.push(buf.toString());
-        cb(null);
-      });
+      return new Promise((resolve) =>
+        setImmediate(() => {
+          order.push(buf.toString());
+          resolve();
+        }),
+      );
     },
-    closeWrite() {
+    async closeWrite() {
       order.push("close_write");
     },
     reset() {},
@@ -108,10 +110,10 @@ test("queue_full: an enqueue past STREAM_QUEUE_CAP gets a queue_full error ack i
     release = resolve;
   });
   const fakeStream = {
-    write(buf, cb) {
-      blocked.then(() => cb(null));
+    write() {
+      return blocked;
     },
-    closeWrite() {},
+    async closeWrite() {},
     reset() {},
   };
   state.streams.set(2, fakeStream);
@@ -154,10 +156,10 @@ test("reset drains pending queued ops with error acks and tears down bookkeeping
   });
   const resetCalls = [];
   const fakeStream = {
-    write(buf, cb) {
-      blocked.then(() => cb(null));
+    write() {
+      return blocked;
     },
-    closeWrite() {},
+    async closeWrite() {},
     reset(code, message) {
       resetCalls.push([code, message]);
     },
@@ -189,10 +191,10 @@ test("reset drains pending queued ops with error acks and tears down bookkeeping
 test("resetStream emits an error ack (not a thrown exception) when stream.reset() throws", async () => {
   resetState();
   const fakeStream = {
-    write(buf, cb) {
-      cb(null);
+    write() {
+      return Promise.resolve();
     },
-    closeWrite() {},
+    async closeWrite() {},
     reset() {
       throw new Error("boom");
     },

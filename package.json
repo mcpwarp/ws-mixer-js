@@ -1,12 +1,11 @@
 {
   "name": "@mcpwarp/ws-mixer",
-  "version": "0.7.0",
-  "sideEffects": false,
+  "version": "0.8.0",
   "publishConfig": {
     "registry": "https://registry.npmjs.org/",
     "access": "public"
   },
-  "description": "ws-mixer.v1 client SDK: N byte streams over one WebSocket, JS/TypeScript client.",
+  "description": "ws-mixer.v1 client SDK and mcpwarp helper: N byte streams over one WebSocket, platform-neutral JS/TypeScript.",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
@@ -17,43 +16,56 @@
     "url": "https://github.com/mcpwarp/ws-mixer-js/issues"
   },
   "type": "module",
-  "main": "./dist/index.cjs",
-  "module": "./dist/index.js",
+  "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
-      "import": "./dist/index.js",
-      "require": "./dist/index.cjs"
-    }
+      "default": "./dist/index.js"
+    },
+    "./mcpwarp": {
+      "types": "./dist/mcpwarp/index.d.ts",
+      "default": "./dist/mcpwarp/index.js"
+    },
+    "./node": {
+      "types": "./dist/node/index.d.ts",
+      "default": "./dist/node/index.js"
+    },
+    "./testing": {
+      "types": "./dist/testing/index.d.ts",
+      "default": "./dist/testing/index.js"
+    },
+    "./package.json": "./package.json"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "files": [
     "dist",
     "LICENSE",
+    "NOTICE",
     "CHANGELOG.md"
   ],
   "scripts": {
-    "prepublishOnly": "node scripts/check-registry.mjs && npm run build",
+    "prepublishOnly": "node scripts/check-registry.mjs && npm run build && npm run check:neutral",
     "build": "tsup && npm run build:types",
-    "build:types": "tsc src/index.ts --target ES2022 --module NodeNext --moduleResolution NodeNext --strict --declaration --emitDeclarationOnly --stripInternal --esModuleInterop --skipLibCheck --outDir dist --rootDir src",
-    "typecheck": "tsc --noEmit",
+    "build:types": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.neutral.json",
+    "check:neutral": "node scripts/check-neutral.mjs",
+    "smoke:deno": "deno run scripts/deno-smoke.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
     "fetch-spec": "node scripts/fetch-spec.mjs",
     "fetch-goserver": "node scripts/fetch-goserver.mjs"
   },
-  "dependencies": {
-    "ws": "^8.18.0"
-  },
   "devDependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "@modelcontextprotocol/server": "^2.3.1",
     "@types/node": "^22.10.0",
-    "@types/ws": "^8.5.13",
     "ajv": "^8.20.0",
     "tsup": "^8.3.5",
     "typescript": "^5.7.2",
-    "vitest": "^2.1.8"
+    "vitest": "^2.1.8",
+    "zod": "^4.0.0"
   }
 }

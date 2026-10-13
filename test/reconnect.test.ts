@@ -1,23 +1,16 @@
 /**
  * Reconnect/backoff policy from ws-mixer-spec/docs/research/2026-08-26-control-channel-and-connection-lifecycle.md
  * and WIRE.md section 2.9's reconnect table, exercised end-to-end
- * against `MixerClient` with fake timers and a fake `ws`-shaped transport
- * injected via the test-only `_wsFactory` option -- no real sockets, no
- * real Go server (that's test/interop.test.ts's job).
+ * against `MixerClient` with fake timers and a fake WHATWG-shaped socket
+ * injected via the `webSocket` factory option -- no real sockets, no real
+ * Go server (that's test/interop.test.ts's job).
  */
-import { EventEmitter } from "node:events";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import {
-  MixerClient,
-  SUBPROTOCOL,
-  fullJitterDelay,
-  type DialSocket,
-  type WSFactory,
-  type DisconnectPayload,
-} from "../src/client.js";
+import { MixerClient, fullJitterDelay, type DisconnectPayload } from "../src/client.js";
+import { FakeSocket, connectSocket, makeFactory, pushWelcome, tick } from "./helpers/fake-socket.js";
 import { encodeControl, type ControlMessage } from "../src/control.js";
 import { decodeFrame, encodeClose, encodeData, encodeOpen, FrameType } from "../src/frame.js";
-import { ErrorCode, StreamError, TokenUnavailableError, WsMixerError } from "../src/errors.js";
+import { ErrorCode, TokenUnavailableError, WsMixerError } from "../src/errors.js";
 import type { MixerStream } from "../src/stream.js";
 
 /** Asserts the invariant blocker 3 requires: `currentState() === "connected"` never coincides with `currentConn() === null`. */
@@ -25,165 +18,6 @@ function assertConnInvariant(client: MixerClient): void {
   if (client.currentState() === "connected") {
     expect(client.currentConn()).not.toBeNull();
   }
-}
-
-/** Builds a `welcome` control frame and pushes it to `socket`, for tests that disable `autoWelcome` and drive the handshake by hand. */
-function pushWelcome(socket: FakeSocket, overrides: Partial<ControlMessage> = {}): void {
-  const welcome = {
-    t: "welcome",
-    v: 1,
-    session: "test-session",
-    window: 262144,
-    max_streams: 64,
-    ping_interval: 30000,
-    ping_timeout: 90000,
-    ...overrides,
-  } as ControlMessage;
-  socket.push(encodeData(0, encodeControl(welcome)));
-}
-
-// --- fake transport ----------------------------------------------------------
-
-/**
- * A fake `ws`-shaped socket, driven entirely by the test: `open()`,
- * `httpReject()` and `netError()` resolve/reject the dial the same way
- * `dialWebSocket` in src/client.ts expects; `push()` delivers an inbound
- * frame once a MixerConn takes over. `send()` optionally forwards every
- * outbound frame to `onSend` so a test can script an auto-`welcome` (or any
- * other scripted server behaviour) without hand-rolling frame bytes twice.
- */
-class FakeSocket extends EventEmitter implements DialSocket {
-  bufferedAmount = 0;
-  readyState = 0; // CONNECTING
-  protocol = "";
-  readonly sent: Uint8Array[] = [];
-  closedWith: { code?: number; reason?: string } | null = null;
-  onSend: ((data: Uint8Array) => void) | null = null;
-  /** The `Authorization` header this dial was opened with (item 4: proves a fresh token is used per dial). */
-  authHeader: string | undefined = undefined;
-  /** The `hello.token` this dial actually sent on the wire (item 4). */
-  helloToken: string | undefined = undefined;
-
-  send(data: Uint8Array, cb?: (err?: Error) => void): void {
-    this.sent.push(data);
-    cb?.();
-    this.onSend?.(data);
-  }
-
-  close(code?: number, reason?: string): void {
-    if (this.closedWith) return;
-    this.closedWith = { code, reason };
-    this.readyState = 3; // CLOSED
-    queueMicrotask(() => this.emit("close", code ?? 1000, Buffer.from(reason ?? "")));
-  }
-
-  terminate(): void {
-    this.close(1006, "terminated");
-  }
-
-  /** Test driver: the dial succeeds, `ws-mixer.v1` echoed by default. */
-  open(protocol: string = SUBPROTOCOL): void {
-    this.readyState = 1; // OPEN
-    this.protocol = protocol;
-    this.emit("open");
-  }
-
-  /** Test driver: the dial fails at the HTTP layer (401/403/404/429/anything else). */
-  httpReject(statusCode: number, headers: Record<string, string> = {}): void {
-    this.emit("unexpected-response", {}, { statusCode, headers });
-  }
-
-  /** Test driver: the dial fails at the transport layer (DNS, ECONNREFUSED, ...). */
-  netError(err: Error): void {
-    this.emit("error", err);
-  }
-
-  /** Test driver: deliver an inbound binary WS message as if it came from the peer. */
-  push(frame: Uint8Array): void {
-    this.emit("message", frame, true);
-  }
-
-  /** Test driver: the server (or the network) closes the socket after the handshake. */
-  serverClose(code: number, reason = ""): void {
-    this.close(code, reason);
-  }
-}
-
-/** Builds a `_wsFactory` that records every fake socket it creates and, by default, auto-answers `hello` with `welcome` so tests can focus on the reconnect policy instead of hand-driving the handshake every time. */
-function makeFactory(
-  sockets: FakeSocket[],
-  opts: { autoWelcome?: boolean; welcomeOverrides?: Partial<ControlMessage> } = {},
-): WSFactory {
-  const autoWelcome = opts.autoWelcome ?? true;
-  return (_url, _protocols, options) => {
-    const socket = new FakeSocket();
-    // Captured regardless of autoWelcome, so every test -- not just the ones
-    // that hand-drive the handshake -- can assert a fresh token is used on
-    // every dial (item 4).
-    socket.authHeader = options.headers.Authorization;
-    sockets.push(socket);
-    socket.onSend = (data) => {
-      let frame;
-      try {
-        frame = decodeFrame(data);
-      } catch {
-        return;
-      }
-      if (frame.type !== FrameType.DATA || frame.streamId !== 0) return;
-      let msg: ControlMessage;
-      try {
-        msg = JSON.parse(Buffer.from(frame.payload).toString("utf8"));
-      } catch {
-        return;
-      }
-      if (msg.t !== "hello") return;
-      socket.helloToken = msg.token;
-      if (!autoWelcome) return;
-      queueMicrotask(() => {
-        const welcome = {
-          t: "welcome",
-          v: 1,
-          session: "test-session",
-          window: 262144,
-          max_streams: 64,
-          ping_interval: 30000,
-          ping_timeout: 90000,
-          ...opts.welcomeOverrides,
-        } as ControlMessage;
-        socket.push(encodeData(0, encodeControl(welcome)));
-      });
-    };
-    return socket;
-  };
-}
-
-/**
- * Drains microtasks (queued welcome replies, promise chains) and flushes any
- * zero-delay timers/`process.nextTick` work along the way -- Node's stream
- * `destroy()` machinery schedules its `'error'`/`'close'` emission a couple
- * of nextTick/immediate hops deep, which plain `await Promise.resolve()`
- * chains alone don't reliably drain. `vi.advanceTimersByTimeAsync(0)` (every
- * test here runs under `vi.useFakeTimers()`) flushes both.
- *
- * Note: under fake timers, a timer scheduled with a delay under 1ms is
- * indistinguishable from "already due" and fires inside this zero-advance
- * flush -- so a test must not assert "this timer has not fired yet" for an
- * unpinned `Math.random()`-jittered delay unless it pins `Math.random` first.
- */
-async function tick(n = 5): Promise<void> {
-  for (let i = 0; i < n; i++) {
-    await Promise.resolve();
-    await vi.advanceTimersByTimeAsync(0);
-  }
-}
-
-/** Waits for a socket to exist at `sockets[index]`, then opens it and lets its handshake complete. */
-async function connectSocket(sockets: FakeSocket[], index: number): Promise<FakeSocket> {
-  await tick();
-  const s = sockets[index]!;
-  s.open();
-  await tick();
-  return s;
 }
 
 afterEach(() => {
@@ -242,7 +76,7 @@ describe("MixerClient reconnect policy", () => {
     const reconnecting: Array<{ attempt: number; delayMs: number; cause: string }> = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       reconnect: { base: 1000, cap: 60000, stableAfter: 10000 },
     });
     client.on("reconnecting", (info) => reconnecting.push(info));
@@ -283,7 +117,7 @@ describe("MixerClient reconnect policy", () => {
       calls++;
       return `token-${calls}`;
     };
-    const client = new MixerClient("wss://x/tunnel", { token: provider, _wsFactory: makeFactory(sockets) });
+    const client = new MixerClient("wss://x/tunnel", { token: provider, webSocket: makeFactory(sockets) });
     const started = client.start();
     started.catch(() => {}); // asserted later via `.rejects`/`await`; avoid a spurious unhandledRejection in between
     await connectSocket(sockets, 0);
@@ -306,7 +140,7 @@ describe("MixerClient reconnect policy", () => {
   it("close 1001 is treated the same as 4012: immediate reconnect", async () => {
     vi.useFakeTimers();
     const sockets: FakeSocket[] = [];
-    const client = new MixerClient("wss://x/tunnel", { token: "t", _wsFactory: makeFactory(sockets) });
+    const client = new MixerClient("wss://x/tunnel", { token: "t", webSocket: makeFactory(sockets) });
     const started = client.start();
     started.catch(() => {}); // asserted later via `.rejects`/`await`; avoid a spurious unhandledRejection in between
     await connectSocket(sockets, 0);
@@ -326,7 +160,7 @@ describe("MixerClient reconnect policy", () => {
     const reconnecting: Array<{ attempt: number; delayMs: number; cause: string }> = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       reconnect: { base: 1000, cap: 60000 },
     });
     client.on("reconnecting", (info) => reconnecting.push(info));
@@ -361,7 +195,7 @@ describe("MixerClient reconnect policy", () => {
     const disconnects: DisconnectPayload[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       reconnect: { maxAttempts: 0 },
       onDisconnect: (r) => disconnects.push(r),
     });
@@ -390,7 +224,7 @@ describe("MixerClient reconnect policy", () => {
     const reconnecting: Array<{ attempt: number; delayMs: number; cause: string }> = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       reconnect: { base: 1000, cap: 60000 },
     });
     client.on("reconnecting", (info) => reconnecting.push(info));
@@ -417,7 +251,7 @@ describe("MixerClient reconnect policy", () => {
       const disconnects: DisconnectPayload[] = [];
       const client = new MixerClient("wss://x/tunnel", {
         token: "t",
-        _wsFactory: makeFactory(sockets),
+        webSocket: makeFactory(sockets),
         onDisconnect: (r) => disconnects.push(r),
       });
       client.on("fatal", (e) => fatalEvents.push(e));
@@ -450,7 +284,7 @@ describe("MixerClient reconnect policy", () => {
     const disconnects: DisconnectPayload[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       onDisconnect: (r) => disconnects.push(r),
     });
     client.on("fatal", (e) => fatalEvents.push(e));
@@ -480,7 +314,7 @@ describe("MixerClient reconnect policy", () => {
     vi.useFakeTimers();
     const sockets: FakeSocket[] = [];
     const fatalEvents: unknown[] = [];
-    const client = new MixerClient("wss://x/tunnel", { token: "t", _wsFactory: makeFactory(sockets) });
+    const client = new MixerClient("wss://x/tunnel", { token: "t", webSocket: makeFactory(sockets) });
     client.on("fatal", (e) => fatalEvents.push(e));
 
     const started = client.start();
@@ -500,7 +334,7 @@ describe("MixerClient reconnect policy", () => {
     const sockets: FakeSocket[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       reconnect: { base: 1000, cap: 60000 },
     });
     const started = client.start();
@@ -525,7 +359,7 @@ describe("MixerClient reconnect policy", () => {
     const disconnects: DisconnectPayload[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       reconnect: { base: 1, cap: 10, maxAttempts: 2 },
       onDisconnect: (r) => disconnects.push(r),
     });
@@ -560,7 +394,7 @@ describe("MixerClient reconnect policy", () => {
   it("close() during an in-flight dial closes the socket once it resolves and never reconnects", async () => {
     vi.useFakeTimers();
     const sockets: FakeSocket[] = [];
-    const client = new MixerClient("wss://x/tunnel", { token: "t", _wsFactory: makeFactory(sockets) });
+    const client = new MixerClient("wss://x/tunnel", { token: "t", webSocket: makeFactory(sockets) });
 
     const started = client.start();
     started.catch(() => {}); // asserted later via `.rejects`/`await`; avoid a spurious unhandledRejection in between
@@ -582,9 +416,11 @@ describe("MixerClient reconnect policy", () => {
   it("errors every in-flight stream when the connection drops for reconnect", async () => {
     vi.useFakeTimers();
     const sockets: FakeSocket[] = [];
-    const client = new MixerClient("wss://x/tunnel", { token: "t", _wsFactory: makeFactory(sockets) });
+    const client = new MixerClient("wss://x/tunnel", { token: "t", webSocket: makeFactory(sockets) });
     const streamErrors: Error[] = [];
-    client.on("stream", (s) => s.on("error", (e: Error) => streamErrors.push(e)));
+    client.on("stream", (s: MixerStream) => {
+      void s.read().catch((e: Error) => streamErrors.push(e));
+    });
 
     const started = client.start();
     started.catch(() => {}); // asserted later via `.rejects`/`await`; avoid a spurious unhandledRejection in between
@@ -607,7 +443,7 @@ describe("MixerClient reconnect policy", () => {
     const sockets: FakeSocket[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       reconnect: { base: 100, cap: 1000 },
     });
 
@@ -646,7 +482,7 @@ describe("MixerClient stability (reconnect.stableAfter)", () => {
     const reconnecting: Array<{ attempt: number; delayMs: number }> = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       reconnect: { base: 1000, cap: 60000, stableAfter: 10000 },
     });
     client.on("reconnecting", (info) => reconnecting.push(info));
@@ -681,7 +517,7 @@ describe("MixerClient stability (reconnect.stableAfter)", () => {
     const reconnecting: Array<{ attempt: number; delayMs: number }> = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       reconnect: { base: 1000, cap: 60000, stableAfter: 10000 },
     });
     client.on("reconnecting", (info) => reconnecting.push(info));
@@ -735,7 +571,7 @@ describe("MixerClient stability (reconnect.stableAfter)", () => {
     const reconnecting: Array<{ attempt: number; delayMs: number }> = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       reconnect: { base: 1000, cap: 60000, stableAfter: 10000 },
     });
     client.on("reconnecting", (info) => reconnecting.push(info));
@@ -803,7 +639,7 @@ describe("MixerClient stability (reconnect.stableAfter)", () => {
     const reconnecting: Array<{ attempt: number; delayMs: number }> = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       reconnect: { base: 1000, cap: 60000, stableAfter: 10000 },
     });
     client.on("reconnecting", (info) => reconnecting.push(info));
@@ -864,7 +700,7 @@ describe("MixerClient stability (reconnect.stableAfter)", () => {
     const disconnects: DisconnectPayload[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       reconnect: { base: 1, cap: 10, maxAttempts: 3, stableAfter: 10000 },
       onDisconnect: (r) => disconnects.push(r),
     });
@@ -903,7 +739,7 @@ describe("MixerClient stability (reconnect.stableAfter)", () => {
     const sockets: FakeSocket[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       reconnect: { stableAfter: 10000 },
     });
 
@@ -928,7 +764,7 @@ describe("MixerClient stability (reconnect.stableAfter)", () => {
     const reconnecting: Array<{ attempt: number; delayMs: number }> = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       // stableAfter: 0 reproduces "reset on welcome" -- the timer fires on
       // the very next tick after welcome, just like the old unconditional reset did.
       reconnect: { base: 1000, cap: 60000, stableAfter: 0 },
@@ -973,7 +809,7 @@ describe("MixerClient drain handling", () => {
       calls++;
       return `token-${calls}`;
     };
-    const client = new MixerClient("wss://x/tunnel", { token: provider, _wsFactory: makeFactory(sockets) });
+    const client = new MixerClient("wss://x/tunnel", { token: provider, webSocket: makeFactory(sockets) });
 
     const started = client.start();
     started.catch(() => {}); // asserted later via `.rejects`/`await`; avoid a spurious unhandledRejection in between
@@ -1028,7 +864,7 @@ describe("MixerClient drain handling", () => {
   it("currentState() never reports connected with conn === null across a drain cycle", async () => {
     vi.useFakeTimers();
     const sockets: FakeSocket[] = [];
-    const client = new MixerClient("wss://x/tunnel", { token: "t", _wsFactory: makeFactory(sockets) });
+    const client = new MixerClient("wss://x/tunnel", { token: "t", webSocket: makeFactory(sockets) });
     const observed: Array<{ state: string; connIsNull: boolean }> = [];
     const record = (): void => {
       observed.push({ state: client.currentState(), connIsNull: client.currentConn() === null });
@@ -1059,7 +895,7 @@ describe("MixerClient drain handling", () => {
   it("two drain cycles in a row each reconnect immediately without wedging the state machine", async () => {
     vi.useFakeTimers();
     const sockets: FakeSocket[] = [];
-    const client = new MixerClient("wss://x/tunnel", { token: "t", _wsFactory: makeFactory(sockets) });
+    const client = new MixerClient("wss://x/tunnel", { token: "t", webSocket: makeFactory(sockets) });
 
     const started = client.start();
     started.catch(() => {});
@@ -1081,13 +917,13 @@ describe("MixerClient drain handling", () => {
     await client.close();
   });
 
-  it("a fast reconnect during drain cancels the old conn's in-flight stream with StreamError(CANCEL) and reports no disconnect for it", async () => {
+  it("a fast reconnect during drain leaves the old conn's in-flight stream alive; the old conn's end is reported once, non-fatal", async () => {
     vi.useFakeTimers();
     const sockets: FakeSocket[] = [];
     const disconnects: DisconnectPayload[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       onDisconnect: (r) => disconnects.push(r),
     });
 
@@ -1104,16 +940,14 @@ describe("MixerClient drain handling", () => {
     await tick();
     expect(stream).toBeDefined();
     let streamErr: unknown;
-    stream!.on("error", (e) => {
+    void stream!.read().catch((e: Error) => {
       streamErr = e;
     });
 
     // Drain: the SDK reconnects immediately in parallel. Once the
-    // replacement's welcome lands, the old (drained) conn is torn down --
-    // its still-live stream didn't error, the connection it rode on was
-    // replaced, so it must get a stream-scoped CANCEL, not a connection-level
-    // error, and the old conn's own teardown must not surface as a disconnect
-    // (the client is still connected throughout, via the replacement).
+    // replacement's welcome lands, new streams go there, but the old
+    // (drained) conn stays up for its in-flight stream (WIRE.md section
+    // 2.9: "in-flight streams finish normally").
     s0.push(drainFrame());
     await tick();
     await vi.advanceTimersByTimeAsync(2000);
@@ -1121,11 +955,21 @@ describe("MixerClient drain handling", () => {
     await tick();
 
     expect(client.currentState()).toBe("connected");
-    expect(streamErr).toBeInstanceOf(StreamError);
-    expect((streamErr as StreamError).code).toBe(ErrorCode.CANCEL);
-    expect((streamErr as StreamError).message).toBe("connection drained");
-    expect(stream!.resetCode).toBe(ErrorCode.CANCEL);
+    expect(client.currentConn()).not.toBeNull();
+    expect(s0.closedWith).toBeNull();
+    expect(streamErr).toBeUndefined();
+    expect(stream!.getState()).toBe("open");
     expect(disconnects).toHaveLength(0);
+
+    // The stream finishes: the old conn closes itself (1000), reported once, non-fatal.
+    s0.push(encodeClose(1));
+    await stream!.closeWrite();
+    await tick();
+    await expect(stream!.closed).resolves.toEqual({ kind: "finished" });
+    expect(s0.closedWith?.code).toBe(1000);
+    expect(disconnects).toHaveLength(1);
+    expect(disconnects[0]).toMatchObject({ phase: "connected", fatal: false, wsCode: 1000 });
+    expect(sockets).toHaveLength(2); // no extra reconnect
 
     await client.close();
     await client.close();
@@ -1134,7 +978,7 @@ describe("MixerClient drain handling", () => {
   it("item 8: a second `drain` on the same connection does not spawn a second parallel reconnect", async () => {
     vi.useFakeTimers();
     const sockets: FakeSocket[] = [];
-    const client = new MixerClient("wss://x/tunnel", { token: "t", _wsFactory: makeFactory(sockets) });
+    const client = new MixerClient("wss://x/tunnel", { token: "t", webSocket: makeFactory(sockets) });
     const drains: unknown[] = [];
     client.on("drain", (d) => drains.push(d));
 
@@ -1172,7 +1016,7 @@ describe("MixerClient drain handling", () => {
     const gate = new Promise<void>((resolve) => (release = resolve));
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       onApp: async () => {
         await gate; // wedges MixerConn's delivery loop
       },
@@ -1210,7 +1054,7 @@ describe("MixerClient drain handling", () => {
     const gate = new Promise<void>((resolve) => (release = resolve));
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       reconnect: { base: 1000, cap: 60000 },
       onApp: async () => {
         await gate; // wedges MixerConn's delivery loop
@@ -1267,7 +1111,7 @@ describe("MixerClient drain handling", () => {
     const fatalEvents: WsMixerError[] = [];
     // autoWelcome:false so the test controls exactly when (or whether) the
     // parallel dial's welcome lands, to land it squarely mid-handshake.
-    const client = new MixerClient("wss://x/tunnel", { token: "t", _wsFactory: makeFactory(sockets, { autoWelcome: false }) });
+    const client = new MixerClient("wss://x/tunnel", { token: "t", webSocket: makeFactory(sockets, { autoWelcome: false }) });
     client.on("fatal", (e) => fatalEvents.push(e));
 
     const started = client.start();
@@ -1313,7 +1157,7 @@ describe("MixerClient drain handling", () => {
     vi.useFakeTimers();
     const sockets: FakeSocket[] = [];
     const fatalEvents: WsMixerError[] = [];
-    const client = new MixerClient("wss://x/tunnel", { token: "t", _wsFactory: makeFactory(sockets, { autoWelcome: false }) });
+    const client = new MixerClient("wss://x/tunnel", { token: "t", webSocket: makeFactory(sockets, { autoWelcome: false }) });
     client.on("fatal", (e) => fatalEvents.push(e));
 
     const started = client.start();
@@ -1359,7 +1203,7 @@ describe("MixerClient drain handling", () => {
       calls++;
       return `token-${calls}`;
     };
-    const client = new MixerClient("wss://x/tunnel", { token: provider, _wsFactory: makeFactory(sockets, { autoWelcome: false }) });
+    const client = new MixerClient("wss://x/tunnel", { token: provider, webSocket: makeFactory(sockets, { autoWelcome: false }) });
     client.on("fatal", (e) => fatalEvents.push(e));
 
     const started = client.start();
@@ -1414,7 +1258,7 @@ describe("MixerClient drain respects maxAttempts", () => {
     const fatalErrors: unknown[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       reconnect: { maxAttempts: 0 },
       onDisconnect: (r) => disconnects.push(r),
     });
@@ -1453,7 +1297,7 @@ describe("MixerClient drain respects maxAttempts", () => {
     const disconnects: DisconnectPayload[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       reconnect: { maxAttempts: 0 },
       onDisconnect: (r) => disconnects.push(r),
     });
@@ -1472,13 +1316,14 @@ describe("MixerClient drain respects maxAttempts", () => {
     expect(stream).toBeDefined();
     let streamEnded = false;
     let streamErr: unknown;
-    stream!.on("end", () => {
-      streamEnded = true;
-    });
-    stream!.on("error", (e) => {
-      streamErr = e;
-    });
-    stream!.resume(); // flowing mode, so push(null) below actually emits 'end'
+    void stream!.read().then(
+      (c) => {
+        streamEnded = c === null;
+      },
+      (e: Error) => {
+        streamErr = e;
+      },
+    );
 
     // Drain arrives with reconnect disabled: the conn stays up and the
     // in-flight stream is left to finish on its own, not cancelled/reset.
@@ -1508,7 +1353,7 @@ describe("MixerClient drain respects maxAttempts", () => {
     const fatalErrors: unknown[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       reconnect: { maxAttempts: 0 },
       onDisconnect: (r) => disconnects.push(r),
     });
@@ -1544,7 +1389,7 @@ describe("MixerClient item 1: a pre-welcome drain does not desync the reconnect 
     const sockets: FakeSocket[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      webSocket: makeFactory(sockets, { autoWelcome: false }),
       reconnect: { base: 100, cap: 1000 },
     });
     const started = client.start();
@@ -1603,7 +1448,7 @@ describe("MixerClient item 6: reconnectImmediately respects maxAttempts", () => 
     const reconnecting: Array<{ attempt: number }> = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      webSocket: makeFactory(sockets, { autoWelcome: false }),
       reconnect: { maxAttempts: 2 },
       onDisconnect: (r) => disconnects.push(r),
     });
@@ -1650,7 +1495,7 @@ describe("MixerClient v0.2: token provider", () => {
     };
     const client = new MixerClient("wss://x/tunnel", {
       token: provider,
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       reconnect: { base: 10, cap: 100 },
     });
 
@@ -1690,7 +1535,7 @@ describe("MixerClient v0.2: token provider", () => {
       return `token-${calls}`;
     };
     const reconnecting: unknown[] = [];
-    const client = new MixerClient("wss://x/tunnel", { token: provider, _wsFactory: makeFactory(sockets) });
+    const client = new MixerClient("wss://x/tunnel", { token: provider, webSocket: makeFactory(sockets) });
     client.on("reconnecting", (info) => reconnecting.push(info));
 
     const started = client.start();
@@ -1724,7 +1569,7 @@ describe("MixerClient v0.2: token provider", () => {
     const disconnects: DisconnectPayload[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: provider,
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       onDisconnect: (r) => disconnects.push(r),
     });
     client.on("fatal", (e) => fatalEvents.push(e));
@@ -1753,7 +1598,7 @@ describe("MixerClient v0.2: token provider", () => {
     const disconnects: DisconnectPayload[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "static-token",
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       onDisconnect: (r) => disconnects.push(r),
     });
 
@@ -1780,7 +1625,7 @@ describe("MixerClient v0.2: token provider", () => {
     const fatalEvents: unknown[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: provider,
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       onDisconnect: (r) => disconnects.push(r),
     });
     client.on("fatal", (e) => fatalEvents.push(e));
@@ -1810,7 +1655,7 @@ describe("MixerClient v0.2: token provider", () => {
     const disconnects: DisconnectPayload[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: provider,
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       onDisconnect: (r) => disconnects.push(r),
     });
 
@@ -1838,7 +1683,7 @@ describe("MixerClient v0.2: token provider", () => {
       const disconnects: DisconnectPayload[] = [];
       const client = new MixerClient("wss://x/tunnel", {
         token: provider,
-        _wsFactory: makeFactory(sockets),
+        webSocket: makeFactory(sockets),
         onDisconnect: (r) => disconnects.push(r),
       });
 
@@ -1870,7 +1715,7 @@ describe("MixerClient v0.2: token provider", () => {
       const reconnecting: Array<{ attempt: number; delayMs: number; cause: string }> = [];
       const client = new MixerClient("wss://x/tunnel", {
         token: "t",
-        _wsFactory: makeFactory(sockets),
+        webSocket: makeFactory(sockets),
         reconnect: { base: 1000, cap: 60000 },
         onDisconnect: (r) => disconnects.push(r),
       });
@@ -1904,7 +1749,7 @@ describe("MixerClient v0.2: token provider", () => {
     const disconnects: DisconnectPayload[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      webSocket: makeFactory(sockets, { autoWelcome: false }),
       reconnect: { base: 10, cap: 100 },
       onDisconnect: (r) => disconnects.push(r),
     });
@@ -1970,7 +1815,7 @@ describe("MixerClient v0.2: token provider", () => {
     const disconnects: DisconnectPayload[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: provider,
-      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      webSocket: makeFactory(sockets, { autoWelcome: false }),
       reconnect: { base: 10, cap: 100, maxAttempts: 1 },
       onDisconnect: (r) => disconnects.push(r),
     });
@@ -2030,7 +1875,7 @@ describe("MixerClient change 1/1b: unified pre-welcome auth-rejection retry", ()
     const reconnecting: unknown[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: provider,
-      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      webSocket: makeFactory(sockets, { autoWelcome: false }),
       onDisconnect: (r) => disconnects.push(r),
     });
     client.on("reconnecting", (info) => reconnecting.push(info));
@@ -2073,7 +1918,7 @@ describe("MixerClient change 1/1b: unified pre-welcome auth-rejection retry", ()
     const fatalEvents: unknown[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: provider,
-      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      webSocket: makeFactory(sockets, { autoWelcome: false }),
       onDisconnect: (r) => disconnects.push(r),
     });
     client.on("fatal", (e) => fatalEvents.push(e));
@@ -2108,7 +1953,7 @@ describe("MixerClient change 1/1b: unified pre-welcome auth-rejection retry", ()
     const disconnects: DisconnectPayload[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "static-token",
-      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      webSocket: makeFactory(sockets, { autoWelcome: false }),
       onDisconnect: (r) => disconnects.push(r),
     });
 
@@ -2145,7 +1990,7 @@ describe("MixerClient change 1/1b: unified pre-welcome auth-rejection retry", ()
     const reconnecting: unknown[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: provider,
-      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      webSocket: makeFactory(sockets, { autoWelcome: false }),
       onDisconnect: (r) => disconnects.push(r),
     });
     client.on("reconnecting", (info) => reconnecting.push(info));
@@ -2187,7 +2032,7 @@ describe("MixerClient change 1/1b: unified pre-welcome auth-rejection retry", ()
     const disconnects: DisconnectPayload[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: provider,
-      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      webSocket: makeFactory(sockets, { autoWelcome: false }),
       onDisconnect: (r) => disconnects.push(r),
     });
 
@@ -2226,7 +2071,7 @@ describe("MixerClient change 1/1b: unified pre-welcome auth-rejection retry", ()
     const disconnects: DisconnectPayload[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: provider,
-      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      webSocket: makeFactory(sockets, { autoWelcome: false }),
       onDisconnect: (r) => disconnects.push(r),
     });
 
@@ -2262,7 +2107,7 @@ describe("MixerClient change 1/1b: unified pre-welcome auth-rejection retry", ()
     const disconnects: DisconnectPayload[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: provider,
-      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      webSocket: makeFactory(sockets, { autoWelcome: false }),
       onDisconnect: (r) => disconnects.push(r),
     });
 
@@ -2304,7 +2149,7 @@ describe("MixerClient change 1 addendum: refresh-retry budget re-arms only at st
     const disconnects: DisconnectPayload[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: provider,
-      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      webSocket: makeFactory(sockets, { autoWelcome: false }),
       reconnect: { base: 10, cap: 100, stableAfter: 10000 },
       onDisconnect: (r) => disconnects.push(r),
     });
@@ -2361,7 +2206,7 @@ describe("MixerClient change 1 addendum: refresh-retry budget re-arms only at st
     const disconnects: DisconnectPayload[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: provider,
-      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      webSocket: makeFactory(sockets, { autoWelcome: false }),
       reconnect: { base: 10, cap: 100, stableAfter: 10000 },
       onDisconnect: (r) => disconnects.push(r),
     });
@@ -2419,7 +2264,7 @@ describe("MixerClient change 1 item 4: the refresh-retry is unconditional on max
     const disconnects: DisconnectPayload[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: provider,
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       reconnect: { maxAttempts: 0 },
       onDisconnect: (r) => disconnects.push(r),
     });
@@ -2454,7 +2299,7 @@ describe("MixerClient change 1 item 4: the refresh-retry is unconditional on max
     const fatalEvents: unknown[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: provider,
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       reconnect: { maxAttempts: 0 },
       onDisconnect: (r) => disconnects.push(r),
     });
@@ -2489,7 +2334,7 @@ describe("MixerClient change 1 item 4: the refresh-retry is unconditional on max
     const reconnecting: Array<{ delayMs: number }> = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: provider,
-      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      webSocket: makeFactory(sockets, { autoWelcome: false }),
       reconnect: { base: 10, cap: 100, stableAfter: 10000 },
       onDisconnect: (r) => disconnects.push(r),
     });
@@ -2555,7 +2400,7 @@ describe("MixerClient TokenUnavailableError", () => {
     const reconnecting: Array<{ attempt: number; delayMs: number }> = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: provider,
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       reconnect: { base: 1000, cap: 60000 },
       onDisconnect: (r) => disconnects.push(r),
     });
@@ -2613,7 +2458,7 @@ describe("MixerClient TokenUnavailableError", () => {
     const reconnecting: Array<{ attempt: number; delayMs: number }> = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: provider,
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       reconnect: { base: 1000, cap: 60000, maxAttempts: 2 },
       onDisconnect: (r) => disconnects.push(r),
     });
@@ -2667,7 +2512,7 @@ describe("MixerClient TokenUnavailableError", () => {
     const reconnecting: Array<{ delayMs: number }> = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: provider,
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       reconnect: { base: 1000, cap: 60000 },
       onDisconnect: (r) => disconnects.push(r),
     });
@@ -2706,7 +2551,7 @@ describe("MixerClient TokenUnavailableError", () => {
     const fatalEvents: unknown[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: provider,
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       onDisconnect: (r) => disconnects.push(r),
     });
     client.on("fatal", (e) => fatalEvents.push(e));
@@ -2733,7 +2578,7 @@ describe("MixerClient TokenUnavailableError", () => {
     const fatalEvents: unknown[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: provider,
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       onDisconnect: (r) => disconnects.push(r),
     });
     client.on("fatal", (e) => fatalEvents.push(e));
@@ -2764,7 +2609,7 @@ describe("MixerClient TokenUnavailableError", () => {
     const reconnecting: Array<{ delayMs: number }> = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: provider,
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       reconnect: { base: 1000, cap: 60000 },
       onDisconnect: (r) => disconnects.push(r),
     });
@@ -2814,7 +2659,7 @@ describe("MixerClient TokenUnavailableError", () => {
     const fatalEvents: unknown[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: provider,
-      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      webSocket: makeFactory(sockets, { autoWelcome: false }),
       reconnect: { base: 10, cap: 100, stableAfter: 10000 },
       onDisconnect: (r) => disconnects.push(r),
     });
@@ -2879,7 +2724,7 @@ describe("MixerClient TokenUnavailableError", () => {
     try {
       const client = new MixerClient("wss://x/tunnel", {
         token: provider,
-        _wsFactory: makeFactory(sockets),
+        webSocket: makeFactory(sockets),
         onDisconnect: (r) => disconnects.push(r),
       });
       client.on("fatal", (ev) => fatalEvents.push(ev));
@@ -2924,7 +2769,7 @@ describe("MixerClient TokenUnavailableError", () => {
     try {
       const client = new MixerClient("wss://x/tunnel", {
         token: provider,
-        _wsFactory: makeFactory(sockets),
+        webSocket: makeFactory(sockets),
         onDisconnect: (r) => disconnects.push(r),
       });
       client.on("fatal", (ev) => fatalEvents.push(ev));
@@ -2961,7 +2806,7 @@ describe("MixerClient item 7: loud onDisconnect for a protocol-bug close (4001/4
       const disconnects: Array<Record<string, unknown>> = [];
       const client = new MixerClient("wss://x/tunnel", {
         token: "t",
-        _wsFactory: makeFactory(sockets),
+        webSocket: makeFactory(sockets),
         onDisconnect: (r) => disconnects.push(r as unknown as Record<string, unknown>),
       });
 
@@ -2991,7 +2836,7 @@ describe("MixerClient item 7: loud onDisconnect for a protocol-bug close (4001/4
     const disconnects: Array<Record<string, unknown>> = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       onDisconnect: (r) => disconnects.push(r as unknown as Record<string, unknown>),
     });
 
@@ -3020,7 +2865,7 @@ describe("MixerClient blocker 1: exactly one DisconnectReason per disconnect", (
     const disconnects: DisconnectPayload[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       reconnect: { maxAttempts: 0 },
       onDisconnect: (r) => disconnects.push(r),
     });
@@ -3044,7 +2889,7 @@ describe("MixerClient blocker 1: exactly one DisconnectReason per disconnect", (
     const disconnects: DisconnectPayload[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      webSocket: makeFactory(sockets, { autoWelcome: false }),
       reconnect: { maxAttempts: 0 },
       onDisconnect: (r) => disconnects.push(r),
     });
@@ -3070,7 +2915,7 @@ describe("MixerClient blocker 1: exactly one DisconnectReason per disconnect", (
     const disconnects: DisconnectPayload[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       reconnect: { maxAttempts: 0 },
       onDisconnect: (r) => disconnects.push(r),
     });
@@ -3095,7 +2940,7 @@ describe("MixerClient blocker 1: exactly one DisconnectReason per disconnect", (
     const connects: unknown[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       reconnect: { base: 10, cap: 100 },
       onDisconnect: (r) => disconnects.push(r),
       onConnect: (w) => connects.push(w),
@@ -3132,7 +2977,7 @@ describe("MixerClient blocker 1: exactly one DisconnectReason per disconnect", (
     const disconnects: DisconnectPayload[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       reconnect: { maxAttempts: 0 },
       onDisconnect: (r) => disconnects.push(r),
     });
@@ -3163,7 +3008,7 @@ describe("MixerClient giveUp mirrors goFatal: no orphaned conn/timers after exha
     const disconnects: DisconnectPayload[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       reconnect: { base: 10, cap: 100, maxAttempts: 1, stableAfter: 10000 },
       onDisconnect: (r) => disconnects.push(r),
     });
@@ -3219,7 +3064,7 @@ describe("MixerClient item 3: a concurrent old-conn close can't clobber a new di
     const disconnects: DisconnectPayload[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      webSocket: makeFactory(sockets, { autoWelcome: false }),
       onDisconnect: (r) => disconnects.push(r),
     });
 
@@ -3272,43 +3117,42 @@ describe("MixerClient item 3: a concurrent old-conn close can't clobber a new di
   });
 });
 
-// --- item 2: unexpected-response drains and destroys the request/response --
+// --- a standard WebSocket cannot see the upgrade's HTTP status ---------------
 
-describe("MixerClient item 2: unexpected-response cleans up req/res instead of leaking them", () => {
-  it("resumes and destroys the response, destroys the request, and terminates the socket", async () => {
+describe("MixerClient dial failures with a standard WebSocket (no upgradeFailure)", () => {
+  it("a rejected upgrade that only surfaces as error + close 1006 is a retried, non-fatal dial failure with no httpStatus", async () => {
     vi.useFakeTimers();
     const sockets: FakeSocket[] = [];
-    const client = new MixerClient("wss://x/tunnel", { token: "t", _wsFactory: makeFactory(sockets) });
+    const disconnects: DisconnectPayload[] = [];
+    const client = new MixerClient("wss://x/tunnel", {
+      token: "t",
+      webSocket: makeFactory(sockets),
+      onDisconnect: (r) => disconnects.push(r),
+    });
 
     const started = client.start();
     started.catch(() => {});
     await tick();
 
-    const terminateSpy = vi.spyOn(sockets[0]!, "terminate");
-    const req = { destroy: vi.fn() };
-    const res = { statusCode: 401, headers: {}, resume: vi.fn(), destroy: vi.fn() };
-    // `ws` skips its own abortHandshake cleanup because a listener is
-    // attached (dialWebSocket's own `ws.once("unexpected-response", ...)`),
-    // so the SDK must drain/destroy req/res itself or they leak.
-    sockets[0]!.emit("unexpected-response", req, res);
+    // What Node's undici WebSocket does on a 401 upgrade: an empty error, then close 1006.
+    sockets[0]!.emit("error", new Error(""));
+    sockets[0]!.emit("close", 1006, Buffer.from(""));
     await tick();
 
-    expect(res.resume).toHaveBeenCalledTimes(1);
-    expect(req.destroy).toHaveBeenCalledTimes(1);
-    expect(res.destroy).toHaveBeenCalledTimes(1);
-    expect(terminateSpy).toHaveBeenCalledTimes(1);
-
-    await expect(started).rejects.toBeTruthy();
+    expect(disconnects).toHaveLength(1);
+    expect(disconnects[0]).toMatchObject({ phase: "dial", fatal: false, httpStatus: undefined, message: "WebSocket connection failed" });
+    expect(client.currentState()).toBe("backoff");
+    await client.close();
   });
 
-  it("a missing res (and req) never throws out of ws's emit, and still settles the dial for a retry", async () => {
+  it("an error event with no message or error never throws, and still settles the dial for a retry", async () => {
     vi.useFakeTimers();
     const sockets: FakeSocket[] = [];
     const disconnects: DisconnectPayload[] = [];
     const reconnecting: Array<{ attempt: number; delayMs: number; cause: string }> = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       reconnect: { base: 1000, cap: 60000 },
       onDisconnect: (r) => disconnects.push(r),
     });
@@ -3318,9 +3162,9 @@ describe("MixerClient item 2: unexpected-response cleans up req/res instead of l
     started.catch(() => {});
     await tick();
 
-    // `ws`'s real event always carries both, but a defensive transport/mock
-    // might not -- emitting must not throw synchronously out of dispatch.
-    expect(() => sockets[0]!.emit("unexpected-response", undefined, undefined)).not.toThrow();
+    // A browser's error event carries nothing at all -- dispatching it must
+    // not throw, and the dial still settles.
+    expect(() => sockets[0]!.emit("error", undefined)).not.toThrow();
     await tick();
 
     // Never fatal, treated like any other unrecognized dial failure: no
@@ -3350,7 +3194,7 @@ describe("MixerClient closeReason", () => {
     const disconnects: DisconnectPayload[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       onDisconnect: (r) => disconnects.push(r),
     });
 
@@ -3377,7 +3221,7 @@ describe("MixerClient closeReason", () => {
     const disconnects: DisconnectPayload[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       onDisconnect: (r) => disconnects.push(r),
     });
 
@@ -3414,7 +3258,7 @@ describe("MixerClient closeReason", () => {
     const disconnects: DisconnectPayload[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       onDisconnect: (r) => disconnects.push(r),
     });
 
@@ -3444,7 +3288,7 @@ describe("MixerClient closeReason", () => {
     const disconnects: DisconnectPayload[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       onDisconnect: (r) => disconnects.push(r),
     });
 
@@ -3469,7 +3313,7 @@ describe("MixerClient closeReason", () => {
     const disconnects: DisconnectPayload[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       onDisconnect: (r) => disconnects.push(r),
     });
 
@@ -3495,7 +3339,7 @@ describe("MixerClient closeReason", () => {
     const disconnects: DisconnectPayload[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      webSocket: makeFactory(sockets, { autoWelcome: false }),
       reconnect: { base: 10, cap: 100 },
       onDisconnect: (r) => disconnects.push(r),
     });
@@ -3537,7 +3381,7 @@ describe("MixerClient handshake-phase close classification", () => {
     const fatalEvents: unknown[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      webSocket: makeFactory(sockets, { autoWelcome: false }),
       onDisconnect: (r) => disconnects.push(r),
     });
     client.on("fatal", (e) => fatalEvents.push(e));
@@ -3578,7 +3422,7 @@ describe("MixerClient handshake-phase close classification", () => {
     const disconnects: DisconnectPayload[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      webSocket: makeFactory(sockets, { autoWelcome: false }),
       reconnect: { base: 10, cap: 100 },
       onDisconnect: (r) => disconnects.push(r),
     });
@@ -3615,7 +3459,7 @@ describe("MixerClient handshake failures raised locally carry their own wsCode",
     const disconnects: DisconnectPayload[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      webSocket: makeFactory(sockets, { autoWelcome: false }),
       reconnect: { base: 10, cap: 100 },
       onDisconnect: (r) => disconnects.push(r),
     });
@@ -3654,7 +3498,7 @@ describe("MixerClient pre-welcome error{} rejection (auth_failure.json shape)", 
     const fatalEvents: unknown[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "stale-or-revoked-token",
-      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      webSocket: makeFactory(sockets, { autoWelcome: false }),
       onDisconnect: (r) => disconnects.push(r),
     });
     client.on("fatal", (e) => fatalEvents.push(e));
@@ -3713,7 +3557,7 @@ describe("MixerClient pre-welcome error{} rejection (auth_failure.json shape)", 
     const disconnects: DisconnectPayload[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      webSocket: makeFactory(sockets, { autoWelcome: false }),
       onDisconnect: (r) => disconnects.push(r),
     });
 
@@ -3748,7 +3592,7 @@ describe("MixerClient pre-welcome error{} rejection (auth_failure.json shape)", 
     const reconnecting: Array<{ attempt: number; delayMs: number; cause: string }> = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      webSocket: makeFactory(sockets, { autoWelcome: false }),
       reconnect: { base: 10, cap: 100 },
       onDisconnect: (r) => disconnects.push(r),
     });
@@ -3791,7 +3635,7 @@ describe("MixerClient change 3: handshake-phase 'error'/'close' converge on one 
     const reconnecting: unknown[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      webSocket: makeFactory(sockets, { autoWelcome: false }),
       reconnect: { base: 10, cap: 100 },
       onDisconnect: (r) => disconnects.push(r),
     });
@@ -3831,7 +3675,7 @@ describe("MixerClient change 3: handshake-phase 'error'/'close' converge on one 
     const disconnects: DisconnectPayload[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      webSocket: makeFactory(sockets, { autoWelcome: false }),
       reconnect: { base: 10, cap: 100 },
       onDisconnect: (r) => disconnects.push(r),
     });
@@ -3859,7 +3703,7 @@ describe("MixerClient change 3: handshake-phase 'error'/'close' converge on one 
     const disconnects: DisconnectPayload[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      webSocket: makeFactory(sockets, { autoWelcome: false }),
       reconnect: { base: 10, cap: 100 },
       onDisconnect: (r) => disconnects.push(r),
     });
@@ -3886,7 +3730,7 @@ describe("MixerClient change 3: handshake-phase 'error'/'close' converge on one 
     const disconnects: DisconnectPayload[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      webSocket: makeFactory(sockets, { autoWelcome: false }),
       reconnect: { base: 10, cap: 100 },
       onDisconnect: (r) => disconnects.push(r),
     });
@@ -3924,7 +3768,7 @@ describe("MixerClient change 3: handshake-phase 'error'/'close' converge on one 
     const disconnects: DisconnectPayload[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      webSocket: makeFactory(sockets, { autoWelcome: false }),
       onDisconnect: (r) => disconnects.push(r),
     });
 
@@ -3948,7 +3792,7 @@ describe("MixerClient change 3: handshake-phase 'error'/'close' converge on one 
     const disconnects: DisconnectPayload[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       onDisconnect: (r) => disconnects.push(r),
     });
 
@@ -3979,7 +3823,7 @@ describe("MixerClient close({ message })", () => {
     const disconnects: DisconnectPayload[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       onDisconnect: (r) => disconnects.push(r),
     });
 
@@ -4023,7 +3867,7 @@ describe("MixerClient close({ message })", () => {
   it("truncates a multi-byte reason to <=123 UTF-8 bytes on a character boundary (no lone surrogate / U+FFFD)", async () => {
     vi.useFakeTimers();
     const sockets: FakeSocket[] = [];
-    const client = new MixerClient("wss://x/tunnel", { token: "t", _wsFactory: makeFactory(sockets) });
+    const client = new MixerClient("wss://x/tunnel", { token: "t", webSocket: makeFactory(sockets) });
 
     const started = client.start();
     started.catch(() => {});
@@ -4047,7 +3891,7 @@ describe("MixerClient close({ message })", () => {
   it("defaults to today's graceful drain-then-close when no message is given", async () => {
     vi.useFakeTimers();
     const sockets: FakeSocket[] = [];
-    const client = new MixerClient("wss://x/tunnel", { token: "t", _wsFactory: makeFactory(sockets) });
+    const client = new MixerClient("wss://x/tunnel", { token: "t", webSocket: makeFactory(sockets) });
 
     const started = client.start();
     started.catch(() => {});
@@ -4067,7 +3911,7 @@ describe("MixerClient close({ message })", () => {
     const disconnects: DisconnectPayload[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       onDisconnect: (r) => disconnects.push(r),
     });
 
@@ -4099,7 +3943,7 @@ describe("MixerClient close({ message })", () => {
     const disconnects: DisconnectPayload[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets, { autoWelcome: false }),
+      webSocket: makeFactory(sockets, { autoWelcome: false }),
       onDisconnect: (r) => disconnects.push(r),
     });
 
@@ -4150,7 +3994,7 @@ describe("MixerClient close({ message })", () => {
     const disconnects: DisconnectPayload[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       reconnect: { base: 1000, cap: 60000, stableAfter: 10000 },
       onDisconnect: (r) => disconnects.push(r),
     });
@@ -4187,7 +4031,7 @@ describe("MixerClient close({ message })", () => {
     const disconnects: DisconnectPayload[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       onDisconnect: (r) => disconnects.push(r),
     });
 
@@ -4228,7 +4072,7 @@ describe("MixerClient close({ message })", () => {
     const disconnects: DisconnectPayload[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       onDisconnect: (r) => disconnects.push(r),
     });
 
@@ -4271,7 +4115,7 @@ describe("MixerClient 0x0e APPLICATION_CLOSE", () => {
     const reconnecting: Array<{ attempt: number; delayMs: number; cause: string }> = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       reconnect: { base: 1000, cap: 60000 },
       onDisconnect: (r) => disconnects.push(r),
     });
@@ -4317,7 +4161,7 @@ describe("MixerClient 0x0e APPLICATION_CLOSE", () => {
     const reconnecting: Array<{ attempt: number; delayMs: number; cause: string }> = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       reconnect: { base: 1000, cap: 60000 },
       onDisconnect: (r) => disconnects.push(r),
     });
@@ -4351,7 +4195,7 @@ describe("MixerClient 0x0e APPLICATION_CLOSE", () => {
     const disconnects: DisconnectPayload[] = [];
     const client = new MixerClient("wss://x/tunnel", {
       token: "t",
-      _wsFactory: makeFactory(sockets),
+      webSocket: makeFactory(sockets),
       onDisconnect: (r) => disconnects.push(r),
     });
 
@@ -4381,7 +4225,7 @@ describe("MixerClient 0x0e APPLICATION_CLOSE", () => {
       const disconnects: DisconnectPayload[] = [];
       const client = new MixerClient("wss://x/tunnel", {
         token: "t",
-        _wsFactory: makeFactory(sockets),
+        webSocket: makeFactory(sockets),
         onDisconnect: (r) => disconnects.push(r),
       });
 

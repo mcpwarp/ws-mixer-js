@@ -1,14 +1,17 @@
 # @mcpwarp/ws-mixer
 
-JS/TypeScript client SDK for `ws-mixer.v1`: N independent byte streams multiplexed over one
-WebSocket connection. See [`ws-mixer-spec`'s `docs/WIRE.md`](https://github.com/mcpwarp/ws-mixer-spec/blob/main/docs/WIRE.md)
-for the normative wire spec; this package is always the **answering peer** (client) -- it never
-opens streams, only receives `OPEN` from the server and reads/writes/closes/resets what arrives.
+Expose a local MCP server at a public mcpwarp URL from inside your app: Node 22+, Deno, Bun, the
+Electron main process, and Obsidian, Zotero and browsers through a header-less `webSocket` factory
+(see [Runtimes](#runtimes)). Also a general `ws-mixer.v1` client: N independent byte
+streams multiplexed over one WebSocket (see
+[`ws-mixer-spec`'s `docs/WIRE.md`](https://github.com/mcpwarp/ws-mixer-spec/blob/main/docs/WIRE.md)).
 
-See [`docs/DESIGN.md`](./docs/DESIGN.md) for this SDK's original design (package/library choice, Node
-`Duplex` stream exposure, the event surface) — this README documents the SDK as actually built, which has
-grown a fuller reconnect/disconnect-reason surface than the original design sketch; where they differ,
-this README and the code win.
+| Entry point | What | Runtime |
+|---|---|---|
+| `@mcpwarp/ws-mixer/mcpwarp` | `expose()`: register one MCP server, serve its HTTP requests | any (platform-neutral) |
+| `@mcpwarp/ws-mixer/node` | `expose({ server })` for an `http.Server`/Express app, `toDuplex()`; also re-exports all of `./mcpwarp` (`McpwarpError`, types, codes) plus `ErrorCode`, `WsMixerError`, `TokenUnavailableError`, `WebSocketFactory` | Node (not Bun) |
+| `@mcpwarp/ws-mixer/testing` | `FakeEdge`: an in-process fake of the mcpwarp edge for your tests | any |
+| `@mcpwarp/ws-mixer` | the ws-mixer transport: `connect()`, `MixerStream`, ... | any |
 
 ## Install
 
@@ -16,440 +19,491 @@ this README and the code win.
 npm install @mcpwarp/ws-mixer
 ```
 
-Requires Node >= 20. Zero runtime dependencies besides [`ws`](https://github.com/websockets/ws).
+ESM only, zero runtime dependencies. Node >= 22 (global `WebSocket`); `require()` of the ESM build
+works on Node >= 22.12.
 
-## Usage
+## Quickstart
 
 ```ts
-import { connect } from "@mcpwarp/ws-mixer";
-import { pipeline } from "node:stream/promises";
+import { McpServer, createMcpHandler } from "@modelcontextprotocol/server";
+import { expose } from "@mcpwarp/ws-mixer/mcpwarp";
 
-const client = await connect("wss://edge.mcpwarp.io/v1/tunnel", {
-  token: process.env.MCPWARP_TOKEN!, // string | (() => Promise<string> | string) -- see "Authentication" below
-  meta: { mcpwarp: { v: 1, services: [{ id: "anki", name: "Anki MCP" }] } }, // -> hello.meta
-
-  // A stream arrived. `stream` is a Node Duplex.
-  onStream: async (stream) => {
-    const chunks: Buffer[] = [];
-    for await (const chunk of stream) chunks.push(chunk as Buffer); // reads until EOF (peer's CLOSE)
-    try {
-      const res = await callLocalMcpServer(Buffer.concat(chunks));
-      stream.end(res); // CLOSE
-    } catch (e) {
-      stream.reset(2 /* INTERNAL_ERROR */, String(e));
-    }
-  },
-
-  onApp: (body) => mcpwarp.handleApp(client, body),
-  onDrain: ({ reason, deadlineMs, message }) => log.info({ reason, deadlineMs }, message ?? "server draining"),
-
-  reconnect: { base: 1000, cap: 60_000, connectTimeout: 10_000 },
+const mcp = createMcpHandler(() => {
+  const server = new McpServer({ name: "notes", version: "1.0.0" });
+  // server.registerTool(...)
+  return server;
 });
 
-client.on("welcome", (w) => log.info({ session: w.session }, "connected"));
-client.on("fatal", (e) => { log.error(e); process.exit(1); }); // see "Reconnect semantics" below for the full fatal set
+const handle = await expose({
+  token: process.env.MCPWARP_TOKEN!, // a personal access token, mcpwarp_pat_...
+  name: "notes", // public URL slug
+  integration: "0f6c2a8e-4c1b-4b7e-9a4e-2f1d9b7c3a10", // required: your integration's registration UUID
+  handler: mcp.fetch,
+});
+console.log(handle.url); // https://notes-<username>.mcpwarp.io/mcp
+if (handle.registration?.created) console.log("first time this service was registered");
 
-await client.sendApp({ mcpwarp: { v: 1, op: "unregister", id: "anki" } }); // resolves once written (see caveat below)
-await client.close(); // drain{client_requested}, 5s grace, close 1000
+process.on("SIGTERM", () => void handle.close());
 ```
+
+`expose()` resolves once the service is registered (or disabled from the dashboard: `state`
+`"disabled"`, `url` undefined; the only case in which a resolved handle has no `url`) and rejects
+with a fatal `McpwarpError` if the first connection or first registration fails fatally: a bad
+token is `code: "UNAUTHORIZED"` (the transport's `WsMixerError` as `cause`), a quota or name problem
+carries the register error code (`QUOTA_EXCEEDED`, `INVALID_NAME`, ...), and another instance
+taking the name over before the first registration completes is `code: "TAKEN_OVER"`.
+
+`handle.registration` is `{ url, serverId, created }` from the latest successful register, readable
+right after `await expose()` (the first `registered` event fires before you hold the handle).
+`created` is true only when that register created the service; re-registrations after a reconnect
+or drain report `false`. It is undefined only when `expose()` resolved as disabled and the service
+has not registered since.
+
+Non-fatal failures before that (no network, a wrong `url`, an upgrade the tunnel refuses, a
+transient register error) are retried forever by default, so `expose()` can stay pending. Bound or
+observe it:
+
+```ts
+const handle = await expose({
+  token, name: "notes", integration, handler: mcp.fetch,
+  signal: AbortSignal.timeout(60_000), // or your plugin's unload signal
+  onRetry: ({ attempt, delayMs, reason }) => console.warn(`mcpwarp retry #${attempt} in ${delayMs} ms: ${reason}`),
+  // reconnect: { maxAttempts: 10 }, // also bounds the attempts before the first registration
+});
+```
+
+Aborting `signal` before the first registration rejects `expose()` with an `AbortError` and stops
+the client; aborting it later closes the handle like `handle.close()`. `onRetry` is called before
+every scheduled reconnect and every re-sent register.
+
+## Three adapters
+
+Every public request becomes one ws-mixer stream carrying raw HTTP/1.1, served in the background
+(a slow request never holds up another). Pick the adapter that matches your server:
+
+### `handler`: a fetch-style function (any runtime)
+
+`(request: Request) => Response | Promise<Response>`. The request URL is the public URL
+(`https://notes-<user>.mcpwarp.io/mcp?...`). Fits MCP SDK v2's `createMcpHandler(...).fetch`, v1's
+`WebStandardStreamableHTTPServerTransport.handleRequest`, Hono, or a hand-written function. A
+Zotero-style `handleMCPRequest(body) -> {status, headers, body}` wraps like this:
+
+```ts
+expose({
+  token, name: "zotero", integration,
+  handler: async (req) => {
+    const r = await handleMCPRequest(await req.text());
+    return new Response(r.body, { status: r.status, headers: r.headers });
+  },
+});
+```
+
+A handler that throws (or returns something that is not a `Response`) is answered with `500`; the
+error is emitted on the handle's `error` event.
+
+### `target`: an HTTP server you already run on localhost (any runtime with `fetch`)
+
+```ts
+expose({ token, name: "obsidian", integration, target: "http://127.0.0.1:27123/mcp" });
+```
+
+Requests to the public `/mcp` go to the target URL (target query parameters first, then the
+incoming ones); no other path is forwarded (see "Only `/mcp` is forwarded"). `Host` becomes the
+target's own (local servers, MCP SDK v1's DNS-rebinding protection included, validate it); the public host
+and scheme arrive as `x-forwarded-host` / `x-forwarded-proto: https`. The SDK asks for
+`accept-encoding: identity`, and a response that is compressed anyway is decoded by `fetch` and
+re-served without `content-encoding`. No response headers within `targetTimeoutMs` (default
+30000, at most 2147483647; only valid with `target`): `504`; target unreachable: `502`.
+
+### `server`: an `http.Server` or `(req, res)` listener (Node, not Bun)
+
+```ts
+import express from "express";
+import { expose } from "@mcpwarp/ws-mixer/node";
+
+const app = express();
+app.post("/mcp", (req, res) => { /* ... */ });
+await expose({ token, name: "my-app", integration, server: app });
+```
+
+MCP SDK v1's Node transport:
+
+```ts
+import http from "node:http";
+import { randomUUID } from "node:crypto";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { expose } from "@mcpwarp/ws-mixer/node";
+
+const mcp = new McpServer({ name: "my-app", version: "1.0.0" });
+const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => randomUUID() });
+await mcp.connect(transport);
+await expose({ token, name: "my-app", integration, server: http.createServer((req, res) => void transport.handleRequest(req, res)) });
+```
+
+The server is never `listen()`ed and never modified: each stream is handed as a socket to a
+private `http.Server`, which passes real `IncomingMessage`/`ServerResponse` objects to yours via
+its `request` event. `req.headers.host` is `localhost`, with the public host in `x-forwarded-host`.
+Node's own `Connection`/`Keep-Alive` response headers are removed before the response reaches the
+edge. The body cap below is checked against `Content-Length` up front; a chunked request body is
+cut off once the raw request (chunk framing included) passes the cap plus 64 KiB: `413` if your
+server has not started its response, else the stream is reset. Either way your `req` is aborted
+(`'aborted'`, plus `'error'` if you listen for it) and later `res` writes are dropped.
+
+`server` needs Node's own `http` internals: the private server is fed each stream through
+`emit("connection", socket)`. **It does not work on Bun**, whose `node:http` ignores sockets passed
+that way, so requests would never be answered; `expose({ server })` from `./node` throws an `Error`
+on Bun instead. On Bun, serve on localhost and use `target` (or a fetch-style `handler`).
+
+### Only `/mcp` is forwarded
+
+The public URL is `handle.url` and nothing else is reachable. Only requests whose path is exactly
+`/mcp` reach your app (`handle.path`, for logging). The match is exact and case-sensitive on the
+path alone: `/mcp?x=1` passes, `/mcp/`, `/MCP` and `/healthz` do not. Every other request is
+answered `404 {"error":"not_found"}` by the SDK in all three adapters, before your handler, target
+or server sees it. The `404` comes before the disabled/closing `503`: an unknown path is never
+served, whatever the state. This is not configurable.
+
+### What your server sees
+
+- One HTTP/1.1 request per stream, only for `/mcp` (above): method, path + query, headers, body
+  (Content-Length or chunked, up to `maxRequestBodyBytes`, default 4 MiB; `413` above it).
+- The body cap is the SDK's, applies to all three adapters, and is enforced before your server
+  sees the request, so your own limit only matters below it: `express.json({ limit: "8mb" })`
+  behind the default cap still rejects anything over 4 MiB with the SDK's `413`. Raise
+  `maxRequestBodyBytes` on `expose()` to match.
+- No `Authorization` header: the edge verifies the caller's token and strips the header before
+  forwarding, so **your app's own bearer-token auth cannot be enforced behind the tunnel**. The SDK
+  adds `x-forwarded-host`/`x-forwarded-proto` (`target`, `server`). No `Expect` header and no
+  hop-by-hop headers either.
+- `Host` per adapter as described above.
+- No interim (1xx) response is ever forwarded: the edge would treat it as the final one.
+- Responses stream through: Content-Length when declared, else chunked with one chunk per body
+  read, so SSE (`text/event-stream`) reaches the client event by event.
+- Malformed requests are answered `400`, a request head over 64 KiB `431`, a head not received
+  within 10 s is cancelled, any path other than `/mcp` `404`, and while disabled or closing every
+  request to `/mcp` gets `503`.
+
+## Authentication
+
+`token` is a personal access token (`mcpwarp_pat_...`, e.g. from `process.env.MCPWARP_TOKEN`; the
+SDK never reads the environment itself) or a JWT with audience `https://connect.<domain>`. It can
+also be a provider, `() => string | Promise<string>`, called on every dial. The SDK does **not**
+refresh tokens: a provider that needs refreshing does it itself. Throw `TokenUnavailableError` from
+a provider for a temporary failure (it is retried with backoff instead of being fatal). A rejected
+token ends the exposure (`error{UNAUTHORIZED}` + close `4011`, fatal).
+
+The token travels in `hello.token`, which is what the tunnel checks, and also in the upgrade's
+`Authorization: Bearer` header when the runtime can set one (ws-mixer spec v0.5.0 makes the header
+optional); never in the URL. See "Transport reference: authentication" below for the provider and refresh-retry rules.
+
+## Identity
+
+`integration` is required: your integration's registration UUID. It attributes usage to your
+integration (not to a particular install). It must be a UUID in RFC 4122 text form, the same set
+zod's `z.uuid()` accepts (`xxxxxxxx-xxxx-Mxxx-Nxxx-xxxxxxxxxxxx`, version `M` 1-8, variant `N`
+`8`/`9`/`a`/`b`, any case, or the nil/max UUID); anything else makes `expose()` throw a `TypeError`,
+because the tunnel would drop it without telling anyone. It is sent lowercased in
+`hello.meta = { client: "sdk-js", version, os, integration }` (what the tunnel reads first, and
+the only copy header-less runtimes send) and in the `X-Mcpwarp-Integration` upgrade header.
+
+## Lifecycle and events
+
+`handle.state`: `connecting` -> `registering` -> `registered` (or `disabled`), back to `connecting`
+on every disconnect, then `closing` -> `closed`. `conflict` is sticky: see below.
+
+| Event | When |
+|---|---|
+| `registered` | `{ url, serverId, created }`, after every successful register (the service is re-registered after every reconnect: the edge keeps no state across connections); the latest one is also `handle.registration` |
+| `disabled` | `{ serverId, reason }`: disabled from the dashboard; requests get `503` |
+| `enabled` | `{ serverId }`: re-enabled; the SDK re-registers |
+| `conflict` | `{ serverId, name, reason: "taken_over" }`: another connection of the same account registered this name and now owns it (below) |
+| `error` | non-fatal: a failing handler or response body, a rejected re-registration, a transient register error (retried with backoff 1 s, 2 s, 4 s, ... up to 30 s), an exception thrown by one of your handle listeners |
+| `disconnect` | every transport disconnect (`DisconnectPayload`, see below); the SDK reconnects itself |
+| `close` | once, terminal: `{}` after `close()`, `{ error }` (a `McpwarpError`) after a fatal failure |
+
+Two instances exposing the same `name` under one account: the newer register wins. The tunnel
+RESETs the older instance's open requests and sends it `conflict` (right away on the same tunnel
+pod, up to ~30 s later from another pod). The older handle goes to state `conflict` and stays
+there: it stops serving (any request that still reaches it is RESET), and it never registers
+again, not after a reconnect, a drain or an `enable`. The SDK does not fight for the name; restarting
+the losing instance (or calling `close()` and `expose()` again) is a human's or the app's call, so
+log or surface the event. `close()` still works and skips the unregister (the name is no longer
+held). `url`/`serverId`/`registration` keep their last values, which now belong to the winner. A
+`conflict` that overtakes the first `registered` reply makes `expose()` reject with a fatal
+`McpwarpError` `TAKEN_OVER` instead (the client is closed; no handle, no `conflict` event).
+
+A server-side drain is transparent: in-flight requests finish on the old connection while new ones
+go to the replacement. `handle.close()` unregisters (2 s budget), then closes the connection
+(`drain{client_requested}`, up to 5 s for in-flight requests, close 1000). `handle.client` is the
+underlying `MixerClient` (stats, events).
+
+## Runtimes
+
+| Runtime | Status |
+|---|---|
+| Node >= 22, Deno, Bun | full: the global `WebSocket` sends the `Authorization` header |
+| Electron (main) | as Node |
+| VS Code desktop extension host | as Node: a plain Node process (no `window`), so use the default factory. Needs a VS Code whose Node has the global `WebSocket` (Node >= 22); on older builds the default factory fails fatally with a clear message |
+| Obsidian / Electron renderer, VS Code for the web, browsers, Zotero 7 | need `webSocket: webSocketFactory(win.WebSocket, { headers: false })` (Zotero's plugin sandbox has no global `WebSocket`; use the main window's). These runtimes cannot set upgrade headers, so neither `Authorization` nor `X-Mcpwarp-Integration` is sent; the tunnel authenticates on `hello.token` and reads the integration from `hello.meta` (ws-mixer spec v0.5.0, mcpwarp tunnel 0.5.0). A refused upgrade (429, 503, ...) looks like a network failure and is retried, so pass `signal`/`onRetry` (above) |
+
+The default factory passes `{ protocols, headers }` only to a `WebSocket` known to accept it
+(Node's, Deno's, Bun's); an Electron renderer is detected as such even though it has `process`.
+`webSocketFactory(ctor)` (headers) takes a constructor accepting that init object;
+`webSocketFactory(ctor, { headers: false })` takes any standard one (`typeof WebSocket` from the DOM lib).
+
+The detection guesses from the global `WebSocket`. The `ws` package's class (or a subclass of it)
+is recognised as a non-native constructor with `ping`/`terminate` on its prototype and `ws`'s
+statics (`createWebSocketStream`, `Server` or `WebSocketServer`), and is called as `new
+WebSocket(url, protocols, { headers })`; this applies to a global replaced by `ws` and to
+`webSocketFactory(ws)`. Bun's own `WebSocket` also has `ping`/`terminate` but is native and has none
+of those statics, so it gets the `{ protocols, headers }` init object it reads headers from. A bound
+or `Proxy`-wrapped global looks native, so under Node its headers are silently dropped: pass a
+`webSocket` factory there.
+
+`target`/`handler` need `Request`/`Response`/`Headers`/`TextEncoder` (all present in Zotero's
+sandbox); `target` also needs `fetch`.
+
+Browser-class runtimes always send an `Origin` upgrade header the app cannot control (Gecko chrome
+windows, e.g. Zotero, send `Origin: null`). An edge that enforces same-origin on the ws-mixer endpoint
+rejects that upgrade with 403, which the SDK sees as a generic connection failure and retries. The
+mcpwarp tunnel accepts any `Origin` because the token in `hello` is the credential; if you run your
+own ws-mixer edge, do the same (e.g. `OriginPatterns` in coder/websocket for a Go server).
+
+Runtime/OS detection reads `process`, `Deno` or `navigator`; a sandbox with none of them reports
+`unknown`. Pass `agent` to `expose()` to say what it is (sent in `hello.agent`, `hello.meta.os` and the
+`User-Agent` where headers are sent), e.g. in Zotero `agent: { runtime: "zotero", os: Services.appinfo.OS }`.
+
+## Testing your integration
+
+```ts
+import { FakeEdge } from "@mcpwarp/ws-mixer/testing";
+import { expose } from "@mcpwarp/ws-mixer/mcpwarp";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+
+const edge = new FakeEdge();
+await edge.start();
+const handle = await expose({ url: edge.url, webSocket: edge.webSocket, token: "test", name: "notes", integration, handler: mcp.fetch });
+
+const client = new Client({ name: "test", version: "1.0.0" });
+await client.connect(new StreamableHTTPClientTransport(new URL(edge.publicUrl("notes")), { fetch: edge.fetch }));
+console.log(await client.listTools());
+
+await client.close();
+await handle.close();
+await edge.stop();
+```
+
+`FakeEdge` runs in memory (no sockets): `edge.fetch` writes each request onto a ws-mixer stream as
+raw HTTP/1.1 exactly like the real edge, and rejects any 1xx response. It records `upgrades`,
+`hellos` and `appLog`, and can `disable(name)`/`enable(name)`, `failRegister(name, error)`,
+`rejectNextUpgrade(status)`, `drain()`, `closeConnection()` and `appError()` to exercise the paths
+your integration must survive. `fetch` needs global `ReadableStream`/`Response`.
+
+## Transport reference
+
+### `connect()`
+
+```ts
+import { connect, type MixerStream } from "@mcpwarp/ws-mixer";
+
+const client = await connect("wss://connect.example.com", {
+  token: process.env.TOKEN!, // string | (() => Promise<string> | string)
+  meta: { app: "demo" }, // -> hello.meta
+  onStream: (stream) => {
+    void serve(stream); // return fast: see "Handler delivery"
+  },
+  onApp: (body) => console.log("app", body),
+  onDrain: ({ reason }) => console.log("draining", reason),
+  onDisconnect: (r) => console.warn(r.phase, r.message),
+  reconnect: { base: 1000, cap: 60_000, connectTimeout: 10_000, stableAfter: 10_000 },
+});
+
+async function serve(stream: MixerStream): Promise<void> {
+  const chunks: Uint8Array[] = [];
+  for await (const chunk of stream) chunks.push(chunk); // until the peer's CLOSE
+  try {
+    await stream.write(`got ${chunks.length} chunks`);
+    await stream.closeWrite(); // CLOSE
+  } catch {
+    stream.reset("INTERNAL_ERROR", "failed");
+  }
+}
+
+await client.sendApp({ hello: "world" }); // resolves once handed to the socket
+await client.close(); // drain{client_requested}, 5 s grace, close 1000
+```
+
+`webSocket` (a `WebSocketFactory`) replaces the default `defaultWebSocketFactory` (the global
+`WebSocket`, with headers where the runtime supports them). A factory can expose a rejected
+upgrade's HTTP status as `socket.upgradeFailure`; a standard WebSocket never can.
+
+`MixerClient`/`MixerConn` are small platform-neutral emitters with the same method names as Node's
+`EventEmitter` (`on`/`once`/`off`/`emit`/`listenerCount`), and work with `events.once()`.
+
+### `MixerStream`
+
+| Member | |
+|---|---|
+| `read(): Promise<Uint8Array \| null>` | next chunk; `null` at clean EOF (peer CLOSE, buffer drained); rejects after a RESET or a lost connection. Credit is returned as you read. |
+| `[Symbol.asyncIterator]` | `for await (const chunk of stream)` |
+| `write(chunk: Uint8Array \| string): Promise<void>` | serialized, waits for send credit (16 KiB DATA frames); resolves once handed to the socket |
+| `closeWrite(): Promise<void>` | half-close: refuses new writes, flushes queued ones, then sends CLOSE |
+| `reset(code, message?)` | RESET both ways (`code` numeric or a wire name like `"CANCEL"`); discards buffers |
+| `close()` | `closeWrite()` if the peer already CLOSE'd, else `reset("CANCEL")` |
+| `refuse()` | `reset("REFUSED_STREAM")` |
+| `closed: Promise<StreamCloseReason>` | never rejects: `{kind:"finished"}`, `{kind:"reset", code, name, message, byPeer}`, or `{kind:"connection_lost", error}`; buffered data stays readable |
+| `getState()`, `getSendWindow()`, `getRecvWindow()`, `resetCode` | inspection |
+
+`toWebStreams(stream)` returns `{ readable, writable }` WHATWG streams; `toDuplex(stream)` from
+`@mcpwarp/ws-mixer/node` returns a Node `Duplex`.
 
 ### Handler delivery
 
 `onStream`/`onApp`/`onDrain` are delivered in wire order from **one** delivery loop per connection,
-one at a time -- never concurrently with each other or with themselves; a slow handler holds up the
-next queued event, exactly like a blocking handler would in any single-threaded event loop.
+one at a time; a returned promise is awaited before the next event. **Return quickly from
+`onStream`** and serve the stream in the background: a handler that awaits the whole exchange
+blocks every other stream.
 
-An event already received when the connection ends is still owed to its handler: `error{}` is
-always the *last* message on the wire, so a stream `OPEN`/`app`/`drain` queued ahead of it arrived
-before the connection ended and is still delivered, even after `close()`/the underlying `MixerConn`
-has already torn down. Concretely: **a handler MAY still fire shortly after `client.close()` (or
-`close({message})`)'s own promise has already resolved -- or after `onDisconnect`/the `'close'` event
-already reported that disconnect**, for a message that arrived before it. A `drain` delivered this
-way never starts a reconnect for a connection that is no longer the live one: on a client that is
-already closing/closed it never does (an app-initiated shutdown); on a conn that instead died for
-an *unrelated* reason while the `drain` was still queued behind a blocked handler, its own `'close'`
-handler already ran and already scheduled the real reconnect before the flushed `drain` is ever
-delivered, so it's skipped there too -- the `drain` is still delivered to `onDrain`, only the
-reconnect it would otherwise trigger is suppressed. A stream `OPEN` delivered this way hands the app
-a stream that is already dead -- its read/write fails promptly with an error rather than hanging
-(see "In-flight streams are lost on reconnect" below). A handler that throws or rejects mid-flush
-doesn't stop the rest of the backlog from being delivered, and never produces an unhandled rejection
-(`onDisconnect`'s "loud" guarantee holds for a handler failure too -- see
-`client.stats().handlerErrors`, "Counters" below).
+An event already received when the connection ends is still owed to its handler (`error{}` is
+always the last message on the wire), so a handler MAY fire shortly after `close()` resolved or
+after `onDisconnect` reported the disconnect. A stream delivered that way has already ended: its
+reads and writes fail promptly. A `drain` delivered that way never starts a reconnect for a
+connection that is no longer the live one. A handler that throws or rejects is counted
+(`stats().handlerErrors`), surfaced as `handlerError` on the conn, and never stops delivery.
 
-## Authentication
+### Transport reference: authentication
 
-`token` is either a static string, or a provider callback (`() => string | Promise<string>`)
-called **fresh on every dial** -- initial connect and every reconnect, never cached. This is the
-shape to reach for whenever the token is short-lived (a Keycloak/OIDC access token, for example):
+`token` is a static string or a provider called **fresh on every dial** (never cached):
 
 ```ts
-import { connect } from "@mcpwarp/ws-mixer";
-
-let cached: { token: string; expiresAt: number } | null = null;
-
 async function getToken(): Promise<string> {
-  if (cached && cached.expiresAt > Date.now() + 5000) return cached.token;
-  const res = await fetch(`${process.env.KEYCLOAK_URL}/realms/mcpwarp/protocol/openid-connect/token`, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      grant_type: "client_credentials",
-      client_id: process.env.KEYCLOAK_CLIENT_ID!,
-      client_secret: process.env.KEYCLOAK_CLIENT_SECRET!,
-    }),
+  const res = await fetch(`${process.env.AUTH_URL}/token`, { method: "POST" }).catch((e) => {
+    throw new TokenUnavailableError("token endpoint unreachable", { cause: e }); // retried
   });
-  if (!res.ok) throw new Error(`token refresh failed: ${res.status}`);
-  const body = (await res.json()) as { access_token: string; expires_in: number };
-  cached = { token: body.access_token, expiresAt: Date.now() + body.expires_in * 1000 };
-  return cached.token;
-}
-
-const client = await connect("wss://edge.mcpwarp.io/v1/tunnel", { token: getToken, /* ... */ });
-```
-
-A provider that throws or rejects is **fatal** by default: no retry, and the thrown/rejected
-error is surfaced verbatim as `DisconnectReason.cause` (`message` is copied from `error.message`).
-
-If the provider merely *couldn't obtain* a token for a temporary reason -- the network isn't back
-yet after a laptop wakes, or the auth server is briefly unreachable while refreshing an expired
-token -- throw or reject with a `TokenUnavailableError` instead (directly, or wrapped via `cause`)
-to opt that one failure into the same treatment as a failed dial (a non-fatal report, normal
-backoff) rather than going fatal:
-
-```ts
-import { TokenUnavailableError } from "@mcpwarp/ws-mixer";
-
-async function getToken(): Promise<string> {
-  const res = await fetch(`${process.env.KEYCLOAK_URL}/realms/mcpwarp/protocol/openid-connect/token`, {
-    method: "POST",
-    /* ... */
-  }).catch((e) => {
-    throw new TokenUnavailableError("token refresh unreachable", { cause: e });
-  });
-  if (!res.ok) throw new Error(`token refresh failed: ${res.status}`); // an HTTP 4xx/5xx is NOT retried
-  return (await res.json()).access_token;
+  if (!res.ok) throw new Error(`token refresh failed: ${res.status}`); // fatal
+  return ((await res.json()) as { access_token: string }).access_token;
 }
 ```
 
-Detection is deliberately `instanceof TokenUnavailableError` only (following `cause` up to 10 links
-deep, never a duck-typed property or method): an accidental match on some unrelated library's error
-must never turn a genuinely fatal provider failure into an endless retry loop. Because detection is
-`instanceof`, import `TokenUnavailableError` from the same installed copy of `@mcpwarp/ws-mixer` the
-client itself comes from -- a duplicated install (a dedupe miss, or a bundle containing both the ESM
-and CJS builds) makes a marked failure look unmarked, i.e. fatal.
+A provider that throws or rejects is **fatal** unless the error is (or has in its `cause` chain, up
+to 10 links) a `TokenUnavailableError` -- detected by `instanceof` only, so import it from the same
+installed copy of this package. A marked failure is treated like a failed dial (non-fatal report,
+normal backoff).
 
-**A pre-`welcome` token rejection gets exactly one immediate refresh-retry -- but only when `token`
-is a provider, and it's ONE budget shared across both rejection shapes:**
+A pre-`welcome` token rejection -- an HTTP `401` on the upgrade (only visible through a factory
+that sets `upgradeFailure`) or a handshake-phase `4011` (`error{code:11}` + close, or a bare
+close) -- gets **one** immediate refresh-retry when `token` is a provider; the second rejection, in
+either shape, is fatal. A static string is fatal on the first. The budget re-arms only at stability
+(below). HTTP `403`/`404` (again only via `upgradeFailure`) are always fatal.
 
-- An HTTP 401 on the upgrade (the **dial** phase).
-- A handshake-phase close carrying `UNAUTHORIZED` (`4011`) -- whether that's the normative
-  `error{code:11}` + close `4011` rejection, or a bare `4011` close with no `error{}` at all.
+### Reconnect semantics
 
-Either shape, on the first rejection, makes the SDK call the provider again and redial immediately
-(no backoff). This is deliberately **not** gated by `reconnect.maxAttempts`/reconnect being disabled
-(the rejected-token rule applies to the very first connect too, not only reconnects), and it does
-**not** itself increment the attempt counter -- it's an immediate redial within the same connect
-attempt, not a new reconnect cycle. A **second** rejection -- in *either* shape, so `401` then `4011`,
-or `4011` then `401`, counts just the same as two of the same shape -- is fatal, and nothing is
-reported for the first rejection (only the final outcome is). If the retry's own dial instead fails
-for an unrelated, non-auth reason (a network error, an HTTP 5xx, a transport death before `welcome`),
-that is *not* "a second rejection": it takes the ordinary recoverable path (a non-fatal report,
-normal backoff) -- but the refresh-retry budget stays spent (see below), so a genuine token rejection
-on some later cycle, before the client ever goes stable, is fatal with no further refresh.
-A **static string** `token` skips the retry entirely and is fatal on the very first rejection, of any
-of the three forms above, since there is nothing to refresh. HTTP `403`/`404` are always fatal, with
-no retry, provider or not.
-
-This retry budget is a client-level flag, not reset on every dial: it re-arms only once the
-connection reaches **stability** (`reconnect.stableAfter` past `welcome` -- see "Reconnect semantics"
-below), the same as the `4013` KEEPALIVE_TIMEOUT one-shot retry. Otherwise a server that welcomes and
-then closes shortly after could make the client hit the token endpoint on every single reconnect
-cycle forever. After a long, healthy (stable) session, the budget is available again -- an ordinary
-token expiry on some later reconnect still gets its one retry.
-
-## Reconnect semantics
-
-`connect()` resolves once the first `welcome` completes (and **rejects** if that never happens --
-a fatal close/HTTP status, or `maxAttempts` exhausted before any connection ever succeeded). After
-that, `MixerClient` owns a persistent reconnect loop, a single state machine
-(`idle -> dialing -> connected -> backoff -> ...`, terminating in `closed`) driven entirely by
-`src/client.ts` and WIRE.md section 2.9.
-
-Three phases, referenced throughout this section and in `DisconnectReason.phase`:
-
-- **`dial`**: resolving the token and opening the WebSocket, up to and including the HTTP upgrade
-  response (the 101, or a rejecting status like `401`/`403`/`404`/`429`).
-- **`handshake`**: after the 101, sending `hello` and waiting for `welcome` (or a rejection --
-  `error{}` and/or a WS close -- instead).
-- **`connected`**: after `welcome` has been received and validated.
+`connect()` resolves on the first `welcome` and rejects if that never happens (fatal failure, or
+`maxAttempts` exhausted first). After that `MixerClient` reconnects on its own. Phases, also in
+`DisconnectReason.phase`: **`dial`** (token + WebSocket open), **`handshake`** (`hello` ->
+`welcome`), **`connected`**.
 
 | Trigger | Policy |
 |---|---|
-| Normal disconnect (1006, 5xx, timeouts, SDK-side protocol errors 4001/4003/4004, ...) | AWS "full jitter": `delay = random(0, min(cap, base * 2^attempt))`, base 1000ms, cap 60000ms. The attempt counter (and every once-only retry budget it gates, e.g. the `4013`/auth-rejection retries below) resets only once a connection has stayed up `reconnect.stableAfter` ms past `welcome` -- **never** on `welcome` itself, and never on a bare TCP connect/101. See `stableAfter` below. |
-| `drain` received | New connection **immediately and in parallel** (jitter `random(0, 2000)ms` only), before the old socket closes. The old connection is torn down as soon as the replacement's `welcome` lands. Stability for the replacement is measured from *its own* `welcome`, independent of the connection it replaced. If `reconnect.maxAttempts` is `0` (reconnecting disabled), no parallel connection is started: the conn is left alone, in-flight streams finish normally, and once the server's own deadline closes it with `4012` that close is reported once as a fatal disconnect (`"drained; reconnect disabled"`). |
-| Close `4012` (`GOING_AWAY`) or `1001`, with no preceding `drain` | Same immediate-reconnect treatment as `drain` (unless it *is* the eventual close of a `drain` received with `reconnect.maxAttempts: 0`, per the row above). |
-| Close `4013` (`KEEPALIVE_TIMEOUT`) | **One** immediate retry (no delay); if that retry itself fails to connect, falls back to normal backoff. This is a once-only budget, re-armed only at stability (see the first row). |
-| Close `4009` (`ENHANCE_YOUR_CALM`) | Backoff starts **at the cap**, not at `base` -- an explicit "the server refused this on purpose, back off hard immediately" signal, not a workaround for anything about the attempt counter's own reset timing. |
-| HTTP `429` during the dial, with a `Retry-After` header | Honoured verbatim (seconds or an HTTP-date) instead of the usual jitter. |
-| A pre-`welcome` token rejection (HTTP `401` on the upgrade, or handshake-phase `4011`), with a token provider present, and the once-only refresh-retry budget not yet spent | One immediate refresh-retry: the provider is called again and the dial redialed right away (no backoff). Unlike every other row here, this is **not** gated by `reconnect.maxAttempts`/reconnect being disabled (it applies to the very first connect too, and matches `ws-mixer-go`'s own `dialAndHandshake`), and it does **not** itself increment the attempt counter -- it's an immediate redial within the same connect attempt, not a new reconnect cycle. See "Authentication" above -- this is ONE budget shared by both rejection shapes. |
-| Close `4010` (`UNSUPPORTED`) in any phase; close `4011` (`UNAUTHORIZED`) *after* `welcome`; a pre-`welcome` token rejection (`401`/`4011`) on its second occurrence with a token provider, or on its very first occurrence with a static string; HTTP `403`/`404`; missing/mismatched subprotocol echo; a token provider that throws/rejects an UNMARKED error | **Fatal.** Surfaced on the `fatal` event and via `onDisconnect({ ..., fatal: true })`; `close()` is issued; **never retried**. `connect()` rejects if this happens before any `welcome`. |
-| A token provider that throws/rejects a `TokenUnavailableError` (directly, or reachable via `cause`) | Treated exactly like a failed dial: phase `"dial"`, `fatal: false`, normal full-jitter backoff via the ordinary path -- it counts as a failed attempt (`reconnect.maxAttempts` applies, the stability rule is unaffected). Not gated by whether `token` is a provider or static string. See "Authentication" above. |
-| Close `4014` (`APPLICATION_CLOSE`), connected phase | Same "start at the cap" treatment as `4009` above (WIRE.md section 2.9): it is by nature sent *after* `welcome` (the app accepted, then refused -- e.g. a per-account connection cap) -- another "refused on purpose" signal, handled the same way regardless of how recently the attempt counter last reset. Applies to both the `error{14}+close` and bare-`4014` shapes. Never emitted by ws-mixer itself -- reserved for the application above to close a connection for its own reason (the reason text is in `error.message`/the WS close reason). See `close({ message })` below. A **handshake-phase** `4014` (before `welcome`) is not special-cased: it follows the ordinary handshake-failure path, where the attempt counter climbs normally. |
-| `reconnect.maxAttempts` exhausted | Stops reconnecting. `connect()` rejects if it never connected once. `maxAttempts` counts *consecutive reconnect attempts without a stable connection in between* -- since the attempt counter itself only resets at stability (see below), a server that always welcomes and then disconnects before a connection ever proves stable exhausts this ceiling and goes fatal exactly like a server that never welcomes at all. |
-| `close()` called while a dial is in flight | The in-flight socket is closed as soon as the dial resolves; nothing reconnects afterward. |
+| Normal disconnect (1006, timeouts, 4001/4003/4004, ...) | full jitter: `random(0, min(cap, base * 2^attempt))`, base 1000 ms, cap 60000 ms. The attempt counter (and the once-only budgets below) resets only at stability, never on `welcome` itself. |
+| `drain` received | new connection **immediately and in parallel** (jitter 0-2 s). Once it welcomes, new streams go there and the drained connection keeps serving its in-flight streams until they finish (then closes itself, `1000`) or `deadline_ms` + 1 s passes (its remaining streams end with `StreamError(CANCEL, "connection drained")`), whichever comes first; the server's own deadline close `4012` may come first. Its end is reported once, non-fatal, without another reconnect. With `maxAttempts: 0` no parallel connection is started; the server's `4012` is then reported once as fatal (`"drained; reconnect disabled"`). |
+| Close `4012`/`1001` without `drain` | immediate reconnect (0-2 s jitter), counts toward `maxAttempts` |
+| Close `4013` (`KEEPALIVE_TIMEOUT`) | one immediate retry, then normal backoff (once-only budget) |
+| Close `4009` (`ENHANCE_YOUR_CALM`), connected-phase `4014` (`APPLICATION_CLOSE`) | backoff starts **at the cap** |
+| `upgradeFailure` 429 with `Retry-After` | honoured verbatim |
+| Pre-`welcome` token rejection, provider, budget unspent | one immediate refresh-retry (see above) |
+| Close `4010` any phase; `4011` after `welcome`; a final token rejection; `upgradeFailure` 403/404; missing subprotocol echo; an unmarked provider throw; a factory that throws (e.g. no global `WebSocket`) | **fatal**: `fatal` event, `onDisconnect({fatal: true})`, never retried |
+| `maxAttempts` exhausted | stop; one merged fatal report |
+
+With a standard WebSocket a rejected upgrade (401, 429, 503, ...) is indistinguishable from a
+network failure: it is a retried, non-fatal dial failure without `httpStatus`. The standard API
+exposes no response headers either, so a `Retry-After` (the mcpwarp tunnel sends one with its
+pre-upgrade `429` rate limit and `503` handshake cap) cannot be read: the SDK's own backoff
+applies instead, and `onRetry` sees each attempt. The mcpwarp tunnel's real token check happens at
+`hello` (`4011`), which is fatal everywhere.
+
+**In-flight streams are lost on reconnect** (no resumption). A stream still open when its
+connection ends delivers what was already buffered, then: a clean `null` if the peer's CLOSE had
+arrived, otherwise a rejected read (`ConnError`); its `closed` reports `connection_lost`. A peer
+RESET always discards buffered data.
 
 ### Stability and `reconnect.stableAfter`
 
-`reconnect.stableAfter` (default `10000`ms) is how long a connection must stay up past `welcome`
-before it's considered **stable** (WIRE.md section 2.9's `stable`). Only once a
-connection reaches stability does the SDK reset:
-
-- The backoff attempt counter (`attempt`), which drives both the full-jitter delay's ceiling and
-  `reconnect.maxAttempts`'s exhaustion check.
-- The `4013` KEEPALIVE_TIMEOUT one-shot immediate-retry budget.
-- The pre-`welcome` token-rejection one-shot refresh-retry budget (see "Authentication" above).
-
-None of these reset on `welcome` itself, or on a bare TCP connect/101 -- a server that welcomes and
-then disconnects shortly after (whether that's a flaky server, a load balancer resetting connections,
-or a token-endpoint-hostile actor exploiting the refresh-retry) would otherwise reset them every
-single cycle, turning backoff into a redial-roughly-once-a-second loop forever instead of actually
-backing off, and could repeatedly burn the auth refresh-retry against a token service that's never
-going to accept the same rejected credential anyway. Stability is tracked **per connection**: a
-`drain` hand-over's retired (old) connection ending, however long after its replacement's own
-`welcome`, never resets or clears the replacement's own stability timer -- only that specific
-connection ending (while it's still the active one) does.
-
-Must be a finite number `>= 0` -- the constructor throws a `RangeError` synchronously otherwise
-(the same validation style as `close()`'s `code`), since a non-finite or negative value would
-silently disable this entirely (Node just clamps `setTimeout`'s delay to ~1ms rather than rejecting
-it). `0` itself stays legal and well-defined: it reproduces the pre-0.4 "reset on `welcome`"
-behaviour, since the stability timer then fires on the very next tick after `welcome` regardless of
-whether the connection is still up.
-
-**Differs from `ws-mixer-go`:** here, `stableAfter: 0` means "no stability window" (see above). In
-the Go SDK, `ReconnectOptions.StableAfter: 0` instead means "unset" and falls back to the 10s
-default, the same way `Base`/`Cap`/`ConnectTimeout: 0` do there. A `0` config value is **not**
-portable between the two SDKs; to genuinely disable the stability window in Go, nothing short of a
-very small positive duration achieves it.
-
-```ts
-reconnect: { base: 1000, cap: 60_000, connectTimeout: 10_000, stableAfter: 10_000 }
-```
-
-Also true regardless of trigger:
-
-- On every replacement, the connection being retired (a `drain`-superseded connection, or one torn
-  down by `close()` mid-handshake) is fully closed, and its timers and listeners go with it. Its
-  retirement is not itself reported as a disconnect (the client stays connected throughout, via the
-  replacement); every in-flight stream on it gets a stream-scoped `StreamError(CANCEL, "connection
-  drained")`, not a connection-level error.
-- **In-flight streams are lost on reconnect.** There is no resumption: stream ids, buffers and
-  credit all restart from zero on the new connection. A handler must be able to tell "the
-  response ended" (`end`/EOF) from "the tunnel died" -- this SDK does not paper over the
-  difference; retry is the application's job.
-
-  Whether a stream still open when the connection ends ends cleanly or with an error depends on
-  whether the peer's own `CLOSE` for **that stream** had already arrived, per WIRE.md's "`CLOSE`
-  preserves buffered data; `RESET` discards it" rule:
-  - The peer's `CLOSE` had already arrived (its read side had already legitimately finished on the
-    wire, independent of the connection dying): the response DID complete. Whatever was buffered is
-    still delivered, `'end'` still fires once it's drained, and no `'error'` event fires -- exactly
-    as if the connection hadn't died. Only the **write** side fails: a write already pending, or
-    started afterward, fails (its callback receives the connection's `ConnError`, or
-    `StreamError(CANCEL, "connection drained")` on a drain hand-over) instead of hanging or silently
-    succeeding, since the connection is gone even though this stream's response was already
-    complete. `stream.errored` stays `null` unless such a write failed, in which case Node's own
-    Writable machinery sets it to that same error. If this side had also already closed its
-    write side (`closeWrite()`/`end()`), the stream's exchange was complete before the connection
-    died: a write fails with its own `StreamError(STREAM_CLOSED)` (or its own socket error) instead.
-    When the callback is called: with nothing left unread, as part of the teardown, and `'close'`
-    fires then too; with data still unread, only once the reader drains it and `'end'` fires (an
-    error any earlier would discard that data and suppress `'end'`), or when the app calls
-    `destroy()`/`reset()`. A stream with unread data that nobody ever reads keeps both pending until
-    the app does one or the other. The connection tracks a stream CLOSE'd both ways only weakly,
-    except while it owes a write callback: one the app dropped with no write pending may be
-    garbage-collected before the teardown, and then its `'close'` listeners never run.
-  - Otherwise (a peer `RESET`, or the connection ending abnormally -- `1006`, or any other way other
-    than that stream's own clean `CLOSE` -- with this stream's read side never having legitimately
-    finished): the stream always ends with an error, never a false clean end. `stream.errored`
-    carries it and `'close'` fires, whether or not the consumer attached an `'error'` listener (one
-    with only `'data'`/`'end'`/`'close'` listeners never sees `'end'` for this case, only `'close'`);
-    a read or write already pending, or started afterward, fails promptly instead of hanging. A peer
-    `RESET` always discards whatever was buffered, even if this stream's `CLOSE` had *also* already
-    arrived (WIRE.md: `RESET` always wins).
+`stableAfter` (default 10000 ms) is how long a connection must stay up past **its own** `welcome`
+before the attempt counter, the `4013` one-shot retry and the token refresh-retry budget reset. A
+server that welcomes and then disconnects can therefore not turn backoff into a tight loop. Must be
+a finite number `>= 0` (`RangeError` otherwise); `0` resets on the next tick. Differs from
+`ws-mixer-go`, where `StableAfter: 0` means "use the default".
 
 ### Disconnect reason shape
 
-Every disconnect, recoverable or fatal, is reported the same way -- to `onDisconnect(reason)` and
-the `'close'` event -- as **exactly one** `DisconnectReason` object. In particular, when a failure is
-also the one that exhausts `reconnect.maxAttempts`, that's still a single report: `fatal: true`, the
-exhaustion message, but carrying the underlying failure's `wsCode`/`errorCode`/`httpStatus`/`cause` --
-never a first report for the failure followed by a second one for giving up.
+Every disconnect is reported exactly once to `onDisconnect(reason)` and the client's `close` event.
 
 | Field | Meaning |
 |---|---|
-| `phase` | `"dial"` (opening the socket / the auth handshake), `"handshake"` (`hello`/`welcome` after the socket opened), or `"connected"` (after `welcome`). Always present. |
-| `wsCode` | The WebSocket close code, when a WS close occurred (including the SDK's own locally-generated code for a close it initiated itself, e.g. `4001` for a hello/welcome timeout). When derived from a ws-mixer error (this side's own error, or a peer's `error{code}`), this is always the semantic `4000+error_code` -- for a `code > 999` that differs from the `4002` actually sent on the wire (illegal WS close codes are clamped; see `errorCode`, which always keeps the real, unclamped value). When instead observed directly from a bare close frame with no preceding `error{}`, `wsCode` is exactly what was on the wire. |
-| `errorCode` | The ws-mixer error code (WIRE.md section 2.8), present under exactly three conditions (D-2026-09-20-09): a ws-mixer `error{}` preceded the close; the close carries a **bare** ws-mixer close code in `4001`-`4999` (derived mechanically as `wsCode - 4000`); or the SDK itself raised a ws-mixer error locally, with no close frame involved yet (a missing/mismatched subprotocol echo -> `UNSUPPORTED`, the welcome timeout -> `PROTOCOL_ERROR`, and the SDK's own other protocol-violation failures). **Never** synthesised for anything else: an HTTP upgrade rejection (401/403/404/429) is `httpStatus` alone, and an abnormal closure (`1006`) or other non-ws-mixer close code (`1000`, `1001`, `1009`, `1011`, ...) carries neither. Also absent for a token-provider throw/reject: that's an application error, not a wire error. |
-| `errorName` | That error code's wire name (e.g. `"KEEPALIVE_TIMEOUT"`). |
-| `httpStatus` | The HTTP status of the upgrade response, when the dial failed at the HTTP layer (401/403/404/429). |
-| `fatal` | Whether the SDK will never reconnect after this (includes `reconnect.maxAttempts` exhaustion). |
-| `message` | Human-readable description; never empty -- a close observed with no reason at all (from the peer, or `ws` itself) still falls back to a description like `"socket closed with code 4014"`. |
-| `closeReason` | The reason field of the close frame **received from the peer**, verbatim -- never this side's own outgoing reason. Absent or empty whenever no reason was received from the peer: an abnormal closure (no close frame at all), this side having initiated the close itself (a peer's echo carries no information and RFC 6455 doesn't require it to copy the reason), or the SDK closing on a peer's `error{}` without reading whatever close frame follows it (WIRE.md section 2.7 allows "logs, surfaces and closes"). The human-readable text is in `message` for all of those cases instead -- consumers SHOULD prefer `closeReason` and fall back to `message`. |
-| `cause` | The token provider's thrown/rejected error, when that's why the dial failed (including a `TokenUnavailableError`-marked, non-fatal one). |
+| `phase` | `"dial"`, `"handshake"` or `"connected"` |
+| `wsCode` | the WebSocket close code, when a close occurred; the semantic `4000+error_code` when derived from a ws-mixer error (an illegal code is clamped to `4002` on the wire only) |
+| `errorCode` / `errorName` | the ws-mixer error code and its name, when one applies: a preceding `error{}`, a bare `4001`-`4999` close, or an SDK-raised error. Never for an HTTP rejection, `1006` or other non-ws-mixer codes, or a provider failure |
+| `httpStatus` | the upgrade's HTTP status -- only when the `webSocket` factory exposes it (`upgradeFailure`); the default backend never sets it |
+| `fatal` | the SDK will not reconnect |
+| `message` | never empty |
+| `closeReason` | the reason of the close frame **received from the peer**, verbatim; never this side's own |
+| `cause` | the token provider's (or factory's) thrown error |
+| `protocolError`, `code`, `name` | set for `4001`/`4003`/`4004` (an SDK bug) |
 
-`sendApp()` returns a `Promise<void>` that resolves once the frame is actually written to the
-socket (`docs/DESIGN.md`), or rejects with the connection's terminal error if the connection
-fails before it gets there -- `conn.ts`'s control queue carries a resolver per queued frame the same
-way `sendData()`'s per-stream outbox already does for stream bytes.
+### Application close
 
-### Application-initiated close
-
-`close()` normally performs the default graceful shutdown shown above (`drain{client_requested}`,
-a grace period, then close `1000`). Pass `{ message }` instead to close the connection with
-`APPLICATION_CLOSE` (`0x0e`/WS close `4014` -- the only code an application may close a *connection*
-with, WIRE.md section 2.8; there is no caller-chosen code, D-2026-09-25-01): `error{code: 14,
-message}` on stream 0, then WS close `4014` with `message` truncated to 123 UTF-8 bytes on a
-character boundary, then the socket -- no `drain`, no grace period, and no reconnect is scheduled
-(matches the default `close()`'s one-report-then-done shape).
-
-```ts
-await client.close({ message: "operator requested shutdown" });
-```
+`close({ message })` closes with `APPLICATION_CLOSE` (`error{code:14, message}`, WS close `4014`,
+message truncated to 123 UTF-8 bytes) instead of the graceful drain; no reconnect.
 
 ### Errors
 
-`WsMixerError` (and its `ConnError`/`StreamError` subclasses) is the single error type this SDK
-throws or emits (`'error'`/`'fatal'`, and every `Promise` rejection). Its `wsCode`/`closeReason`
-fields exist for the same reason as the identically-named `DisconnectReason` fields above -- set
-only when this particular error was built from an actually-observed close frame (as opposed to a
-locally-raised protocol violation), and under the same "never this side's own outgoing reason" rule
-as `closeReason`.
+`WsMixerError` and its subclasses are what the transport throws, emits and rejects with. On a
+stream: `ConnError` -- the connection under it ended (the connection's own terminal error is kept as
+`cause`; `code`/`wsCode`/`closeReason` copied); `StreamError` -- this stream alone was reset (peer
+RESET, the app's own `reset()`/`close()`, a write after `closeWrite()` (`STREAM_CLOSED`), or a
+drain deadline (`CANCEL`, `"connection drained"`)). The `fatal` event's `code` is `INTERNAL_ERROR`
+whenever no ws-mixer code applies; branch on the disconnect reason's fields instead. `./mcpwarp`
+reports with `McpwarpError` (`code`: a register/app error code, `MALFORMED_ENVELOPE`, `CLOSED`,
+`UNAUTHORIZED` for a rejected token, `TAKEN_OVER` for a `conflict` before the first registration,
+`DISCONNECTED_FATAL` for any other fatal transport failure or when `reconnect.maxAttempts` runs
+out; `fatal`; the transport's `WsMixerError`, or on exhaustion
+the `DisconnectPayload`, is kept as `cause`).
+`expose()` never rejects with a bare `WsMixerError`; the only other rejection is the `AbortError`
+from `signal`.
 
-On a stream (`stream.errored`, its `'error'` event, a write callback) the subclass says what ended
-it (a `sendApp()` rejection is always the `ConnError` case):
+### Counters
 
-- `ConnError` -- the connection under it ended: an abnormal closure, a graceful `close()`, a
-  protocol failure, or a failed socket write. Whatever the connection's own terminal error was
-  (the socket's `WsMixerError`, a raw `ws` send error) is kept as `cause`; `code`, `wsCode` and
-  `closeReason` are copied from it.
-- `StreamError` -- this stream alone was reset: a peer `RESET`, the app's own `reset()`/
-  `destroy()`/`close()` (`CANCEL`), a write after `closeWrite()` (`STREAM_CLOSED`), or a drain
-  hand-over (`CANCEL`, `"connection drained"`, see above).
-- `null` (`stream.errored`) -- a clean end: the peer's `CLOSE` arrived and nothing pending failed,
-  or the app's own `destroy()` with no error and no write pending.
+`client.stats()` returns "ignore and count" counters (unknown frame types, stale frames, duplicate
+pongs, refused opens, drain violations, unknown drain reasons, handler errors, protocol violations)
+and `bytesIn`/`bytesOut` (whole WS messages, header included -- not comparable with Go's
+payload-only metric). Nothing escalates a sustained run into a connection error.
 
-The `'fatal'` event's `WsMixerError.code` follows the same "present only when a ws-mixer error code
-actually applies" rule as `DisconnectReason.errorCode` above (D-2026-09-20-09) -- it is `INTERNAL_ERROR`
-whenever no ws-mixer code exists for the underlying failure (an HTTP `401`/`403` upgrade rejection,
-for instance, used to surface `UNAUTHORIZED` here and no longer does), and otherwise the same derived
-code the disconnect reason carries (e.g. a bare `4011` close's `code` is `UNAUTHORIZED`, matching
-`errorCode`, not `INTERNAL_ERROR`). Consumers that need to distinguish *why* a fatal happened should
-branch on the disconnect reason's `httpStatus`/`wsCode`/`errorCode`, not on the fatal error's `code`
-alone.
-
-## Tests
-
-`npm test` (vitest) runs:
-
-- `test/frame.test.ts`, `test/control.test.ts` -- every fixture under `{frames,control}` in a
-  `ws-mixer-spec` checkout (see "Spec fixtures" below) is decoded/validated by this SDK's own codec
-  and hand-written validator and checked against the fixture's expected outcome (`valid`/`wire_valid`),
-  per `ws-mixer-spec`'s `spec/README.md`'s "SDK runtime validators assert `wire_valid`" rule. Skips
-  with a reason if no spec checkout can be found.
-- `test/sequence.test.ts` -- every `sequences/*.json` transcript with `role: "client"` is replayed
-  against a real `MixerConn` over a deterministic fake transport (`test/helpers/fake-ws.ts`); the
-  `role: "server"` transcripts are scripted from the Go server's perspective and are `it.skip`'d with
-  that reason, since this SDK is client-only. Same spec-checkout resolution and skip behavior as above.
-- `test/stream.test.ts`, `test/conn.test.ts`, `test/keepalive.test.ts`, `test/reconnect.test.ts` --
-  unit coverage for the stream state machine, credit/WINDOW accounting, half-close, the
-  control-priority + round-robin write scheduler (exact interleaving asserted against the fake
-  transport), keepalive/dead-peer detection, and the reconnect backoff math.
-- `test/interop.test.ts` -- `go build`s `cmd/testserver` from a `ws-mixer-go` checkout and drives it
-  as a plain child process (not `go run .`, so killing the child actually kills the server, not a
-  `go run` wrapper around it), connects this SDK as a real client over a real socket, and exercises a
-  multi-stream request/response round trip, an `app` round trip, and an immediate reconnect after
-  `Drain`.
-
-  **Spec fixtures and the Go interop server now live in their own repos** (`ws-mixer-spec`,
-  `ws-mixer-go`), not under this one. Both are resolved the same way: an env var override, else a
-  fetched checkout at the pinned tag, else a sibling directory next to this repo.
-
-  | | env var | fetched checkout | sibling fallback | pin file |
-  |---|---|---|---|---|
-  | spec fixtures | `WSMIXER_SPEC_DIR` | `.spec/spec` (`npm run fetch-spec`) | `../ws-mixer-spec/spec` | `spec.pin` |
-  | Go interop server | `WSMIXER_GO_DIR` | `.goserver` (`npm run fetch-goserver`) | `../ws-mixer-go` | `goserver.pin` |
-
-  `WSMIXER_SPEC_DIR` accepts either directory shape: this repo's own convention (the spec subdir
-  itself, i.e. `$WSMIXER_SPEC_DIR/fixtures` exists directly) or `ws-mixer-go`'s convention
-  (repo-root, i.e. `$WSMIXER_SPEC_DIR/spec/fixtures`) -- `test/helpers/spec-dir.ts` tries the former
-  first, then falls back to `$WSMIXER_SPEC_DIR/spec`.
-
-  Every one of `test/frame.test.ts`, `test/control.test.ts`, `test/sequence.test.ts` and
-  `test/interop.test.ts` skips its suite with the resolution failure as the reason -- never fails or
-  silently passes -- when none of the three resolve.
-
-  Toolchain resolution for the Go build: `$GO` (a path to a `go` binary) is preferred if set, else
-  whatever `go` is on `PATH`. Either way, the build runs with `GOTOOLCHAIN=auto`, so a resolved `go`
-  older than `cmd/testserver`'s `go` directive transparently downloads a matching toolchain instead of
-  failing -- `$GO` does not need to point at an exact-version match.
-
-  Run just this one (needs a working `go` on `PATH`, or set `GO=/path/to/go`, and a resolvable
-  `ws-mixer-go` checkout):
-
-  ```bash
-  npx vitest run test/interop.test.ts
-  ```
-
-## Counters
-
-`client.stats()` (and `conn.stats()`) return "ignore and count" counters -- unknown frame types,
-stale frames, duplicate pongs, refused opens -- for the sites that already tolerate and discard
-those per the wire spec. Unlike the Go server, this SDK does not escalate a sustained run of any of
-them (e.g. repeated `STREAM_LIMIT` refusals) into a connection error; that's left for later.
-
-`bytesIn`/`bytesOut` count raw WS message bytes, header included, for every message sent or
-received -- not just DATA payload bytes. This is not the same measurement as Go's
-`BytesTransferred` metric, which counts payload only; don't compare the two directly.
-
-## Build
+## Development
 
 ```bash
-npm run build       # tsup (dist/{index.js,index.cjs}) + build:types (dist/*.d.ts)
-npm run build:types # plain `tsc --emitDeclarationOnly`, stripping @internal members
-npm run typecheck   # tsc --noEmit, strict
-npm test            # vitest run
+npm run typecheck     # tsc (all) + tsc -p tsconfig.neutral.json (neutral code without Node types)
+npm test              # vitest
+npm run build         # tsup (ESM, shared chunks) + tsc declarations (@internal stripped)
+npm run check:neutral # after build: nothing reachable from ., ./mcpwarp, ./testing imports node:* or a package
+npm run smoke:deno    # after build: the neutral build end to end on Deno
 ```
 
-Declarations are generated by a plain `tsc --emitDeclarationOnly` pass (per-module `dist/*.d.ts`,
-not a single bundled file), not by tsup's own `dts` option: tsup 8.x's bundled-declaration step does
-not honour `stripInternal`, so it was leaking every `@internal`-tagged member straight into the
-public API surface. `tsconfig.json`'s `stripInternal: true` is the setting that actually matters;
-`build:types` just repeats its flags on the CLI since `tsc -p` cannot mix a project file with
-explicit entry points, and `src/index.ts` (not `test/**`) is the only entry point declarations are
-needed for.
+Tests: spec fixtures (`frame`, `control`, `sequence`) from a `ws-mixer-spec` checkout and the Go
+interop test from a `ws-mixer-go` checkout, both resolved from an env var, else a fetched checkout,
+else a sibling directory (suites skip with the reason when none resolves):
 
-## Before this is published
+| | env var | fetched checkout | sibling fallback | pin file |
+|---|---|---|---|---|
+| spec fixtures | `WSMIXER_SPEC_DIR` | `.spec/spec` (`npm run fetch-spec`) | `../ws-mixer-spec/spec` | `spec.pin` |
+| Go interop server | `WSMIXER_GO_DIR` | `.goserver` (`npm run fetch-goserver`) | `../ws-mixer-go` | `goserver.pin` |
 
-While `@mcpwarp/ws-mixer` is unpublished (publishing is guarded by `scripts/check-registry.mjs`'s
-`prepublishOnly` check, which refuses to publish anywhere but the public npm registry, not a
-`"private"` field), a consumer (e.g. the mcpwarp
-tunnel client) links against a built copy directly:
+The interop test builds `cmd/testserver` with `$GO` or the `go` on `PATH` (`GOTOOLCHAIN=auto`) and is
+the one real-socket test of the default (global `WebSocket`) backend. `test/e2e-mcp.test.ts` runs
+the real MCP SDKs (devDependencies only) through `FakeEdge`; `test/boundary.test.ts` enforces the
+import boundary on the sources. The conformance adapter lives in `conformance/adapter/`.
 
-```bash
-cd ws-mixer-js && npm install && npm run build   # produces dist/{index.js,index.cjs,index.d.ts,...}
-```
-
-```json
-{
-  "dependencies": {
-    "@mcpwarp/ws-mixer": "file:../ws-mixer-js"
-  }
-}
-```
-
-then `npm install` in the consumer. `file:` dependencies are copied (not symlinked) by npm on
-install, so **re-run `npm run build` here and `npm install` there** after every change -- there is
-no live-reload across the `file:` link. Once this package is ready to publish for real, pick a
-version and `npm publish` as usual; nothing else in this setup changes.
+Declarations come from a plain `tsc -p tsconfig.build.json` pass, not tsup's `dts` (which ignores
+`stripInternal`).

@@ -5,7 +5,7 @@
  * rule 3).
  */
 import { once } from "node:events";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { FakeWS } from "./helpers/fake-ws.js";
 import { MixerConn } from "../src/conn.js";
 import { encodeControl } from "../src/control.js";
@@ -97,11 +97,22 @@ describe("MixerConn stream dispatch", () => {
     const streamP = new Promise<MixerStream>((resolve) => conn.on("stream", resolve));
     ws.receive(encodeOpen(1));
     const stream = await streamP;
-    stream.on("error", () => {}); // fail() destroys every live stream; a Duplex thrown 'error' with no listener would crash the test
     const closeP = new Promise<{ wsCode: number }>((resolve) => conn.on("close", resolve as never));
     ws.receive(encodeData(1, new Uint8Array(20480)));
     const close = await closeP;
     expect(close.wsCode).toBe(4003);
+    await expect(stream.closed).resolves.toMatchObject({ kind: "connection_lost" });
+  });
+
+  it("a text frame is a connection PROTOCOL_ERROR (ws-mixer.v1 is binary only)", async () => {
+    const ws = new FakeWS();
+    const { conn } = await handshaken(ws);
+    conn.on("error", () => {});
+    const closeP = new Promise<{ wsCode: number; message: string }>((resolve) => conn.on("close", resolve as never));
+    (ws as unknown as { dispatch: (t: string, ev: unknown) => void }).dispatch("message", { data: "hello" });
+    const close = await closeP;
+    expect(close.wsCode).toBe(4001);
+    expect(close.message).toMatch(/text frame/);
   });
 
   it("late WINDOW after CLOSE is tolerated, not an error", async () => {
@@ -110,8 +121,7 @@ describe("MixerConn stream dispatch", () => {
     const streamP = new Promise<MixerStream>((resolve) => conn.on("stream", resolve));
     ws.receive(encodeOpen(1));
     const stream = await streamP;
-    stream.on("error", () => {});
-    stream.closeWrite();
+    await stream.closeWrite();
     ws.receive(encodeClose(1)); // peer closes too -> fully closed
     await new Promise((r) => setImmediate(r));
     let errored = false;
@@ -132,9 +142,34 @@ describe("MixerConn stream dispatch", () => {
     expect(stream.getState()).toBe("open");
     ws.receive(encodeClose(1));
     expect(stream.getState()).toBe("half_closed_remote");
-    stream.end(Buffer.from("HTTP/1.1 200 OK"));
-    await new Promise((r) => setImmediate(r));
+    await stream.write(Buffer.from("HTTP/1.1 200 OK"));
+    await stream.closeWrite();
     expect(stream.getState()).toBe("closed");
+    expect(conn.liveStreamCount()).toBe(0);
+  });
+});
+
+describe("MixerConn writer: socket backpressure (bufferedAmount)", () => {
+  it("stalls the writer while bufferedAmount is above 1 MiB and resumes once it drops", async () => {
+    const ws = new FakeWS();
+    const { conn } = await handshaken(ws);
+    vi.useFakeTimers();
+    try {
+      ws.sent.length = 0;
+      ws.bufferedAmount = 2 * 1024 * 1024;
+      let firstDone = false;
+      const first = conn.sendApp({ i: 1 }).then(() => (firstDone = true));
+      const second = conn.sendApp({ i: 2 });
+      await vi.advanceTimersByTimeAsync(200);
+      expect(ws.sent).toHaveLength(1); // handed to the socket, then the writer waits
+      expect(firstDone).toBe(false);
+      ws.bufferedAmount = 0;
+      await vi.advanceTimersByTimeAsync(60);
+      await Promise.all([first, second]);
+      expect(ws.sent).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -283,6 +318,50 @@ describe("MixerConn drain", () => {
   });
 });
 
+describe("MixerConn.close(): drain{client_requested} and queued frames go out before the teardown", () => {
+  const controlTypes = (ws: FakeWS) =>
+    ws.sent
+      .map((f) => decodeFrame(f))
+      .filter((f) => f.streamId === 0)
+      .map((f) => (JSON.parse(Buffer.from(f.payload).toString()) as { t: string; reason?: string; code?: number }));
+
+  it("with no streams open, the drain frame is written before error{NO_ERROR} and close 1000", async () => {
+    const ws = new FakeWS();
+    const { conn } = await handshaken(ws);
+    ws.sent.length = 0;
+    await conn.close();
+    expect(controlTypes(ws)).toEqual([
+      expect.objectContaining({ t: "drain", reason: "client_requested" }),
+      expect.objectContaining({ t: "error", code: ErrorCode.NO_ERROR }),
+    ]);
+    expect(ws.closedWith?.code).toBe(1000);
+  });
+
+  it("the last stream's CLOSE is written even while the writer is held back by bufferedAmount", async () => {
+    const ws = new FakeWS();
+    const { conn } = await handshaken(ws);
+    const streamP = new Promise<MixerStream>((resolve) => conn.on("stream", resolve));
+    ws.receive(encodeOpen(1));
+    const stream = await streamP;
+    ws.receive(encodeClose(1));
+    ws.bufferedAmount = 2 * 1024 * 1024;
+    void conn.sendApp({ parked: true });
+    await new Promise((r) => setTimeout(r, 10));
+    const closing = conn.close(2000);
+    await stream.closeWrite();
+    await new Promise((r) => setTimeout(r, 30));
+    expect(ws.closedWith).toBeNull();
+    ws.bufferedAmount = 0;
+    await closing;
+    const frames = ws.sent.map((f) => decodeFrame(f));
+    const closeIdx = frames.findIndex((f) => f.type === FrameType.CLOSE && f.streamId === 1);
+    expect(closeIdx).toBeGreaterThan(-1);
+    expect(controlTypes(ws).map((m) => m.t)).toEqual(["hello", "app", "drain", "error"]);
+    expect(ws.closedWith?.code).toBe(1000);
+    await expect(stream.closed).resolves.toEqual({ kind: "finished" });
+  });
+});
+
 describe("MixerConn ordered async delivery (item 2)", () => {
   it("stream/app/drain handlers fire in wire order off one queue, even when a handler is async", async () => {
     const ws = new FakeWS();
@@ -370,7 +449,7 @@ describe("MixerConn ordered async delivery (item 2)", () => {
     const ws = new FakeWS();
     const { conn } = await handshaken(ws, { maxStreams: 4 });
     const errorListeners = conn.listenerCount("error");
-    const first = once(conn, "stream") as Promise<[MixerStream]>;
+    const first = once(conn as never, "stream") as Promise<[MixerStream]>;
     expect(conn.listenerCount("stream")).toBe(1);
 
     ws.receive(encodeOpen(1));
@@ -481,7 +560,7 @@ describe("MixerConn minor conformance (item 6)", () => {
 });
 
 describe("MixerConn.sendApp() write-completion", () => {
-  it("resolves only once ws.send's callback confirms the frame was written, not on enqueue", async () => {
+  it("resolves once the frame was handed to the socket, not on enqueue", async () => {
     const ws = new FakeWS();
     const { conn } = await handshaken(ws);
     ws.sent.length = 0;
@@ -489,14 +568,10 @@ describe("MixerConn.sendApp() write-completion", () => {
     const p = conn.sendApp({ x: 1 }).then(() => {
       resolved = true;
     });
-    // The writer picks the frame off the queue and calls ws.send() on the
-    // next microtask, but FakeWS.send's callback only fires on a *further*
-    // microtask -- so right after that first tick, the frame has been
-    // written but sendApp() must not have resolved yet.
-    await Promise.resolve();
-    expect(ws.sent.length).toBe(1);
+    expect(ws.sent.length).toBe(0);
     expect(resolved).toBe(false);
     await p;
+    expect(ws.sent.length).toBe(1);
     expect(resolved).toBe(true);
   });
 
@@ -523,7 +598,7 @@ describe("MixerConn.sendApp() write-completion", () => {
     const first = conn.sendApp({ x: 1 }).catch((e: Error) => e);
     const second = conn.sendApp({ x: 2 }).catch((e: Error) => e);
     await new Promise((r) => setImmediate(r));
-    ws.emit("close", 1006, Buffer.from("simulated socket failure"));
+    ws.serverClose(1006, "simulated socket failure");
     expect(await first).toBeInstanceOf(Error);
     expect(await second).toBeInstanceOf(Error);
   });
@@ -634,7 +709,7 @@ describe("MixerConn ordered async delivery: flush after close (R1)", () => {
     expect(order).toEqual(["start:0", "end:0", "start:1", "end:1"]); // B delivered after close, in wire order; i:99 never appears
   });
 
-  it("a queued stream OPEN is still delivered after close, and the stream it hands over is already destroyed with an error (no read/write ever hangs)", async () => {
+  it("a queued stream OPEN is still delivered after close, and the stream it hands over has already ended with an error (no read/write ever hangs)", async () => {
     const ws = new FakeWS();
     const { conn } = await handshaken(ws, { maxStreams: 4 });
     const delivered: MixerStream[] = [];
@@ -660,10 +735,12 @@ describe("MixerConn ordered async delivery: flush after close (R1)", () => {
 
     expect(delivered).toHaveLength(1);
     const stream = delivered[0]!;
-    // Handed to the app already dead: destroyed, with the connection's error
-    // -- never a clean end, and no read/write on it can ever hang.
-    expect(stream.destroyed).toBe(true);
-    expect(stream.errored).toBeTruthy();
+    // Handed to the app already dead, with the connection's error -- never a
+    // clean end, and no read/write on it can ever hang.
+    expect(stream.getState()).toBe("closed");
+    await expect(stream.closed).resolves.toMatchObject({ kind: "connection_lost" });
+    await expect(stream.read()).rejects.toBeInstanceOf(ConnError);
+    await expect(stream.write("x")).rejects.toBeInstanceOf(ConnError);
   });
 
   it("a handler that throws mid-flush does not stop the rest of the backlog from being delivered, and produces no unhandled rejection", async () => {
@@ -707,284 +784,97 @@ describe("MixerConn ordered async delivery: flush after close (R1)", () => {
 });
 
 describe("MixerConn abnormal connection death errors open streams, never re-touches an already-closed one (R2)", () => {
-  it("a stream that already fully, cleanly closed both directions before the connection later dies abnormally keeps its clean end -- retired, only destroyed by the teardown", async () => {
+  it("a stream that already fully, cleanly closed both directions before the connection later dies abnormally keeps its clean end", async () => {
     const ws = new FakeWS();
     const { conn } = await handshaken(ws, { maxStreams: 4 });
-    let stream: MixerStream | undefined;
-    let sawError = false;
-    conn.on("stream", (s: MixerStream) => {
-      stream = s;
-      s.on("error", () => {
-        sawError = true;
-      });
-    });
+    const streamP = new Promise<MixerStream>((resolve) => conn.on("stream", resolve));
     ws.receive(encodeOpen(1));
-    await new Promise((r) => setImmediate(r));
-    expect(stream).toBeDefined();
+    const stream = await streamP;
 
     // Both directions close cleanly: the peer's CLOSE, then this side's own.
     ws.receive(encodeClose(1));
-    stream!.end(); // -> closeWrite(): CLOSE sent, state "closed", retired
-    await new Promise((r) => setImmediate(r));
-    expect(stream!.getState()).toBe("closed");
-    expect(stream!.errored).toBeFalsy(); // ended cleanly, not with an error
+    await stream.closeWrite();
+    expect(stream.getState()).toBe("closed");
+    expect(conn.liveStreamCount()).toBe(0);
 
     // Now the WHOLE connection dies abnormally (1006, no close frame).
-    ws.emit("close", 1006, Buffer.from(""));
+    ws.serverClose(1006);
     await new Promise((r) => setImmediate(r));
 
-    // Retired, but not yet destroyed (nothing read it to 'end'): the teardown
-    // still reaches it, only to destroy it -- its clean end stands, no error.
-    expect(sawError).toBe(false);
-    expect(stream!.errored).toBeFalsy();
-    expect(stream!.destroyed).toBe(true);
+    await expect(stream.closed).resolves.toEqual({ kind: "finished" });
+    expect(await stream.read()).toBeNull();
+    expect(stream.resetCode).toBeUndefined();
   });
 
-  it("a stream CLOSE'd both ways with unread data outlives the connection for its reader; a write issued after the teardown still fails STREAM_CLOSED, once 'end' has fired", async () => {
+  it("a stream CLOSE'd both ways with unread data outlives the connection for its reader; a write issued after the teardown fails STREAM_CLOSED", async () => {
     const ws = new FakeWS();
     const { conn } = await handshaken(ws);
     const streamP = new Promise<MixerStream>((resolve) => conn.on("stream", resolve));
     ws.receive(encodeOpen(1));
     const stream = await streamP;
-    stream.on("error", () => {});
     ws.receive(encodeData(1, Buffer.from("hello")));
     ws.receive(encodeClose(1));
-    stream.closeWrite();
-    ws.emit("close", 1006, Buffer.from(""));
-    expect(stream.destroyed).toBe(false);
+    await stream.closeWrite();
+    ws.serverClose(1006);
 
-    const events: string[] = [];
-    stream.write(Buffer.from("late"), (e) => events.push(`write-cb:${e ? (e as StreamError).codeName : "ok"}`));
-    await new Promise((r) => setImmediate(r));
-    expect(events).toEqual([]);
-
-    const received: Buffer[] = [];
-    stream.on("data", (c: Buffer) => received.push(c));
-    stream.on("end", () => events.push("end"));
-    const closed = new Promise<void>((resolve) => stream.once("close", () => resolve()));
-    await closed;
-    expect(Buffer.concat(received).toString()).toBe("hello");
-    expect([...events].sort()).toEqual(["end", "write-cb:STREAM_CLOSED"]);
+    const werr = (await stream.write(Buffer.from("late")).catch((e) => e)) as StreamError;
+    expect(werr).toBeInstanceOf(StreamError);
+    expect(werr.codeName).toBe("STREAM_CLOSED");
+    expect(new TextDecoder().decode((await stream.read())!)).toBe("hello");
+    expect(await stream.read()).toBeNull();
     expect(stream.resetCode).toBeUndefined();
+  });
+
+  it("an open stream with unread data: the data is still delivered, then the read fails with the connection's error", async () => {
+    const ws = new FakeWS();
+    const { conn } = await handshaken(ws);
+    const streamP = new Promise<MixerStream>((resolve) => conn.on("stream", resolve));
+    ws.receive(encodeOpen(1));
+    const stream = await streamP;
+    ws.receive(encodeData(1, Buffer.from("partial")));
+    ws.serverClose(1006);
+    expect(new TextDecoder().decode((await stream.read())!)).toBe("partial");
+    await expect(stream.read()).rejects.toBeInstanceOf(ConnError);
   });
 });
 
-describe("MixerConn retired streams are tracked weakly", () => {
-  type Retired = Map<number, MixerStream | WeakRef<MixerStream>>;
-  const retiredOf = (conn: MixerConn) => (conn as unknown as { retired: Retired }).retired;
-  const dead = Object.assign(Object.create(WeakRef.prototype) as WeakRef<MixerStream>, { deref: () => undefined });
-  const alive = (entry: MixerStream | WeakRef<MixerStream>) => (entry instanceof WeakRef ? entry.deref() : entry);
-
-  /** One permanent 'stream' listener handing each stream to whoever waits for it. */
-  function nextStream(conn: MixerConn): () => Promise<MixerStream> {
-    let waiting: ((s: MixerStream) => void) | null = null;
-    conn.on("stream", (s: MixerStream) => {
-      const resolve = waiting;
-      waiting = null;
-      resolve?.(s);
-    });
-    return () =>
-      new Promise<MixerStream>((resolve) => {
-        waiting = resolve;
-      });
-  }
-
-  /** Peer CLOSE with an empty body, app end()s, nobody ever reads: retired, never 'end', never destroyed. */
-  async function retireUnread(ws: FakeWS, next: () => Promise<MixerStream>, id: number): Promise<void> {
-    const streamP = next();
-    ws.receive(encodeOpen(id));
-    const stream = await streamP;
-    stream.on("error", () => {});
-    ws.receive(encodeClose(id));
-    stream.end(Buffer.from("resp"));
-    await new Promise((r) => setImmediate(r));
-  }
-
-  it("holds each never-read retired stream by WeakRef, and prunes dead refs on insert, on 'close' and at teardown", async () => {
+describe("MixerConn retires finished and reset streams", () => {
+  it("drops a stream from its table on CLOSE both ways, on RESET either way, and never routes frames to it again", async () => {
     const ws = new FakeWS();
-    const { conn } = await handshaken(ws);
-    conn.on("error", () => {});
+    const { conn } = await handshaken(ws, { maxStreams: 4 });
     const streams: MixerStream[] = [];
     conn.on("stream", (s: MixerStream) => streams.push(s));
-    const next = nextStream(conn);
-    for (const id of [1, 3, 5]) await retireUnread(ws, next, id);
-    const retired = retiredOf(conn);
-    expect([...retired.keys()]).toEqual([1, 3, 5]);
-    for (const [i, ref] of [...retired.values()].entries()) {
-      expect(ref).toBeInstanceOf(WeakRef);
-      expect(alive(ref)).toBe(streams[i]);
-      expect(streams[i]!.destroyed).toBe(false);
-    }
-
-    retired.set(1001, dead);
-    await retireUnread(ws, next, 7);
-    expect([...retired.keys()]).toEqual([1, 3, 5, 7]);
-
-    retired.set(1003, dead);
-    const closed = new Promise<void>((resolve) => streams[0]!.once("close", () => resolve()));
-    streams[0]!.resume();
-    await closed;
-    expect([...retired.keys()]).toEqual([3, 5, 7]);
-
-    retired.set(1005, dead);
-    ws.emit("close", 1006, Buffer.from(""));
-    await new Promise((r) => setImmediate(r));
-    expect(retired.size).toBe(0);
-    expect(streams.every((s) => s.destroyed)).toBe(true);
-  });
-
-  it("holds a retired stream strongly while it owes a write callback: held before retirement, or held after it (upgraded from its WeakRef)", async () => {
-    const ws = new FakeWS();
-    const { conn } = await handshaken(ws);
-    conn.on("error", () => {});
-    const next = nextStream(conn);
-    const retired = retiredOf(conn);
-
-    // No held callback: weak.
-    await retireUnread(ws, next, 1);
-    expect(retired.get(1)).toBeInstanceOf(WeakRef);
-
-    // Held before retirement (peer CLOSE, the socket send fails, then closeWrite()): strong from the start.
-    const heldBeforeP = next();
+    ws.receive(encodeOpen(1));
     ws.receive(encodeOpen(3));
-    const heldBefore = await heldBeforeP;
-    heldBefore.on("error", () => {});
-    ws.receive(encodeClose(3));
-    ws.failNextSend(new Error("simulated socket failure"));
-    const beforeErrs: Array<Error | null | undefined> = [];
-    heldBefore.write(Buffer.from("x"), (e) => beforeErrs.push(e));
-    await new Promise((r) => setImmediate(r));
-    await new Promise((r) => setImmediate(r));
-    heldBefore.closeWrite();
-    expect(heldBefore.getState()).toBe("closed");
-    expect(retired.get(3)).toBe(heldBefore);
-
-    // Held after retirement (a write after closeWrite()): the WeakRef is upgraded.
-    const heldAfterP = next();
     ws.receive(encodeOpen(5));
-    const heldAfter = await heldAfterP;
-    heldAfter.on("error", () => {});
-    ws.receive(encodeClose(5));
-    heldAfter.closeWrite();
-    expect(retired.get(5)).toBeInstanceOf(WeakRef);
-    const afterErrs: Array<Error | null | undefined> = [];
-    heldAfter.write(Buffer.from("late"), (e) => afterErrs.push(e));
     await new Promise((r) => setImmediate(r));
-    expect(retired.get(5)).toBe(heldAfter);
-    expect(retired.get(1)).toBeInstanceOf(WeakRef);
-    expect(beforeErrs).toHaveLength(0);
-    expect(afterErrs).toHaveLength(0);
+    expect(conn.liveStreamCount()).toBe(3);
 
-    ws.emit("close", 1006, Buffer.from(""));
-    await new Promise((r) => setImmediate(r));
-    expect(retired.size).toBe(0);
-    expect(beforeErrs).toHaveLength(1);
-    expect(beforeErrs[0]).toBeInstanceOf(ConnError);
-    expect(afterErrs).toHaveLength(1);
-    expect((afterErrs[0] as StreamError).codeName).toBe("STREAM_CLOSED");
+    ws.receive(encodeClose(1));
+    await streams[0]!.closeWrite();
+    streams[1]!.reset("CANCEL");
+    ws.receive(encodeReset(5, ErrorCode.CANCEL, "peer"));
+    expect(conn.liveStreamCount()).toBe(0);
+
+    // A late WINDOW for a retired id is a stale frame, not an error.
+    ws.receive(encodeWindow(1, 5));
+    expect(conn.stats().staleFrames).toBe(1);
   });
 
-  it.skipIf(typeof globalThis.gc !== "function")(
-    "a retired stream the app dropped is collected; one it still holds is still torn down by the connection's death (needs --expose-gc)",
-    async () => {
-      const ws = new FakeWS();
-      const { conn } = await handshaken(ws);
-      conn.on("error", () => {});
-      const next = nextStream(conn);
-      for (let id = 1; id < 41; id += 2) await retireUnread(ws, next, id);
-
-      // Kept: peer CLOSE, a write whose socket send fails, closeWrite() -> retired with the callback held until 'end', which never comes unread.
-      const keptP = next();
-      ws.receive(encodeOpen(41));
-      const kept = await keptP;
-      kept.on("error", () => {});
-      ws.receive(encodeClose(41));
-      ws.failNextSend(new Error("simulated socket failure"));
-      const cbErrs: Array<Error | null | undefined> = [];
-      kept.write(Buffer.from("x"), (e) => cbErrs.push(e));
-      await new Promise((r) => setImmediate(r));
-      await new Promise((r) => setImmediate(r));
-      kept.closeWrite();
-      await new Promise((r) => setImmediate(r));
-      expect(kept.getState()).toBe("closed");
-      expect(cbErrs).toHaveLength(0);
-
-      const retired = retiredOf(conn);
-      expect(retired.size).toBe(21);
-      for (let i = 0; i < 5; i++) {
-        await new Promise((r) => setImmediate(r));
-        globalThis.gc!();
-      }
-      expect([...retired].filter(([, entry]) => alive(entry) !== undefined).map(([id]) => id)).toEqual([41]);
-
-      const closed = new Promise<void>((resolve) => kept.once("close", () => resolve()));
-      ws.emit("close", 1006, Buffer.from(""));
-      await closed;
-      expect(retired.size).toBe(0);
-      expect(cbErrs).toHaveLength(1);
-      expect(cbErrs[0]).toBeInstanceOf(ConnError);
-      expect(kept.destroyed).toBe(true);
-    },
-  );
-
-  it.skipIf(typeof globalThis.gc !== "function")(
-    "a retired stream the app dropped while it owes a write callback is not collected: the connection's death still settles the callback and fires 'close' (needs --expose-gc)",
-    async () => {
-      const ws = new FakeWS();
-      const { conn } = await handshaken(ws);
-      conn.on("error", () => {});
-      const next = nextStream(conn);
-      const log: string[] = [];
-
-      // All stream refs live only inside this function's frame, gone once it returns.
-      await (async () => {
-        // Control: dropped with nothing owed -- must be collected, proving the drop is real.
-        await retireUnread(ws, next, 1);
-
-        // Held before retirement: peer CLOSE, the socket send fails, then closeWrite().
-        const beforeP = next();
-        ws.receive(encodeOpen(3));
-        const before = await beforeP;
-        before.on("error", () => {});
-        before.on("close", () => log.push("close:3"));
-        ws.receive(encodeClose(3));
-        ws.failNextSend(new Error("simulated socket failure"));
-        before.write(Buffer.from("x"), (e) => log.push(`cb:3:${e instanceof ConnError ? "ConnError" : String(e)}`));
-        await new Promise((r) => setImmediate(r));
-        await new Promise((r) => setImmediate(r));
-        before.closeWrite();
-
-        // Held after retirement: a write after closeWrite().
-        const afterP = next();
-        ws.receive(encodeOpen(5));
-        const after = await afterP;
-        after.on("error", () => {});
-        after.on("close", () => log.push("close:5"));
-        ws.receive(encodeClose(5));
-        after.closeWrite();
-        after.write(Buffer.from("late"), (e) => log.push(`cb:5:${(e as StreamError | undefined)?.codeName ?? String(e)}`));
-        await new Promise((r) => setImmediate(r));
-      })();
-
-      const retired = retiredOf(conn);
-      expect([...retired.keys()]).toEqual([1, 3, 5]);
-      for (let i = 0; i < 5; i++) {
-        await new Promise((r) => setImmediate(r));
-        globalThis.gc!();
-      }
-      expect(alive(retired.get(1)!)).toBeUndefined();
-      for (const id of [3, 5]) {
-        expect(alive(retired.get(id)!)?.id).toBe(id);
-        expect(retired.get(id)).not.toBeInstanceOf(WeakRef);
-      }
-      expect(log).toEqual([]);
-
-      ws.emit("close", 1006, Buffer.from(""));
-      await new Promise((r) => setTimeout(r, 20));
-      expect(retired.size).toBe(0);
-      expect([...log].sort()).toEqual(["cb:3:ConnError", "cb:5:STREAM_CLOSED", "close:3", "close:5"]);
-    },
-  );
+  it("a write still pending when its stream is RESET by the peer rejects with that RESET's error (sendDone)", async () => {
+    const ws = new FakeWS();
+    const { conn } = await handshaken(ws, { window: 16384 });
+    const streamP = new Promise<MixerStream>((resolve) => conn.on("stream", resolve));
+    ws.receive(encodeOpen(1));
+    const stream = await streamP;
+    // Two chunks: the second waits on credit (welcome window is 16384).
+    const werr = stream.write(new Uint8Array(16384 + 1)).catch((e) => e as StreamError);
+    await new Promise((r) => setImmediate(r));
+    ws.receive(encodeReset(1, ErrorCode.CANCEL, "peer gave up"));
+    const err = await werr;
+    expect(err).toBeInstanceOf(StreamError);
+    expect((err as StreamError).code).toBe(ErrorCode.CANCEL);
+  });
 });
 
 describe("MixerConn peer error{} handling (item 4)", () => {
@@ -1080,7 +970,7 @@ describe("MixerConn.handleDispatchError (item 10)", () => {
     expect(decodeFrame(resetFrame!).payload[3]).toBe(ErrorCode.STREAM_CLOSED);
   });
 
-  it("a StreamError for a still-live stream uses abort(): RESET sent, resetCode set, and 'reset' emitted (item 3)", async () => {
+  it("a StreamError for a still-live stream uses abort(): RESET sent, resetCode set, and `closed` reports the reset (item 3)", async () => {
     const ws = new FakeWS();
     const { conn } = await handshaken(ws);
     const streamP = new Promise<MixerStream>((resolve) => conn.on("stream", resolve));
@@ -1088,15 +978,15 @@ describe("MixerConn.handleDispatchError (item 10)", () => {
     const stream = await streamP;
     ws.receive(encodeClose(1)); // half_closed_remote; the id stays live
     await new Promise((r) => setImmediate(r));
-    const resetP = new Promise<{ code: number; message: string }>((resolve) => stream.on("reset", resolve));
     ws.sent.length = 0;
 
     // DATA after the peer's own CLOSE: an SDK-detected StreamError(STREAM_CLOSED),
     // not application code -- must go through abort(), not the app-facing reset().
     ws.receive(encodeData(1, new Uint8Array([1])));
-    const info = await resetP;
+    const info = await stream.closed;
+    await new Promise((r) => setImmediate(r));
 
-    expect(info.code).toBe(ErrorCode.STREAM_CLOSED);
+    expect(info).toMatchObject({ kind: "reset", code: ErrorCode.STREAM_CLOSED, byPeer: false });
     expect(stream.resetCode).toBe(ErrorCode.STREAM_CLOSED);
     expect(stream.getState()).toBe("closed");
     const resetFrame = ws.sent.find((f) => decodeFrame(f).type === FrameType.RESET && decodeFrame(f).streamId === 1);
@@ -1164,17 +1054,17 @@ describe("MixerConn incoming RESET message length", () => {
     const streamP = new Promise<MixerStream>((resolve) => conn.on("stream", resolve));
     ws.receive(encodeOpen(1));
     const stream = await streamP;
-    stream.on("error", () => {});
-    const resetP = new Promise<{ code: number; message: string }>((resolve) => stream.on("reset", resolve));
 
     const long = "x" + "é".repeat(200); // 401 UTF-8 bytes; byte 256 falls mid-"é"
     ws.receive(encodeReset(1, ErrorCode.CANCEL, long));
-    const info = await resetP;
+    const info = (await stream.closed) as { kind: "reset"; code: number; message: string; byPeer: boolean };
 
+    expect(info.kind).toBe("reset");
+    expect(info.byPeer).toBe(true);
     expect(info.code).toBe(ErrorCode.CANCEL);
     expect(info.message).toBe("x" + "é".repeat(127));
     expect(Buffer.byteLength(info.message)).toBe(255);
-    expect((stream.errored as StreamError).message).toBe(info.message);
+    expect(((await stream.read().catch((e) => e)) as StreamError).message).toBe(info.message);
     await new Promise((r) => setImmediate(r));
     expect(connClosed).toBe(false);
     expect(conn.stats().protocolViolations).toBe(0);
@@ -1188,18 +1078,13 @@ describe("MixerConn stream teardown: queued DATA and error classes", () => {
     const streamP = new Promise<MixerStream>((resolve) => conn.on("stream", resolve));
     ws.receive(encodeOpen(1));
     const stream = await streamP;
-    stream.on("error", () => {});
 
-    // Stall the writer on a control frame so the stream's chunk stays in the outbox.
-    const held: Array<() => void> = [];
-    const realSend = ws.send.bind(ws);
-    ws.send = (data: Uint8Array, cb?: (err?: Error) => void) => {
-      ws.sent.push(data.slice());
-      held.push(() => cb?.());
-    };
+    // Stall the writer on a control frame (socket buffer above the high-water
+    // mark) so the stream's chunk stays in the outbox.
+    ws.bufferedAmount = 2 * 1024 * 1024;
     void conn.sendApp({ stall: true });
     await new Promise((r) => setImmediate(r));
-    const writeErrP = new Promise<Error | null | undefined>((resolve) => stream.write(Buffer.from("queued"), (e) => resolve(e)));
+    const writeErrP = stream.write(Buffer.from("queued")).catch((e: Error) => e);
     await new Promise((r) => setImmediate(r));
 
     ws.receive(encodeReset(1, ErrorCode.CANCEL, "peer gave up"));
@@ -1207,27 +1092,25 @@ describe("MixerConn stream teardown: queued DATA and error classes", () => {
     expect(writeErr).toBeInstanceOf(StreamError);
     expect((writeErr as StreamError).code).toBe(ErrorCode.CANCEL);
 
-    ws.send = realSend;
-    for (const release of held) release();
-    await new Promise((r) => setImmediate(r));
+    ws.bufferedAmount = 0;
+    await new Promise((r) => setTimeout(r, 60));
     const data1 = ws.sent.map((f) => decodeFrame(f)).filter((f) => f.type === FrameType.DATA && f.streamId === 1);
     expect(data1).toHaveLength(0);
   });
 
-  it("a raw socket send failure reaches the write callback as a ConnError, with the socket's own error as `cause`", async () => {
+  it("a raw socket send failure reaches the write as a ConnError, with the socket's own error as `cause`", async () => {
     const ws = new FakeWS();
     const { conn } = await handshaken(ws);
     const streamP = new Promise<MixerStream>((resolve) => conn.on("stream", resolve));
     ws.receive(encodeOpen(1));
     const stream = await streamP;
-    stream.on("error", () => {});
     const raw = new Error("WebSocket is not open: readyState 2 (CLOSING)");
     ws.failNextSend(raw);
-    const writeErr = await new Promise<Error | null | undefined>((resolve) => stream.write(Buffer.from("x"), (e) => resolve(e)));
+    const writeErr = (await stream.write(Buffer.from("x")).catch((e: Error) => e)) as ConnError;
     expect(writeErr).toBeInstanceOf(ConnError);
-    expect((writeErr as ConnError).code).toBe(ErrorCode.INTERNAL_ERROR);
-    expect(writeErr!.message).toBe(raw.message);
-    expect(writeErr!.cause).toBe(raw);
+    expect(writeErr.code).toBe(ErrorCode.INTERNAL_ERROR);
+    expect(writeErr.message).toBe(raw.message);
+    expect(writeErr.cause).toBe(raw);
   });
 
   it("an abnormal 1006 close tears a live stream down with a ConnError that keeps wsCode and the socket-close error as `cause`", async () => {
@@ -1236,23 +1119,23 @@ describe("MixerConn stream teardown: queued DATA and error classes", () => {
     const streamP = new Promise<MixerStream>((resolve) => conn.on("stream", resolve));
     ws.receive(encodeOpen(1));
     const stream = await streamP;
-    const errP = new Promise<Error>((resolve) => stream.on("error", resolve));
-    ws.emit("close", 1006, Buffer.from(""));
-    const err = await errP;
+    ws.serverClose(1006);
+    const reason = await stream.closed;
+    expect(reason.kind).toBe("connection_lost");
+    const err = (reason as { error: ConnError }).error;
     expect(err).toBeInstanceOf(ConnError);
-    expect((err as ConnError).wsCode).toBe(1006);
+    expect(err.wsCode).toBe(1006);
     expect(err.cause).toBeInstanceOf(WsMixerError);
     expect(err.cause).not.toBeInstanceOf(ConnError);
-    expect(stream.errored).toBe(err);
+    await expect(stream.read()).rejects.toBe(err);
   });
 
-  it("drain hand-over: DATA queued behind another stream's in-flight write fails with its own stream's CANCEL, not the connection's NO_ERROR", async () => {
+  it("superseded conn failed with a per-stream CANCEL: DATA queued behind another stream's in-flight frame fails with its own stream's CANCEL, not the connection's NO_ERROR", async () => {
     const ws = new FakeWS();
     const { conn } = await handshaken(ws);
     conn.on("error", () => {});
     const streams: MixerStream[] = [];
     conn.on("stream", (s: MixerStream) => {
-      s.on("error", () => {});
       streams.push(s);
     });
     ws.receive(encodeOpen(1));
@@ -1260,33 +1143,30 @@ describe("MixerConn stream teardown: queued DATA and error classes", () => {
     await new Promise((r) => setImmediate(r));
     const [s1, s3] = streams as [MixerStream, MixerStream];
 
-    // Hold every socket send: s3's chunk stays in flight, s1's queues behind it in the outbox.
-    const held: Array<(err?: Error) => void> = [];
-    ws.send = (data: Uint8Array, cb?: (err?: Error) => void) => {
-      ws.sent.push(data.slice());
-      held.push((err) => cb?.(err));
-    };
-    const s3ErrP = new Promise<Error | null | undefined>((resolve) => s3.write(Buffer.from("s3"), (e) => resolve(e)));
+    // s3's frame is handed to the socket and the writer then waits on the
+    // socket buffer; s1's chunk queues behind it in the outbox.
+    ws.bufferedAmount = 2 * 1024 * 1024;
+    const s3P = s3.write(Buffer.from("s3")).then(
+      () => null,
+      (e: Error) => e,
+    );
     await new Promise((r) => setImmediate(r));
-    const s1ErrP = new Promise<Error | null | undefined>((resolve) => s1.write(Buffer.from("s1"), (e) => resolve(e)));
+    const s1P = s1.write(Buffer.from("s1")).then(
+      () => null,
+      (e: Error) => e,
+    );
     await new Promise((r) => setImmediate(r));
-    expect(held).toHaveLength(1);
 
     conn.fail(new WsMixerError(ErrorCode.NO_ERROR, "superseded"), (id) => new StreamError(ErrorCode.CANCEL, id, "connection drained"));
-    // The old socket dies under s3's in-flight write.
-    for (const release of held) release(new Error("socket closed"));
 
-    for (const [s, errP] of [
-      [s1, s1ErrP],
-      [s3, s3ErrP],
-    ] as const) {
-      const err = await errP;
-      expect(err).toBeInstanceOf(StreamError);
-      expect((err as StreamError).code).toBe(ErrorCode.CANCEL);
-      expect(err!.message).toBe("connection drained");
-      expect(s.errored).toBeInstanceOf(StreamError);
-      expect((s.errored as StreamError).code).toBe(ErrorCode.CANCEL);
-      expect(s.errored!.message).toBe("connection drained");
+    // s3's bytes already reached the socket: that write succeeded.
+    expect(await s3P).toBeNull();
+    const err = (await s1P) as StreamError;
+    expect(err).toBeInstanceOf(StreamError);
+    expect(err.code).toBe(ErrorCode.CANCEL);
+    expect(err.message).toBe("connection drained");
+    for (const s of [s1, s3]) {
+      await expect(s.closed).resolves.toEqual({ kind: "reset", code: ErrorCode.CANCEL, name: "CANCEL", message: "connection drained", byPeer: false });
     }
     const data1 = ws.sent.map((f) => decodeFrame(f)).filter((f) => f.type === FrameType.DATA && f.streamId === 1);
     expect(data1).toHaveLength(0);

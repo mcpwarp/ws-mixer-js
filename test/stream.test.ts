@@ -1,911 +1,449 @@
-/** Unit tests for MixerStream's state machine, credit accounting and half-close semantics, against a fake StreamHost. */
-import { describe, expect, it, vi } from "vitest";
+/**
+ * MixerStream against a recording StreamHost (no connection): state
+ * machine, credit accounting, half-close/RESET semantics, the `closed`
+ * promise and connection teardown (terminate).
+ */
+import { describe, expect, it } from "vitest";
 import { MixerStream, type StreamHost } from "../src/stream.js";
-import { ErrorCode, StreamError, WsMixerError } from "../src/errors.js";
-import { decodeFrame, FrameType, windowIncrement } from "../src/frame.js";
+import { ConnError, ErrorCode, StreamError } from "../src/errors.js";
+import { FrameType, decodeFrame, resetCode, resetMessage, windowIncrement, type Frame } from "../src/frame.js";
+import { toWebStreams } from "../src/webstreams.js";
 
-function fakeHost(): StreamHost & { frames: Uint8Array[]; retired: number[] } {
-  const frames: Uint8Array[] = [];
-  const retired: number[] = [];
-  return {
-    frames,
-    retired,
-    sendData: vi.fn(async () => {}),
-    sendControlFrame: (f: Uint8Array) => frames.push(f),
-    retireStream: (id: number) => retired.push(id),
-  };
+class RecordingHost implements StreamHost {
+  /** Every frame in the order the stream handed it over (DATA via sendData, the rest via sendControlFrame). */
+  readonly frames: Array<{ type: "DATA"; streamId: number; payload: Uint8Array } | Frame> = [];
+  readonly retired: number[] = [];
+  /** When set, sendData waits for release() instead of resolving right away. */
+  hold = false;
+  private held: Array<() => void> = [];
+
+  sendData(streamId: number, chunk: Uint8Array): Promise<void> {
+    this.frames.push({ type: "DATA", streamId, payload: chunk.slice() });
+    if (!this.hold) return Promise.resolve();
+    return new Promise((resolve) => this.held.push(resolve));
+  }
+  sendControlFrame(frame: Uint8Array): void {
+    this.frames.push(decodeFrame(frame));
+  }
+  retireStream(streamId: number): void {
+    this.retired.push(streamId);
+  }
+  release(): void {
+    this.hold = false;
+    for (const r of this.held.splice(0)) r();
+  }
+  data(): Uint8Array[] {
+    return this.frames.filter((f) => f.type === "DATA").map((f) => f.payload);
+  }
+  ofType(t: number): Frame[] {
+    return this.frames.filter((f): f is Frame => typeof f.type === "number" && f.type === t);
+  }
+  kinds(): string[] {
+    return this.frames.map((f) => (f.type === "DATA" ? "DATA" : (["OPEN", "DATA", "WINDOW", "CLOSE", "RESET"][f.type] ?? "?")));
+  }
+}
+
+const enc = (s: string) => new TextEncoder().encode(s);
+const dec = (b: Uint8Array | null) => (b === null ? null : new TextDecoder().decode(b));
+const tick = () => new Promise<void>((r) => setImmediate(r));
+
+function make(recvWindow = 16384, sendWindow = 262144) {
+  const host = new RecordingHost();
+  const stream = new MixerStream(1, host, recvWindow, sendWindow);
+  return { host, stream };
 }
 
 describe("MixerStream state machine", () => {
-  it("starts open and moves to half_closed_local on closeWrite", () => {
-    const host = fakeHost();
-    const s = new MixerStream(1, host, 1024, 1024);
-    expect(s.getState()).toBe("open");
-    s.closeWrite();
-    expect(s.getState()).toBe("half_closed_local");
-    const frame = decodeFrame(host.frames[0]!);
-    expect(frame.type).toBe(FrameType.CLOSE);
+  it("starts open; closeWrite() -> half_closed_local; then peer CLOSE -> closed, retired, closed=finished", async () => {
+    const { host, stream } = make();
+    expect(stream.getState()).toBe("open");
+    await stream.closeWrite();
+    expect(stream.getState()).toBe("half_closed_local");
+    expect(host.kinds()).toEqual(["CLOSE"]);
+    stream.handleClose();
+    expect(stream.getState()).toBe("closed");
+    expect(host.retired).toEqual([1]);
+    await expect(stream.closed).resolves.toEqual({ kind: "finished" });
   });
 
-  it("half_closed_local + recv CLOSE -> closed, retires the id", () => {
-    const host = fakeHost();
-    const s = new MixerStream(1, host, 1024, 1024);
-    s.closeWrite();
-    s.handleClose();
-    expect(s.getState()).toBe("closed");
-    expect(host.retired).toContain(1);
+  it("peer CLOSE then closeWrite() -> closed, retired once, finished", async () => {
+    const { host, stream } = make();
+    stream.handleClose();
+    expect(stream.getState()).toBe("half_closed_remote");
+    await stream.closeWrite();
+    expect(stream.getState()).toBe("closed");
+    expect(host.retired).toEqual([1]);
+    await expect(stream.closed).resolves.toEqual({ kind: "finished" });
   });
 
-  it("recv CLOSE delivers buffered data, then EOF (CLOSE preserves data)", async () => {
-    const host = fakeHost();
-    const s = new MixerStream(1, host, 1024, 1024);
-    s.handleData(new TextEncoder().encode("hello"));
-    s.handleClose();
-    const chunks: Buffer[] = [];
-    for await (const chunk of s) chunks.push(chunk as Buffer);
-    expect(Buffer.concat(chunks).toString()).toBe("hello");
-  });
-
-  it("RESET discards buffered data", () => {
-    const host = fakeHost();
-    const s = new MixerStream(1, host, 1024, 1024);
-    s.on("error", () => {});
-    s.handleData(new TextEncoder().encode("hello"));
-    s.handleReset(ErrorCode.CANCEL, "nevermind");
-    expect(s.getState()).toBe("closed");
-    // The stream is destroyed with the RESET error; reading throws rather than yielding "hello".
-    expect(s.destroyed).toBe(true);
-  });
-
-  it("DATA exceeding recv credit throws (caller turns it into a connection error)", () => {
-    const host = fakeHost();
-    const s = new MixerStream(1, host, 10, 1024);
-    expect(() => s.handleData(new Uint8Array(11))).toThrow(/credit remaining/);
-  });
-
-  it("WINDOW credits sendWindow and DATA after CLOSE-sent is refused", () => {
-    const host = fakeHost();
-    const s = new MixerStream(1, host, 1024, 0);
-    expect(s.getSendWindow()).toBe(0);
-    s.handleWindow(100);
-    expect(s.getSendWindow()).toBe(100);
-  });
-
-  it("WINDOW is tolerated (ignored) on a stream already closed", () => {
-    const host = fakeHost();
-    const s = new MixerStream(1, host, 1024, 0);
-    s.on("error", () => {});
-    s.handleReset(ErrorCode.CANCEL, "gone");
-    expect(() => s.handleWindow(5)).not.toThrow();
-  });
-
-  it("WINDOW overflow past 2^31-1 throws", () => {
-    const host = fakeHost();
-    const s = new MixerStream(1, host, 1024, 0x7fffffff - 1);
-    expect(() => s.handleWindow(10)).toThrow(/2\^31-1/);
-  });
-
-  it("sendDone() is true once CLOSE has been sent, with a STREAM_CLOSED error", () => {
-    const host = fakeHost();
-    const s = new MixerStream(1, host, 1024, 1024);
-    s.closeWrite();
-    const { done, error } = s.sendDone();
-    expect(done).toBe(true);
-    expect(error!.code).toBe(ErrorCode.STREAM_CLOSED);
-  });
-
-  it("no DATA is sent after CLOSE or RESET: _write on a half-closed-local stream fails", async () => {
-    const host = fakeHost();
-    const s = new MixerStream(1, host, 1024, 1024);
-    s.closeWrite();
-    await expect(
-      new Promise<void>((resolve, reject) => {
-        (s as unknown as { _write: (c: Uint8Array, e: string, cb: (e?: Error | null) => void) => void })._write(
-          new Uint8Array([1]),
-          "buffer",
-          (err) => (err ? reject(err) : resolve()),
-        );
-      }),
-    ).rejects.toThrow();
-  });
-
-  it("close() on a stream whose peer hasn't half-closed sends CLOSE then RESET(CANCEL)", () => {
-    const host = fakeHost();
-    const s = new MixerStream(1, host, 1024, 1024);
-    s.on("error", () => {});
-    s.close();
-    const types = host.frames.map((f) => decodeFrame(f).type);
-    expect(types).toEqual([FrameType.CLOSE, FrameType.RESET]);
-    const resetFrame = decodeFrame(host.frames[1]!);
-    expect(resetFrame.payload[3]).toBe(ErrorCode.CANCEL);
-  });
-
-  it("close() when the peer already half-closed is just CloseWrite + local teardown (no RESET)", () => {
-    const host = fakeHost();
-    const s = new MixerStream(1, host, 1024, 1024);
-    s.handleClose(); // peer half-closed first
-    s.close();
-    const types = host.frames.map((f) => decodeFrame(f).type);
-    expect(types).toEqual([FrameType.CLOSE]);
+  it("closeWrite() is idempotent: one CLOSE frame, same promise", async () => {
+    const { host, stream } = make();
+    const a = stream.closeWrite();
+    const b = stream.closeWrite();
+    expect(a).toBe(b);
+    await a;
+    expect(host.ofType(FrameType.CLOSE)).toHaveLength(1);
   });
 
   it("duplicate CLOSE from the peer is a STREAM_CLOSED stream error", () => {
-    const host = fakeHost();
-    const s = new MixerStream(1, host, 1024, 1024);
-    s.handleClose();
-    expect(() => s.handleClose()).toThrow(/duplicate CLOSE/);
+    const { stream } = make();
+    stream.handleClose();
+    expect(() => stream.handleClose()).toThrow(StreamError);
   });
 
-  it("credits WINDOW back once unacked reaches half the window", async () => {
-    const host = fakeHost();
-    const s = new MixerStream(1, host, 100, 1024);
-    s.handleData(new Uint8Array(60)); // > window/2 = 50
-    s.resume();
-    await new Promise((r) => setImmediate(r));
-    const windowFrames = host.frames.filter((f) => decodeFrame(f).type === FrameType.WINDOW);
-    expect(windowFrames.length).toBe(1);
-  });
-
-  // --- item 1: credit-on-consume across all four consumption modes -----------
-
-  const WINDOW = 262144; // default window; half-window threshold = 131072
-  const PAYLOAD_BYTES = 150000; // > 128 KiB, forces at least one WINDOW credit
-
-  /** Feeds `total` bytes into the stream as a sequence of recvWindow-respecting chunks. */
-  function feed(s: MixerStream, total: number, chunkSize = 16384): void {
-    let sent = 0;
-    while (sent < total) {
-      const n = Math.min(chunkSize, total - sent, s.getRecvWindow());
-      if (n <= 0) break; // caller must drain between feeds if this happens
-      s.handleData(new Uint8Array(n));
-      sent += n;
+  it("DATA after the peer's CLOSE is a STREAM_CLOSED stream error", () => {
+    const { stream } = make();
+    stream.handleClose();
+    try {
+      stream.handleData(enc("x"));
+      expect.unreachable();
+    } catch (e) {
+      expect(e).toBeInstanceOf(StreamError);
+      expect((e as StreamError).code).toBe(ErrorCode.STREAM_CLOSED);
     }
-  }
+  });
+});
 
-  function windowIncrements(host: ReturnType<typeof fakeHost>): number[] {
-    return host.frames.filter((f) => decodeFrame(f).type === FrameType.WINDOW).map((f) => windowIncrement(decodeFrame(f)));
-  }
-
-  it("credits on consume via on('data')", async () => {
-    const host = fakeHost();
-    const s = new MixerStream(1, host, WINDOW, WINDOW);
-    let received = 0;
-    s.on("data", (c: Buffer) => (received += c.length));
-    const done = new Promise<void>((resolve) => s.on("end", resolve));
-    feed(s, PAYLOAD_BYTES);
-    s.push(null);
-    await done;
-    expect(received).toBe(PAYLOAD_BYTES);
-    const increments = windowIncrements(host);
-    expect(increments.length).toBeGreaterThanOrEqual(1);
-    const total = increments.reduce((a, b) => a + b, 0);
-    expect(total).toBeGreaterThanOrEqual(WINDOW / 2);
-    expect(total).toBeLessThanOrEqual(PAYLOAD_BYTES);
-    expect(s.getRecvWindow()).toBeGreaterThan(WINDOW - PAYLOAD_BYTES);
-    expect(s.getRecvWindow()).toBeGreaterThan(0);
+describe("MixerStream reading and credit", () => {
+  it("returns credit at half the window as the app reads, not on receipt", async () => {
+    const { host, stream } = make(16384);
+    stream.handleData(new Uint8Array(6000));
+    stream.handleData(new Uint8Array(6000));
+    expect(host.ofType(FrameType.WINDOW)).toHaveLength(0);
+    expect(stream.getRecvWindow()).toBe(16384 - 12000);
+    await stream.read();
+    expect(host.ofType(FrameType.WINDOW)).toHaveLength(0); // 6000 < 8192
+    await stream.read();
+    const windows = host.ofType(FrameType.WINDOW);
+    expect(windows).toHaveLength(1);
+    expect(windowIncrement(windows[0]!)).toBe(12000);
+    expect(stream.getRecvWindow()).toBe(16384);
   });
 
-  it("credits on consume via pipe()", async () => {
-    const host = fakeHost();
-    const s = new MixerStream(1, host, WINDOW, WINDOW);
-    const { PassThrough } = await import("node:stream");
-    const sink = new PassThrough();
-    let received = 0;
-    sink.on("data", (c: Buffer) => (received += c.length));
-    const done = new Promise<void>((resolve) => sink.on("end", resolve));
-    s.pipe(sink);
-    feed(s, PAYLOAD_BYTES);
-    s.push(null);
-    await done;
-    expect(received).toBe(PAYLOAD_BYTES);
-    const total = windowIncrements(host).reduce((a, b) => a + b, 0);
-    expect(total).toBeGreaterThanOrEqual(WINDOW / 2);
-    expect(total).toBeLessThanOrEqual(PAYLOAD_BYTES);
-    expect(s.getRecvWindow()).toBeGreaterThan(WINDOW - PAYLOAD_BYTES);
+  it("DATA exceeding recv credit throws ConnError(FLOW_CONTROL_ERROR)", () => {
+    const { stream } = make(16384);
+    try {
+      stream.handleData(new Uint8Array(16385));
+      expect.unreachable();
+    } catch (e) {
+      expect(e).toBeInstanceOf(ConnError);
+      expect((e as ConnError).code).toBe(ErrorCode.FLOW_CONTROL_ERROR);
+    }
   });
 
-  it("credits on consume via for await", async () => {
-    const host = fakeHost();
-    const s = new MixerStream(1, host, WINDOW, WINDOW);
-    let received = 0;
-    const iterate = (async () => {
-      for await (const chunk of s) received += (chunk as Buffer).length;
-    })();
-    feed(s, PAYLOAD_BYTES);
-    s.push(null);
-    await iterate;
-    expect(received).toBe(PAYLOAD_BYTES);
-    const total = windowIncrements(host).reduce((a, b) => a + b, 0);
-    expect(total).toBeGreaterThanOrEqual(WINDOW / 2);
-    expect(total).toBeLessThanOrEqual(PAYLOAD_BYTES);
-    expect(s.getRecvWindow()).toBeGreaterThan(WINDOW - PAYLOAD_BYTES);
+  it("keeps its own copy of each DATA payload", async () => {
+    const { stream } = make();
+    const payload = enc("abc");
+    stream.handleData(payload);
+    payload.fill(0);
+    expect(dec(await stream.read())).toBe("abc");
   });
 
-  it("credits on consume via explicit read()", async () => {
-    const host = fakeHost();
-    const s = new MixerStream(1, host, WINDOW, WINDOW);
-    let received = 0;
-    const done = new Promise<void>((resolve) => s.on("end", resolve));
-    s.on("readable", () => {
-      let chunk: Buffer | null;
-      while ((chunk = s.read() as Buffer | null) !== null) received += chunk.length;
-    });
-    feed(s, PAYLOAD_BYTES);
-    s.push(null);
-    await done;
-    expect(received).toBe(PAYLOAD_BYTES);
-    const total = windowIncrements(host).reduce((a, b) => a + b, 0);
-    expect(total).toBeGreaterThanOrEqual(WINDOW / 2);
-    expect(total).toBeLessThanOrEqual(PAYLOAD_BYTES);
-    expect(s.getRecvWindow()).toBeGreaterThan(WINDOW - PAYLOAD_BYTES);
+  it("a pending read is woken by DATA; concurrent reads are served FIFO", async () => {
+    const { stream } = make();
+    const r1 = stream.read();
+    const r2 = stream.read();
+    stream.handleData(enc("one"));
+    stream.handleData(enc("two"));
+    expect(dec(await r1)).toBe("one");
+    expect(dec(await r2)).toBe("two");
   });
 
-  // --- item 2: peer RESET must not throw with no 'error' listener ------------
-
-  it("RESET(CANCEL) with no 'error' listener does not throw, fires 'close', and sets resetCode", async () => {
-    const host = fakeHost();
-    const s = new MixerStream(1, host, 1024, 1024);
-    // Deliberately no s.on("error", ...): this is exactly the case that used
-    // to crash the process (an unhandled Duplex 'error' emission).
-    const closeP = new Promise<void>((resolve) => s.on("close", resolve));
-    const resetP = new Promise<{ code: number; message: string }>((resolve) => s.on("reset", resolve));
-    expect(() => s.handleReset(ErrorCode.CANCEL, "peer cancelled")).not.toThrow();
-    const info = await resetP;
-    expect(info.code).toBe(ErrorCode.CANCEL);
-    await closeP;
-    expect(s.resetCode).toBe(ErrorCode.CANCEL);
+  it("CLOSE preserves buffered data: chunks first, then null (repeatedly)", async () => {
+    const { stream } = make();
+    stream.handleData(enc("hello"));
+    stream.handleClose();
+    expect(dec(await stream.read())).toBe("hello");
+    expect(await stream.read()).toBeNull();
+    expect(await stream.read()).toBeNull();
   });
 
-  it("RESET with an 'error' listener still destroys with the StreamError", async () => {
-    const host = fakeHost();
-    const s = new MixerStream(1, host, 1024, 1024);
-    const errP = new Promise<Error>((resolve) => s.on("error", resolve));
-    s.handleReset(ErrorCode.CANCEL, "peer cancelled");
-    const err = await errP;
-    expect((err as unknown as { code: number }).code).toBe(ErrorCode.CANCEL);
-    expect(s.destroyed).toBe(true);
+  it("async iteration yields every chunk and ends at CLOSE", async () => {
+    const { stream } = make();
+    stream.handleData(enc("a"));
+    stream.handleData(enc("b"));
+    setTimeout(() => stream.handleClose(), 1);
+    const got: string[] = [];
+    for await (const c of stream) got.push(dec(c)!);
+    expect(got).toEqual(["a", "b"]);
   });
 
-  // --- item 7: reset() code-name-or-number, message truncation, toWeb() ------
-
-  it("reset() accepts a numeric code and sends RESET with it", () => {
-    const host = fakeHost();
-    const s = new MixerStream(1, host, 1024, 1024);
-    s.on("error", () => {});
-    s.reset(ErrorCode.CANCEL, "bye");
-    const frame = decodeFrame(host.frames[0]!);
-    expect(frame.type).toBe(FrameType.RESET);
-    expect(frame.payload[3]).toBe(ErrorCode.CANCEL);
+  it("RESET from the peer discards buffered data and rejects reads with StreamError(code); closed=reset byPeer", async () => {
+    const { host, stream } = make();
+    stream.handleData(enc("buffered"));
+    stream.handleReset(ErrorCode.CANCEL, "peer gave up");
+    expect(stream.resetCode).toBe(ErrorCode.CANCEL);
+    const err = (await stream.read().catch((e) => e)) as StreamError;
+    expect(err).toBeInstanceOf(StreamError);
+    expect(err.code).toBe(ErrorCode.CANCEL);
+    expect(host.ofType(FrameType.RESET)).toHaveLength(0); // never RESET in answer to RESET
+    expect(host.retired).toEqual([1]);
+    await expect(stream.closed).resolves.toEqual({ kind: "reset", code: ErrorCode.CANCEL, name: "CANCEL", message: "peer gave up", byPeer: true });
   });
 
-  it("reset() accepts a wire code name and sends the matching numeric RESET code", () => {
-    const host = fakeHost();
-    const s = new MixerStream(1, host, 1024, 1024);
-    s.on("error", () => {});
-    s.reset("CANCEL", "bye");
-    const frame = decodeFrame(host.frames[0]!);
-    expect(frame.payload[3]).toBe(ErrorCode.CANCEL);
+  it("RESET after CLOSE still discards the buffer (RESET wins)", async () => {
+    const { stream } = make();
+    stream.handleData(enc("x"));
+    stream.handleClose();
+    stream.handleReset(ErrorCode.INTERNAL_ERROR, "");
+    await expect(stream.read()).rejects.toBeInstanceOf(StreamError);
+  });
+});
+
+describe("MixerStream writing", () => {
+  it("chunks writes into 16 KiB DATA frames", async () => {
+    const { host, stream } = make(16384, 262144);
+    await stream.write(new Uint8Array(16384 * 2 + 10));
+    expect(host.data().map((d) => d.length)).toEqual([16384, 16384, 10]);
   });
 
-  it("reset() rejects an unknown code name", () => {
-    const host = fakeHost();
-    const s = new MixerStream(1, host, 1024, 1024);
-    expect(() => s.reset("NOT_A_REAL_CODE")).toThrow(/unknown ws-mixer error code name/);
+  it("a string is written as UTF-8", async () => {
+    const { host, stream } = make();
+    await stream.write("héllo");
+    expect(dec(host.data()[0]!)).toBe("héllo");
+  });
+
+  it("blocks at send window 0 and resumes on WINDOW", async () => {
+    const { host, stream } = make(16384, 16384);
+    let done = false;
+    const p = stream.write(new Uint8Array(16384 + 5)).then(() => (done = true));
+    await tick();
+    expect(host.data().map((d) => d.length)).toEqual([16384]);
+    expect(done).toBe(false);
+    expect(stream.getSendWindow()).toBe(0);
+    stream.handleWindow(100);
+    await p;
+    expect(host.data().map((d) => d.length)).toEqual([16384, 5]);
+    expect(stream.getSendWindow()).toBe(95);
+  });
+
+  it("WINDOW overflow past 2^31-1 throws ConnError", () => {
+    const { stream } = make(16384, 0x7fff_ffff);
+    expect(() => stream.handleWindow(1)).toThrow(ConnError);
+  });
+
+  it("WINDOW is tolerated on a stream already closed", async () => {
+    const { stream } = make();
+    stream.handleClose();
+    await stream.closeWrite();
+    expect(() => stream.handleWindow(5)).not.toThrow();
+  });
+
+  it("writes are serialized in call order", async () => {
+    const { host, stream } = make();
+    host.hold = true;
+    const a = stream.write("a");
+    const b = stream.write("b");
+    await tick();
+    host.release();
+    await Promise.all([a, b]);
+    expect(host.data().map(dec)).toEqual(["a", "b"]);
+  });
+
+  it("write after closeWrite() rejects with STREAM_CLOSED", async () => {
+    const { stream } = make();
+    void stream.closeWrite();
+    const err = (await stream.write("late").catch((e) => e)) as StreamError;
+    expect(err).toBeInstanceOf(StreamError);
+    expect(err.code).toBe(ErrorCode.STREAM_CLOSED);
+  });
+
+  it("closeWrite() waits for queued writes, then sends CLOSE after the last DATA", async () => {
+    const { host, stream } = make();
+    host.hold = true;
+    const w = stream.write("data");
+    const c = stream.closeWrite();
+    await tick();
+    expect(host.ofType(FrameType.CLOSE)).toHaveLength(0);
+    expect(stream.getState()).toBe("open");
+    host.release();
+    await Promise.all([w, c]);
+    expect(host.kinds()).toEqual(["DATA", "CLOSE"]);
+    expect(stream.getState()).toBe("half_closed_local");
+  });
+
+  it("a credit-blocked write is woken by reset() and rejects with the reset code; closeWrite() still resolves", async () => {
+    const { host, stream } = make(16384, 16384);
+    const w = stream.write(new Uint8Array(16384 + 5));
+    const werr = w.catch((e) => e as StreamError);
+    await tick();
+    const c = stream.closeWrite();
+    await tick();
+    stream.reset(ErrorCode.INTERNAL_ERROR, "giving up");
+    const err = await werr;
+    expect(err).toBeInstanceOf(StreamError);
+    expect((err as StreamError).code).toBe(ErrorCode.INTERNAL_ERROR);
+    await c;
+    expect(host.ofType(FrameType.CLOSE)).toHaveLength(0);
+  });
+});
+
+describe("MixerStream reset / close / refuse", () => {
+  it("reset() sends RESET with a numeric code, retires, rejects pending reads, closed=reset not byPeer", async () => {
+    const { host, stream } = make();
+    const r = stream.read();
+    stream.reset(ErrorCode.INTERNAL_ERROR, "app gave up");
+    await expect(r).rejects.toMatchObject({ code: ErrorCode.INTERNAL_ERROR });
+    const rst = host.ofType(FrameType.RESET);
+    expect(rst).toHaveLength(1);
+    expect(resetCode(rst[0]!)).toBe(ErrorCode.INTERNAL_ERROR);
+    expect(resetMessage(rst[0]!)).toBe("app gave up");
+    expect(host.retired).toEqual([1]);
+    expect(stream.getState()).toBe("closed");
+    await expect(stream.closed).resolves.toMatchObject({ kind: "reset", code: ErrorCode.INTERNAL_ERROR, byPeer: false });
+  });
+
+  it("reset() accepts a wire code name", () => {
+    const { host, stream } = make();
+    stream.reset("STREAM_LIMIT");
+    expect(resetCode(host.ofType(FrameType.RESET)[0]!)).toBe(ErrorCode.STREAM_LIMIT);
+  });
+
+  it("reset() throws on an unknown code name", () => {
+    const { stream } = make();
+    expect(() => stream.reset("NOT_A_CODE")).toThrow(/unknown ws-mixer error code name/);
   });
 
   it("reset() truncates the message to 256 UTF-8 bytes on a character boundary", () => {
-    const host = fakeHost();
-    const s = new MixerStream(1, host, 1024, 1024);
-    s.on("error", () => {});
-    // Every character is a 3-byte UTF-8 sequence ('☃' snowman), so a
-    // naive byte-count truncation would split one in half.
-    const longMessage = "☃".repeat(200); // 600 bytes
-    s.reset(ErrorCode.CANCEL, longMessage);
-    const frame = decodeFrame(host.frames[0]!);
-    const messageBytes = frame.payload.subarray(4);
-    expect(messageBytes.length).toBeLessThanOrEqual(256);
-    // Decoding must not throw or produce a replacement character from a split sequence.
-    const decoded = new TextDecoder("utf-8", { fatal: true }).decode(messageBytes);
-    expect(decoded.length * 3).toBe(messageBytes.length);
+    const { host, stream } = make();
+    stream.reset("CANCEL", "x" + "é".repeat(200));
+    const msg = resetMessage(host.ofType(FrameType.RESET)[0]!);
+    expect(msg).toBe("x" + "é".repeat(127));
+    expect(new TextEncoder().encode(msg).length).toBe(255);
   });
 
-  // --- blocker 1: reset() must not throw with no 'error' listener ------------
-
-  it("reset() with no 'error' listener does not throw and fires 'close'", async () => {
-    const host = fakeHost();
-    const s = new MixerStream(1, host, 1024, 1024);
-    // Deliberately no s.on("error", ...).
-    const closeP = new Promise<void>((resolve) => s.on("close", resolve));
-    expect(() => s.reset("INTERNAL_ERROR", "x")).not.toThrow();
-    await closeP;
-    expect(s.getState()).toBe("closed");
+  it("reset() on an already-closed stream is a no-op", async () => {
+    const { host, stream } = make();
+    stream.handleClose();
+    await stream.closeWrite();
+    stream.reset("CANCEL");
+    expect(host.ofType(FrameType.RESET)).toHaveLength(0);
+    await expect(stream.closed).resolves.toEqual({ kind: "finished" });
   });
 
-  it("reset() with an 'error' listener still carries the code via 'error'", async () => {
-    const host = fakeHost();
-    const s = new MixerStream(1, host, 1024, 1024);
-    const errP = new Promise<Error>((resolve) => s.on("error", resolve));
-    s.reset("INTERNAL_ERROR", "x");
-    const err = await errP;
-    expect((err as unknown as { code: number }).code).toBe(ErrorCode.INTERNAL_ERROR);
-    expect(s.destroyed).toBe(true);
+  it("close() while the peer is still sending sends RESET(CANCEL), no CLOSE", () => {
+    const { host, stream } = make();
+    stream.close();
+    expect(host.kinds()).toEqual(["RESET"]);
+    expect(resetCode(host.ofType(FrameType.RESET)[0]!)).toBe(ErrorCode.CANCEL);
   });
 
-  it("reset() sets resetCode but does not emit 'reset' (the app-called API already knows why)", () => {
-    const host = fakeHost();
-    const s = new MixerStream(1, host, 1024, 1024);
-    s.on("error", () => {});
-    let sawReset = false;
-    s.on("reset", () => (sawReset = true));
-    s.reset(ErrorCode.CANCEL, "app decided");
-    expect(s.resetCode).toBe(ErrorCode.CANCEL);
-    expect(sawReset).toBe(false);
+  it("close() after the peer's CLOSE is just closeWrite(): CLOSE, no RESET", async () => {
+    const { host, stream } = make();
+    stream.handleClose();
+    stream.close();
+    await stream.closed;
+    expect(host.kinds()).toEqual(["CLOSE"]);
   });
 
-  it("abort() sets resetCode and emits 'reset', mirroring a peer-sent RESET", () => {
-    const host = fakeHost();
-    const s = new MixerStream(1, host, 1024, 1024);
-    s.on("error", () => {});
-    const resetP = new Promise<{ code: number; message: string }>((resolve) => s.on("reset", resolve));
-    s.abort(ErrorCode.PROTOCOL_ERROR, "sdk-detected violation");
-    const frame = decodeFrame(host.frames[0]!);
-    expect(frame.type).toBe(FrameType.RESET);
-    expect(frame.payload[3]).toBe(ErrorCode.PROTOCOL_ERROR);
-    expect(s.resetCode).toBe(ErrorCode.PROTOCOL_ERROR);
-    return resetP.then((info) => {
-      expect(info.code).toBe(ErrorCode.PROTOCOL_ERROR);
-      expect(info.message).toBe("sdk-detected violation");
-    });
+  it("refuse() sends RESET(REFUSED_STREAM)", () => {
+    const { host, stream } = make();
+    stream.refuse();
+    expect(resetCode(host.ofType(FrameType.RESET)[0]!)).toBe(ErrorCode.REFUSED_STREAM);
   });
 
-  it("abort() on an already-closed stream is a no-op: no duplicate RESET, no 'reset' emitted", () => {
-    const host = fakeHost();
-    const s = new MixerStream(1, host, 1024, 1024);
-    s.on("error", () => {});
-    s.reset(ErrorCode.CANCEL, "first");
-    host.frames.length = 0;
-    let sawReset = false;
-    s.on("reset", () => (sawReset = true));
-    expect(() => s.abort(ErrorCode.PROTOCOL_ERROR, "too late")).not.toThrow();
-    expect(host.frames).toHaveLength(0);
-    expect(sawReset).toBe(false);
-    expect(s.resetCode).toBe(ErrorCode.CANCEL); // unchanged from the first reset()
+  it("abort() (SDK-detected) sends RESET and resolves closed=reset not byPeer; a no-op once closed", async () => {
+    const { host, stream } = make();
+    stream.abort(ErrorCode.STREAM_CLOSED, "DATA after CLOSE");
+    stream.abort(ErrorCode.STREAM_CLOSED, "again");
+    expect(host.ofType(FrameType.RESET)).toHaveLength(1);
+    expect(stream.resetCode).toBe(ErrorCode.STREAM_CLOSED);
+    await expect(stream.closed).resolves.toMatchObject({ kind: "reset", byPeer: false });
   });
 
-  it("close() with no 'error' listener on a stream whose peer hasn't half-closed does not throw", async () => {
-    const host = fakeHost();
-    const s = new MixerStream(1, host, 1024, 1024);
-    const closeP = new Promise<void>((resolve) => s.on("close", resolve));
-    expect(() => s.close()).not.toThrow();
-    await closeP;
-  });
-
-  it("CLOSE both ways (peer CLOSE with data buffered, then end()): 'finish' and 'end' both fire before 'close', and finished() resolves instead of a premature close", async () => {
-    const { finished } = await import("node:stream/promises");
-    const host = fakeHost();
-    const s = new MixerStream(1, host, 1024, 1024);
-    s.handleData(new TextEncoder().encode("hello"));
-    s.handleClose();
-    const events: string[] = [];
-    for (const ev of ["finish", "end", "close"]) s.on(ev, () => events.push(ev));
-    const done = finished(s);
-    s.end();
-    await new Promise((r) => setImmediate(r));
-    expect(s.getState()).toBe("closed");
-    expect(s.destroyed).toBe(false); // "hello" is still unread: no 'end' yet, so no 'close' yet
-
-    const chunks: Buffer[] = [];
-    for await (const chunk of s) chunks.push(chunk as Buffer);
-    expect(Buffer.concat(chunks).toString()).toBe("hello");
-    await done;
-    await new Promise((r) => setImmediate(r));
-    expect(events.slice().sort()).toEqual(["close", "end", "finish"]);
-    expect(events[2]).toBe("close");
-    expect(s.destroyed).toBe(true);
-    expect(s.errored).toBeNull();
-  });
-
-  it("closeWrite() on a peer-CLOSE'd stream whose read side already ended destroys it right away: 'close' fires", async () => {
-    const host = fakeHost();
-    const s = new MixerStream(1, host, 1024, 1024);
-    s.handleClose();
-    for await (const _ of s) void _;
-    expect(s.readableEnded).toBe(true);
-    const closeP = new Promise<void>((resolve) => s.on("close", resolve));
-    s.closeWrite();
-    await closeP;
-    expect(s.destroyed).toBe(true);
-    expect(host.retired).toEqual([1]);
-  });
-
-  it("toWeb() returns a Web Streams readable/writable pair", () => {
-    const host = fakeHost();
-    const s = new MixerStream(1, host, 1024, 1024);
-    const web = s.toWeb();
-    expect(web.readable).toBeInstanceOf(ReadableStream);
-    expect(web.writable).toBeInstanceOf(WritableStream);
+  it("sendDone() is true with STREAM_CLOSED once CLOSE was sent, with the RESET error after reset", async () => {
+    const a = make();
+    expect(a.stream.sendDone().done).toBe(false);
+    await a.stream.closeWrite();
+    expect(a.stream.sendDone()).toMatchObject({ done: true, error: { code: ErrorCode.STREAM_CLOSED } });
+    const b = make();
+    b.stream.reset("CANCEL");
+    expect(b.stream.sendDone()).toMatchObject({ done: true, error: { code: ErrorCode.CANCEL } });
   });
 });
 
-describe("MixerStream.terminateNoThrow: abnormal connection death always errors an open stream (R2)", () => {
-  function abnormalCloseError(): WsMixerError {
-    return new WsMixerError(ErrorCode.INTERNAL_ERROR, "socket closed with code 1006", { wsCode: 1006 });
-  }
+describe("MixerStream.terminate (connection teardown)", () => {
+  const lost = () => new ConnError(ErrorCode.INTERNAL_ERROR, "socket closed with code 1006");
 
-  it("no 'error' listener: 'end' is NOT emitted, 'close' fires, stream.errored carries the error, nothing crashes the process", async () => {
-    const host = fakeHost();
-    const s = new MixerStream(1, host, 1024, 1024);
-    let sawEnd = false;
-    let sawClose = false;
-    s.on("data", () => {});
-    s.on("end", () => {
-      sawEnd = true;
-    });
-    s.on("close", () => {
-      sawClose = true;
-    });
-    s.resume(); // flowing mode, so a clean end would surface 'end' here if this bug regressed
-
-    const uncaught: unknown[] = [];
-    const onUncaught = (e: unknown) => uncaught.push(e);
-    process.on("uncaughtException", onUncaught);
-    try {
-      const err = abnormalCloseError();
-      s.terminateNoThrow(err);
-      await new Promise((r) => setImmediate(r));
-
-      expect(sawEnd).toBe(false);
-      expect(sawClose).toBe(true);
-      expect(s.errored).toBe(err);
-      expect(uncaught).toHaveLength(0);
-    } finally {
-      process.off("uncaughtException", onUncaught);
-    }
+  it("an open stream: pending read rejects with the ConnError, closed=connection_lost, never a clean EOF", async () => {
+    const { stream } = make();
+    const r = stream.read();
+    const err = lost();
+    stream.terminate(err);
+    await expect(r).rejects.toBe(err);
+    await expect(stream.read()).rejects.toBe(err);
+    await expect(stream.closed).resolves.toEqual({ kind: "connection_lost", error: err });
+    expect(stream.getState()).toBe("closed");
   });
 
-  it("with an 'error' listener attached: it receives the connection's error", async () => {
-    const host = fakeHost();
-    const s = new MixerStream(1, host, 1024, 1024);
-    let received: unknown;
-    s.on("error", (e) => {
-      received = e;
-    });
-    const err = abnormalCloseError();
-    s.terminateNoThrow(err);
-    await new Promise((r) => setImmediate(r));
-    expect(received).toBe(err);
+  it("keeps buffered data readable, then rejects (no CLOSE had arrived)", async () => {
+    const { stream } = make();
+    stream.handleData(enc("hello"));
+    stream.terminate(lost());
+    expect(dec(await stream.read())).toBe("hello");
+    await expect(stream.read()).rejects.toBeInstanceOf(ConnError);
   });
 
-  it("a for-await consumer throws the connection's error instead of completing normally, even with no 'error' listener attached", async () => {
-    const host = fakeHost();
-    const s = new MixerStream(1, host, 1024, 1024);
-    const err = abnormalCloseError();
-    const consume = (async () => {
-      const chunks: Buffer[] = [];
-      for await (const chunk of s) chunks.push(chunk as Buffer);
-      return chunks;
-    })();
-    s.terminateNoThrow(err);
-    await expect(consume).rejects.toBe(err);
+  it("CLOSE already received: buffered data, then a clean null", async () => {
+    const { stream } = make();
+    stream.handleData(enc("hello"));
+    stream.handleClose();
+    stream.terminate(lost());
+    expect(dec(await stream.read())).toBe("hello");
+    expect(await stream.read()).toBeNull();
   });
 
-  it("a write blocked on send credit gets the connection's error via its callback, promptly, instead of hanging", async () => {
-    const host = fakeHost();
-    const s = new MixerStream(1, host, 1024, 0); // sendWindow 0: the write blocks immediately in reserveSendCredit
-    const err = abnormalCloseError();
-    const writeErr = await new Promise<Error | null | undefined>((resolve) => {
-      s.write(Buffer.from("hello"), (e) => resolve(e));
-      setImmediate(() => s.terminateNoThrow(err));
-    });
-    expect(writeErr).toBe(err);
+  it("a credit-blocked write and later writes fail promptly with the connection's error", async () => {
+    const { stream } = make(16384, 0);
+    const w = stream.write("blocked");
+    const werr = w.catch((e) => e);
+    await tick();
+    const err = lost();
+    stream.terminate(err);
+    expect(await werr).toBe(err);
+    await expect(stream.write("later")).rejects.toBe(err);
+  });
+
+  it("a StreamError (drain-deadline CANCEL): resetCode set, closed=reset not byPeer, buffered data kept, no RESET sent", async () => {
+    const { host, stream } = make();
+    stream.handleData(enc("hi"));
+    stream.terminate(new StreamError(ErrorCode.CANCEL, 1, "connection drained"));
+    expect(stream.resetCode).toBe(ErrorCode.CANCEL);
+    expect(dec(await stream.read())).toBe("hi");
+    await expect(stream.read()).rejects.toMatchObject({ code: ErrorCode.CANCEL, message: "connection drained" });
+    await expect(stream.closed).resolves.toEqual({ kind: "reset", code: ErrorCode.CANCEL, name: "CANCEL", message: "connection drained", byPeer: false });
+    expect(host.ofType(FrameType.RESET)).toHaveLength(0);
+  });
+
+  it("is a no-op once the stream finished", async () => {
+    const { stream } = make();
+    stream.handleClose();
+    await stream.closeWrite();
+    stream.terminate(lost());
+    expect(await stream.read()).toBeNull();
+    await expect(stream.closed).resolves.toEqual({ kind: "finished" });
   });
 });
 
-describe("MixerStream.terminateNoThrow: the peer's CLOSE already arrived -- buffered data is preserved, not discarded (R2 gap closed)", () => {
-  function abnormalCloseError(): WsMixerError {
-    return new WsMixerError(ErrorCode.INTERNAL_ERROR, "socket closed with code 1006", { wsCode: 1006 });
-  }
-
-  it("CLOSE already received with data still buffered: a later connection-level failure still delivers the buffered data, then 'end' -- stream.errored stays null, no 'error' fires", async () => {
-    const host = fakeHost();
-    const s = new MixerStream(1, host, 1024, 1024);
-    s.handleData(new TextEncoder().encode("hello"));
-    s.handleClose(); // the peer's CLOSE already arrived; "hello" is still unread, sitting in the buffer
-
-    let sawError = false;
-    s.on("error", () => {
-      sawError = true;
-    });
-
-    const err = abnormalCloseError();
-    s.terminateNoThrow(err); // the connection dies abnormally before "hello" was ever read
-
-    const chunks: Buffer[] = [];
-    for await (const chunk of s) chunks.push(chunk as Buffer);
-    expect(Buffer.concat(chunks).toString()).toBe("hello"); // delivered first, as CLIENT-SDK.md requires
-    expect(s.errored).toBeNull(); // the response DID complete -- no error on the read side
-    expect(sawError).toBe(false);
+describe("toWebStreams", () => {
+  it("reads chunks then closes; writes DATA then CLOSE on writable.close()", async () => {
+    const { host, stream } = make();
+    const { readable, writable } = toWebStreams(stream);
+    stream.handleData(enc("in"));
+    stream.handleClose();
+    const reader = readable.getReader();
+    expect(dec((await reader.read()).value!)).toBe("in");
+    expect((await reader.read()).done).toBe(true);
+    const writer = writable.getWriter();
+    await writer.write(enc("out"));
+    await writer.close();
+    expect(host.kinds()).toEqual(["DATA", "CLOSE"]);
   });
 
-  it("CLOSE already received: the WRITE side's callback is settled with the real error once the read side has drained, not before", async () => {
-    const host = fakeHost();
-    const s = new MixerStream(1, host, 1024, 1024);
-    s.handleData(new TextEncoder().encode("hello"));
-    s.handleClose(); // the peer's CLOSE already arrived; "hello" is still unread, sitting in the buffer
-    const err = abnormalCloseError();
-    s.terminateNoThrow(err); // read side pending 'end' until "hello" is consumed below
-
-    const writeErrP = new Promise<Error | null | undefined>((resolve) => {
-      s.write(Buffer.from("still trying to write"), (e) => resolve(e));
-    });
-
-    const chunks: Buffer[] = [];
-    for await (const chunk of s) chunks.push(chunk as Buffer);
-    expect(Buffer.concat(chunks).toString()).toBe("hello"); // read side still delivers what it buffered
-
-    expect(await writeErrP).toBe(err); // the write's callback gets the real terminal error, not a generic one
-    expect(s.destroyed).toBe(true);
-  });
-
-  it("CLOSE already received, terminateNoThrow already ran: a write issued after termination still resolves with the real error, and the buffered read + 'end' + 'close' still happen (write-after-termination)", async () => {
-    const host = fakeHost();
-    const s = new MixerStream(1, host, 1024, 1024);
-    s.handleData(new TextEncoder().encode("hello"));
-    s.handleClose();
-    const err = abnormalCloseError();
-    s.terminateNoThrow(err);
-
-    const events: string[] = [];
-    s.on("end", () => events.push("end"));
-    s.on("close", () => events.push("close"));
-    const closeP = new Promise<void>((resolve) => s.on("close", resolve));
-
-    const writeErrP = new Promise<Error | null | undefined>((resolve) => {
-      s.write(Buffer.from("x"), (e) => resolve(e));
-    });
-
-    const chunks: Buffer[] = [];
-    for await (const chunk of s) chunks.push(chunk as Buffer);
-    expect(Buffer.concat(chunks).toString()).toBe("hello");
-
-    await closeP;
-    expect(events).toEqual(["end", "close"]);
-    expect(await writeErrP).toBe(err);
-  });
-
-  it("a RESET still discards buffered data and errors, even when the peer had already sent CLOSE first -- discardBuffered overrides the CLOSE-preserves-data path", async () => {
-    const host = fakeHost();
-    const s = new MixerStream(1, host, 1024, 1024);
-    let received: unknown;
-    s.on("error", (e) => {
-      received = e;
-    });
-    s.handleData(new TextEncoder().encode("hello"));
-    s.handleClose(); // remoteClosed = true, "hello" still buffered
-    s.handleReset(ErrorCode.CANCEL, "actually never mind"); // RESET arrives after CLOSE -- WIRE.md: RESET discards
-    await new Promise((r) => setImmediate(r));
-
-    expect(s.getState()).toBe("closed");
-    expect(s.destroyed).toBe(true);
-    expect(s.errored).toBeTruthy();
-    expect(s.resetCode).toBe(ErrorCode.CANCEL);
-    expect(received).toBeInstanceOf(StreamError);
-  });
-});
-
-describe("MixerStream.terminateNoThrow: 'close' always fires on the CLOSE-already-arrived path (BUG 1/2)", () => {
-  function abnormalCloseError(): WsMixerError {
-    return new WsMixerError(ErrorCode.INTERNAL_ERROR, "socket closed with code 1006", { wsCode: 1006 });
-  }
-
-  it("CLOSE already received, buffer already empty: a later connection failure still destroys the stream and fires 'close'", async () => {
-    const host = fakeHost();
-    const s = new MixerStream(1, host, 1024, 1024);
-    s.on("error", () => {});
-    s.handleClose(); // remoteClosed = true, nothing buffered -- maybeDeliverEOF already pushed EOF
-    const closeP = new Promise<void>((resolve) => s.on("close", resolve));
-    s.terminateNoThrow(abnormalCloseError());
-    await closeP;
-    expect(s.destroyed).toBe(true);
-  });
-
-  it("CLOSE already received, data still buffered: 'close' fires once the buffered data has been delivered and 'end' fires, with stream.errored staying null", async () => {
-    const host = fakeHost();
-    const s = new MixerStream(1, host, 1024, 1024);
-    s.handleData(new TextEncoder().encode("hello"));
-    s.handleClose();
-    const closeP = new Promise<void>((resolve) => s.on("close", resolve));
-    const err = abnormalCloseError();
-    s.terminateNoThrow(err);
-
-    const chunks: Buffer[] = [];
-    for await (const chunk of s) chunks.push(chunk as Buffer);
-    expect(Buffer.concat(chunks).toString()).toBe("hello");
-    await closeP;
-    expect(s.destroyed).toBe(true);
-    expect(s.errored).toBeNull();
-  });
-
-  it("CLOSE already received with a write still outstanding when the connection dies: the write fails promptly with the real error (not silently, not routed around), the buffered read is still delivered followed by 'end', and the stream still reaches 'close' instead of hanging", async () => {
-    const host = fakeHost();
-    const s = new MixerStream(1, host, 1024, 0); // sendWindow 0: the write blocks in reserveSendCredit, staying queued/"outstanding"
-    s.handleData(new TextEncoder().encode("hello"));
-    s.handleClose(); // remoteClosed = true, "hello" buffered
-    const err = abnormalCloseError();
-
-    const closeP = new Promise<void>((resolve) => s.on("close", resolve));
-    const writeErrP = new Promise<Error | null | undefined>((resolve) => {
-      s.write(Buffer.from("still trying to write"), (e) => resolve(e));
-    });
-    // Let the write settle into writeQueue (blocked on send credit) before
-    // the connection dies, and before anything reads "hello" back out --
-    // terminateNoThrow must see both the outstanding write AND the still-
-    // unread buffer at once.
-    await new Promise((resolve) => setImmediate(resolve));
-    s.terminateNoThrow(err);
-
-    const chunks: Buffer[] = [];
-    for await (const chunk of s) chunks.push(chunk as Buffer);
-    expect(Buffer.concat(chunks).toString()).toBe("hello"); // buffered read is still delivered, not lost
-
-    expect(await writeErrP).toBe(err);
-    await closeP;
-    expect(s.destroyed).toBe(true);
-    expect(s.errored).toBe(err); // Node's own Writable machinery still marks `errored` once the held write callback runs with `err`, even though the read side finished cleanly first (no 'error' event fires, per the other assertions here)
-  });
-
-  it("app calls reset() while a write callback is held back for the read side: the stream destroys, 'close' fires, and the callback still receives the terminal error, instead of hanging forever (BUG 1)", async () => {
-    const host = fakeHost();
-    const s = new MixerStream(1, host, 1024, 0); // sendWindow 0: the write blocks in reserveSendCredit, staying queued/"outstanding"
-    s.handleData(new TextEncoder().encode("hello"));
-    s.handleClose(); // remoteClosed = true, "hello" buffered
-    const err = new WsMixerError(ErrorCode.INTERNAL_ERROR, "socket closed with code 1006", { wsCode: 1006 });
-
-    const writeErrP = new Promise<Error | null | undefined>((resolve) => {
-      s.write(Buffer.from("still trying to write"), (e) => resolve(e));
-    });
-    await new Promise((resolve) => setImmediate(resolve));
-    s.terminateNoThrow(err); // holds the write callback back, waiting on the never-to-be-read buffer
-
-    const closeP = new Promise<void>((resolve) => s.on("close", resolve));
-    s.reset(ErrorCode.CANCEL, "giving up"); // nobody ever reads "hello" -- reset() must still unstick this
-
-    await closeP;
-    expect(s.destroyed).toBe(true);
-    expect(await writeErrP).toBe(err);
-  });
-
-  it("write with no reader attached: the callback stays uncalled until the read side is actually drained, then 'end'/'close' fire and the callback runs with the terminal error (documented tradeoff)", async () => {
-    const host = fakeHost();
-    const s = new MixerStream(1, host, 1024, 0); // sendWindow 0: the write blocks in reserveSendCredit, staying queued/"outstanding"
-    s.handleData(new TextEncoder().encode("hello"));
-    s.handleClose(); // remoteClosed = true, "hello" buffered, nobody reading
-    const err = new WsMixerError(ErrorCode.INTERNAL_ERROR, "socket closed with code 1006", { wsCode: 1006 });
-
-    let writeErr: Error | null | undefined = "unsettled" as unknown as Error | null | undefined;
-    s.write(Buffer.from("x"), (e) => {
-      writeErr = e;
-    });
-    await new Promise((r) => setImmediate(r)); // let the write settle into writeQueue, blocked on send credit, before terminating
-    s.terminateNoThrow(err);
-    await new Promise((r) => setImmediate(r));
-    expect(writeErr).toBe("unsettled"); // no reader yet -- callback must not have run
-
-    const events: string[] = [];
-    s.on("end", () => events.push("end"));
-    s.on("close", () => events.push("close"));
-    const closeP = new Promise<void>((resolve) => s.on("close", resolve));
-
-    const chunks: Buffer[] = [];
-    for await (const chunk of s) chunks.push(chunk as Buffer); // attach a reader now
-    expect(Buffer.concat(chunks).toString()).toBe("hello");
-
-    await closeP;
-    expect(events).toEqual(["end", "close"]);
-    expect(writeErr).toBe(err);
-  });
-});
-
-describe("MixerStream.drainWriteQueue: a write that fails outside termination reports its error, never a false success", () => {
-  /**
-   * Runs `body`, collecting any uncaughtException/unhandledRejection raised while it (and one
-   * macrotask after it) runs -- an unlistened 'error' emitted from inside drainWriteQueue's async
-   * loop surfaces as the latter.
-   */
-  async function collectUncaught(body: () => Promise<void>): Promise<unknown[]> {
-    const uncaught: unknown[] = [];
-    const onUncaught = (e: unknown) => uncaught.push(e);
-    process.on("uncaughtException", onUncaught);
-    process.on("unhandledRejection", onUncaught);
-    try {
-      await body();
-      await new Promise((r) => setImmediate(r));
-    } finally {
-      process.off("uncaughtException", onUncaught);
-      process.off("unhandledRejection", onUncaught);
-    }
-    return uncaught;
-  }
-
-  it("no 'error' listener, the connection's send rejects mid-drain: the callback gets that error, a promisified write rejects, nothing crashes", async () => {
-    const host = fakeHost();
-    const sendErr = new Error("socket write failed");
-    host.sendData = vi.fn(async () => {
-      throw sendErr;
-    });
-    const s = new MixerStream(1, host, 1024, 1024);
-    const { promisify } = await import("node:util");
-    const write = promisify((chunk: Buffer, cb: (e?: Error | null) => void) => s.write(chunk, cb));
-
-    const uncaught = await collectUncaught(async () => {
-      await expect(write(Buffer.from("hello"))).rejects.toBe(sendErr);
-    });
-    expect(uncaught).toHaveLength(0);
-    expect(s.errored).toBe(sendErr);
-  });
-
-  it("no 'error' listener, a write blocked on send credit is rejected by closeWrite(): the callback gets STREAM_CLOSED, nothing crashes", async () => {
-    const host = fakeHost();
-    const s = new MixerStream(1, host, 1024, 0); // sendWindow 0: the write blocks in reserveSendCredit
-    let writeErr: Error | null | undefined;
-    const uncaught = await collectUncaught(async () => {
-      const writeErrP = new Promise<Error | null | undefined>((resolve) => {
-        s.write(Buffer.from("hello"), (e) => resolve(e));
-      });
-      await new Promise((r) => setImmediate(r));
-      s.closeWrite();
-      s.handleWindow(100); // wakes the waiter, which now sees half_closed_local and rejects
-      writeErr = await writeErrP;
-    });
-    expect(writeErr).toBeInstanceOf(StreamError);
-    expect((writeErr as StreamError).code).toBe(ErrorCode.STREAM_CLOSED);
-    expect(uncaught).toHaveLength(0);
-
-    // The failed write errored the read side too, before the peer finished sending: DATA + CLOSE arriving afterwards are accepted by the state machine but never reach a reader.
-    s.handleData(new TextEncoder().encode("late"));
-    s.handleClose();
-    expect(s.getState()).toBe("closed");
-    expect(s.errored).toBe(writeErr);
-    const events: string[] = [];
-    s.on("data", () => events.push("data"));
-    s.on("end", () => events.push("end"));
-    await new Promise((r) => setImmediate(r));
-    expect(events).toEqual([]);
-  });
-
-  it("peer CLOSE already arrived with data buffered, no 'error' listener, the send rejects before any teardown: the buffer, 'end' and 'close' are still delivered, and the callback is held until after 'end'", async () => {
-    const host = fakeHost();
-    const sendErr = new Error("WebSocket is not open: readyState 2 (CLOSING)");
-    host.sendData = vi.fn(async () => {
-      throw sendErr;
-    });
-    const s = new MixerStream(1, host, 1024, 1024);
-    s.handleData(new TextEncoder().encode("hello"));
-    s.handleClose(); // remoteClosed = true, "hello" still buffered
-
-    const events: string[] = [];
-    let writeErr: Error | null | undefined;
-    s.write(Buffer.from("x"), (e) => {
-      writeErr = e;
-      events.push("write-cb");
-    });
-    await new Promise((r) => setImmediate(r)); // the send has rejected; no teardown has reached the stream yet
-    expect(events).toEqual([]);
-    expect(s.errored).toBeNull();
-
-    s.on("end", () => events.push("end"));
-    s.on("close", () => events.push("close"));
-    const closeP = new Promise<void>((resolve) => s.on("close", resolve));
-    const connErr = new WsMixerError(ErrorCode.INTERNAL_ERROR, "socket closed with code 1006", { wsCode: 1006 });
-    s.terminateNoThrow(connErr); // what MixerConn.rejectOutstanding() does once the socket's 'close' follows
-
-    const chunks: Buffer[] = [];
-    for await (const chunk of s) chunks.push(chunk as Buffer);
-    expect(Buffer.concat(chunks).toString()).toBe("hello");
-    await closeP;
-    expect(events).toEqual(["end", "write-cb", "close"]);
-    expect(writeErr).toBe(connErr);
-    expect(s.errored).toBe(connErr); // marked by Node's Writable once the held callback runs, after the read side finished
-  });
-
-  it("peer CLOSE already arrived with data buffered, the send rejects, then the app calls closeWrite() before any teardown: draining the buffer still settles the held callback and fires 'close'", async () => {
-    const host = fakeHost();
-    const sendErr = new Error("WebSocket is not open: readyState 2 (CLOSING)");
-    host.sendData = vi.fn(async () => {
-      throw sendErr;
-    });
-    const s = new MixerStream(1, host, 1024, 1024);
-    s.handleData(new TextEncoder().encode("hello"));
-    s.handleClose();
-
-    const events: string[] = [];
-    let writeErr: Error | null | undefined;
-    s.write(Buffer.from("x"), (e) => {
-      writeErr = e;
-      events.push("write-cb");
-    });
-    await new Promise((r) => setImmediate(r)); // the send has rejected and is held
-    s.closeWrite(); // closed + retired: MixerConn's teardown will never reach this stream now
-    expect(s.getState()).toBe("closed");
-    expect(host.retired).toEqual([1]);
-
-    s.on("end", () => events.push("end"));
-    s.on("close", () => events.push("close"));
-    const closeP = new Promise<void>((resolve) => s.on("close", resolve));
-    const chunks: Buffer[] = [];
-    for await (const chunk of s) chunks.push(chunk as Buffer);
-    expect(Buffer.concat(chunks).toString()).toBe("hello");
-    await closeP;
-    expect(events).toEqual(["end", "write-cb", "close"]);
-    expect(writeErr).toBe(sendErr);
-    expect(s.destroyed).toBe(true);
-  });
-
-  it("peer CLOSE already arrived with data buffered, the send rejects, no teardown and no closeWrite(): draining the buffer settles the held callback after 'end', and the later teardown fires 'close'", async () => {
-    const host = fakeHost();
-    const sendErr = new Error("WebSocket is not open: readyState 2 (CLOSING)");
-    host.sendData = vi.fn(async () => {
-      throw sendErr;
-    });
-    const s = new MixerStream(1, host, 1024, 1024);
-    s.handleData(new TextEncoder().encode("hello"));
-    s.handleClose();
-
-    const events: string[] = [];
-    const writeErrP = new Promise<Error | null | undefined>((resolve) => {
-      s.write(Buffer.from("x"), (e) => {
-        events.push("write-cb");
-        resolve(e);
-      });
-    });
-    await new Promise((r) => setImmediate(r));
-    s.on("end", () => events.push("end"));
-    const chunks: Buffer[] = [];
-    for await (const chunk of s) chunks.push(chunk as Buffer);
-    expect(Buffer.concat(chunks).toString()).toBe("hello");
-    expect(await writeErrP).toBe(sendErr);
-    expect(events).toEqual(["end", "write-cb"]);
-    expect(s.getState()).toBe("half_closed_remote");
-
-    const closeP = new Promise<void>((resolve) => s.on("close", resolve));
-    s.terminateNoThrow(new WsMixerError(ErrorCode.INTERNAL_ERROR, "socket closed with code 1006", { wsCode: 1006 }));
-    await closeP;
-  });
-
-  it("peer CLOSE already arrived and 'end' already fired, the send rejects before any teardown: the callback gets the send error right away, and teardown still fires 'close'", async () => {
-    const host = fakeHost();
-    const sendErr = new Error("WebSocket is not open: readyState 2 (CLOSING)");
-    host.sendData = vi.fn(async () => {
-      throw sendErr;
-    });
-    const s = new MixerStream(1, host, 1024, 1024);
-    s.handleClose(); // nothing buffered: EOF pushed right away
-    const chunks: Buffer[] = [];
-    for await (const chunk of s) chunks.push(chunk as Buffer);
-    expect(s.readableEnded).toBe(true);
-
-    const writeErr = await new Promise<Error | null | undefined>((resolve) => {
-      s.write(Buffer.from("x"), (e) => resolve(e));
-    });
-    expect(writeErr).toBe(sendErr);
-    const closeP = new Promise<void>((resolve) => s.on("close", resolve));
-    const connErr = new WsMixerError(ErrorCode.INTERNAL_ERROR, "socket closed with code 1006", { wsCode: 1006 });
-    s.terminateNoThrow(connErr);
-    await closeP;
-  });
-
-  it("with an 'error' listener: the callback gets the send error and the listener fires with the same error", async () => {
-    const host = fakeHost();
-    const sendErr = new Error("socket write failed");
-    host.sendData = vi.fn(async () => {
-      throw sendErr;
-    });
-    const s = new MixerStream(1, host, 1024, 1024);
-    const errP = new Promise<Error>((resolve) => s.on("error", resolve));
-    const writeErr = await new Promise<Error | null | undefined>((resolve) => {
-      s.write(Buffer.from("hello"), (e) => resolve(e));
-    });
-    expect(writeErr).toBe(sendErr);
-    expect(await errP).toBe(sendErr);
+  it("cancelling the readable RESETs with CANCEL", async () => {
+    const { host, stream } = make();
+    const { readable } = toWebStreams(stream);
+    await readable.cancel("nope");
+    expect(resetCode(host.ofType(FrameType.RESET)[0]!)).toBe(ErrorCode.CANCEL);
   });
 });

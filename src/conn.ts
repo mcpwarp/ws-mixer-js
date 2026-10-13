@@ -6,10 +6,11 @@
  * OpenStream, only receives OPEN from the server.
  *
  * Mirrors `ws-mixer-go/wsmixer/conn.go`, `dispatch.go`, `sched.go`, `keepalive.go` and
- * `drain.go`, adapted to Node's single-threaded event loop (no goroutines:
+ * `drain.go`, adapted to JS's single-threaded event loop (no goroutines:
  * one write scheduler driven by a wake/notify queue instead of channels).
+ * Platform-neutral: talks to a WHATWG-shaped `WebSocketLike`.
  */
-import { EventEmitter } from "node:events";
+import { Emitter } from "./emitter.js";
 import {
   type AgentInfo,
   type ControlMessage,
@@ -30,19 +31,9 @@ import {
   resetMessage,
   windowIncrement,
 } from "./frame.js";
+import type { WebSocketLike } from "./socket.js";
 import { MixerStream, type StreamHost } from "./stream.js";
-import { truncateUtf8 } from "./util.js";
-
-/** Structural subset of `ws`'s WebSocket that MixerConn depends on (keeps the transport swappable). */
-export interface WSLike {
-  readonly readyState: number;
-  send(data: Uint8Array, cb?: (err?: Error) => void): void;
-  close(code?: number, reason?: string): void;
-  terminate?(): void;
-  on(event: "message", listener: (data: Uint8Array | Buffer, isBinary: boolean) => void): void;
-  on(event: "close", listener: (code: number, reason: Buffer) => void): void;
-  on(event: "error", listener: (err: Error) => void): void;
-}
+import { errorMessage, isArrayBufferAnyRealm, truncateUtf8 } from "./util.js";
 
 export interface ConnOptions {
   token: string;
@@ -77,6 +68,10 @@ const STREAM0_BURST = 100;
 const DELIVERY_QUEUE_MIN = 128;
 /** Added on top of maxStreams when that alone would exceed DELIVERY_QUEUE_MIN, mirroring deliveryQueueMargin. */
 const DELIVERY_QUEUE_MARGIN = 64;
+/** The writer waits while the socket's bufferedAmount is above this (WIRE.md section 2.6 rule 2). */
+const SEND_HIGH_WATER = 1024 * 1024;
+const SEND_POLL_MIN_MS = 5;
+const SEND_POLL_MAX_MS = 50;
 
 /**
  * Clamps a would-be WS close code to one actually legal to send on the wire
@@ -84,10 +79,9 @@ const DELIVERY_QUEUE_MARGIN = 64;
  * application-layer error code >= 0x1000_0000 is a legal RESET code,
  * errors.ts, but was never a legal *connection*-close code) is clamped to
  * INTERNAL_ERROR's mapped code (4002) instead, mirroring ws-mixer-go/wsmixer's
- * wsCloseCode (conn.go). `ws`'s Sender.close() throws a RangeError for an
- * out-of-range code rather than sending nothing, which this file's own
- * catch would otherwise turn into `ws.terminate()` -- a bare 1006 abnormal
- * closure that tells the peer nothing at all. `error{}` (sent separately,
+ * wsCloseCode (conn.go). A WHATWG `close()` throws for any code outside
+ * 1000/3000-4999 rather than sending anything, which would leave only a bare
+ * argument-less close that tells the peer nothing. `error{}` (sent separately,
  * unclamped) still carries the real code either way, and the *reported*
  * `wsCode` (the 'close' event below, DisconnectReason) stays the real
  * 4000+code too -- only the bytes actually put on the wire are clamped.
@@ -103,8 +97,8 @@ const MAX_RESET_MESSAGE = 256;
  * What a stream or a pending write/send sees when the connection under it
  * ends: always a ConnError, so `instanceof ConnError` vs `StreamError` tells
  * "the tunnel died" from "this stream was reset". A non-ConnError (the
- * socket's own close -> WsMixerError, a graceful close's NO_ERROR, a raw `ws`
- * send failure) is wrapped with the same code/message and kept as `cause`.
+ * socket's own close -> WsMixerError, a graceful close's NO_ERROR, a raw
+ * socket send failure) is wrapped with the same code/message and kept as `cause`.
  */
 function asConnError(err: Error): ConnError {
   if (err instanceof ConnError) return err;
@@ -133,7 +127,8 @@ interface OutboxItem {
 
 /** One queued control-channel (stream-0) frame, paired with the promise that resolves once it's actually written. */
 interface ControlItem {
-  frame: Uint8Array;
+  /** null: a barrier, resolved once every control frame queued before it was written. */
+  frame: Uint8Array | null;
   resolve: () => void;
   reject: (err: Error) => void;
 }
@@ -187,8 +182,8 @@ export declare interface MixerConn {
 }
 
 /** One live, handshaken (or handshaking) ws-mixer connection. */
-export class MixerConn extends EventEmitter {
-  private readonly ws: WSLike;
+export class MixerConn extends Emitter {
+  private readonly ws: WebSocketLike;
   private readonly opts: ConnOptions;
 
   private closed = false;
@@ -205,23 +200,6 @@ export class MixerConn extends EventEmitter {
   private lastStreamId?: number;
 
   private readonly streams = new Map<number, MixerStream>();
-  /**
-   * Retired (out of `streams`: no frame or DATA is ever routed to them again)
-   * but not yet destroyed -- in practice a stream CLOSE'd both ways, waiting
-   * on its reader's 'end'. Tracked only so rejectOutstanding() still tears
-   * them down; each leaves on its own 'close', and teardown clears the rest.
-   * Weak by default: a stream never read never emits 'end', so never
-   * 'close', and a strong ref would pin every such stream the app abandoned
-   * for the connection's lifetime. Strong while the stream holds a write
-   * callback (retireStream(), or pinRetired() when one is held after
-   * retirement): the stream owns that callback, not the other way round, and
-   * the callback is what the app is waiting on -- collecting the stream
-   * would leave it unsettled forever. A retired stream's held callbacks are
-   * only ever flushed by destroy(), so a strong entry leaves on 'close' and
-   * is never unpinned.
-   * Dead weak refs are pruned whenever the map is touched.
-   */
-  private readonly retired = new Map<number, MixerStream | WeakRef<MixerStream>>();
   private highestOpened = 0;
 
   /**
@@ -266,14 +244,13 @@ export class MixerConn extends EventEmitter {
   /**
    * The `StreamHost` a `MixerStream` actually talks to: a plain object of
    * bound closures, not `this` -- so `sendData`/`sendControlFrame`/
-   * `retireStream`/`pinRetired` stay private implementation details of
-   * MixerConn instead of leaking onto its public (and `.d.ts`) surface (item 8).
+   * `retireStream` stay private implementation details of MixerConn instead
+   * of leaking onto its public (and `.d.ts`) surface (item 8).
    */
   readonly #streamHost: StreamHost = {
     sendData: (streamId, chunk) => this.sendData(streamId, chunk),
     sendControlFrame: (frame) => this.sendControlFrame(frame),
     retireStream: (streamId) => this.retireStream(streamId),
-    pinRetired: (streamId) => this.pinRetired(streamId),
   };
 
   // --- write scheduler state ---
@@ -304,23 +281,36 @@ export class MixerConn extends EventEmitter {
   private watchdogTimer: ReturnType<typeof setInterval> | null = null;
   private handshakeTimer: ReturnType<typeof setTimeout> | null = null;
   private jitterTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Armed by retire(): the drain deadline for a superseded connection's remaining streams. */
+  private retireTimer: ReturnType<typeof setTimeout> | null = null;
   /**
    * The most recent pre-welcome `'error'` event's message, recorded so
    * `onSocketClose`'s report -- the sole reporter, see its own doc comment
-   * -- can use it as `message` when `ws`'s own close carries no reason of
-   * its own.
+   * -- can use it as `message` when the socket's own close carries no reason
+   * of its own.
    */
   private pendingHandshakeErrorMessage: string | undefined;
 
-  constructor(ws: WSLike, opts: ConnOptions) {
+  /** `socket` must already be open, with `binaryType = "arraybuffer"` (dialWebSocket does both). */
+  constructor(socket: WebSocketLike, opts: ConnOptions) {
     super();
-    this.ws = ws;
+    this.ws = socket;
     this.opts = opts;
     this.ourWindow = opts.window ?? DEFAULT_WINDOW;
     this.maxStreams = opts.maxStreams ?? DEFAULT_MAX_STREAMS;
-    ws.on("message", (data) => this.onMessage(data));
-    ws.on("close", (code, reason) => this.onSocketClose(code, reason));
-    ws.on("error", (err) => this.onSocketError(err));
+    socket.addEventListener("message", (ev: { data?: unknown }) => this.onMessage(ev?.data));
+    socket.addEventListener("close", (ev: { code?: unknown; reason?: unknown }) =>
+      this.onSocketClose(typeof ev?.code === "number" ? ev.code : 1006, typeof ev?.reason === "string" ? ev.reason : ""),
+    );
+    socket.addEventListener("error", (ev: { message?: unknown; error?: { message?: unknown } }) =>
+      this.onSocketError(
+        typeof ev?.message === "string" && ev.message
+          ? ev.message
+          : typeof ev?.error?.message === "string" && ev.error.message
+            ? ev.error.message
+            : "WebSocket error",
+      ),
+    );
   }
 
   // --- handshake --------------------------------------------------------------
@@ -399,10 +389,19 @@ export class MixerConn extends EventEmitter {
 
   // --- read dispatch (never blocks on application code) ------------------------
 
-  private onMessage(data: Uint8Array | Buffer): void {
-    this.counters.bytesIn += data.length;
+  private onMessage(data: unknown): void {
     try {
-      this.dispatchFrame(data instanceof Uint8Array ? data : new Uint8Array(data));
+      if (isArrayBufferAnyRealm(data)) {
+        this.counters.bytesIn += data.byteLength;
+        this.dispatchFrame(new Uint8Array(data));
+      } else if (ArrayBuffer.isView(data)) {
+        this.counters.bytesIn += data.byteLength;
+        this.dispatchFrame(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
+      } else if (typeof data === "string") {
+        throw new ConnError(ErrorCode.PROTOCOL_ERROR, "text frame received: ws-mixer.v1 is binary only");
+      } else {
+        throw new ConnError(ErrorCode.INTERNAL_ERROR, "WebSocket binaryType 'arraybuffer' not honoured");
+      }
     } catch (e) {
       this.handleDispatchError(e);
     }
@@ -432,7 +431,7 @@ export class MixerConn extends EventEmitter {
       }
       return;
     }
-    this.fail(new ConnError(ErrorCode.INTERNAL_ERROR, e instanceof Error ? e.message : String(e)));
+    this.fail(new ConnError(ErrorCode.INTERNAL_ERROR, errorMessage(e)));
   }
 
   private dispatchFrame(msg: Uint8Array): void {
@@ -681,7 +680,7 @@ export class MixerConn extends EventEmitter {
 
   /**
    * Invokes every listener for `event` in registration order, awaiting each
-   * one's return value before starting the next -- unlike EventEmitter's own
+   * one's return value before starting the next -- unlike the emitter's own
    * synchronous `emit`, which fires listeners back to back without waiting
    * for a returned Promise to settle.
    *
@@ -690,18 +689,18 @@ export class MixerConn extends EventEmitter {
    * `'handlerError'` emit -- never an unhandled rejection, and never fatal
    * to delivery: the next queued stream/app/drain event still runs.
    *
-   * Iterates rawListeners(), not listeners(): for a once() registration that
-   * is the self-removing wrapper, so it detaches on first delivery (it
-   * returns and throws exactly what the wrapped listener does).
+   * Iterates a snapshot of the registrations; a once() entry is dropped
+   * before it is invoked, so it detaches on first delivery.
    */
   private async emitOrdered(event: string, arg: unknown): Promise<void> {
-    for (const listener of this.rawListeners(event) as Array<(a: unknown) => unknown>) {
+    for (const entry of this.rawEntries(event)) {
+      if (entry.once) this.dropEntry(event, entry);
       try {
-        const result = listener.call(this, arg);
-        if (result instanceof Promise) await result;
+        const result = entry.fn.call(this, arg);
+        if (result && typeof (result as PromiseLike<unknown>).then === "function") await result;
       } catch (e) {
         this.counters.handlerErrors++;
-        const error = e instanceof Error ? e : new Error(String(e));
+        const error = e instanceof Error ? e : new Error(errorMessage(e), { cause: e });
         if (this.listenerCount("handlerError") > 0) this.emit("handlerError", { event, error });
       }
     }
@@ -711,11 +710,11 @@ export class MixerConn extends EventEmitter {
 
   /**
    * Queues one control-channel frame and returns a promise that resolves
-   * once `ws.send`'s callback confirms it was actually written (or rejects
+   * once the writer has handed it to the socket (writeRaw) (or rejects
    * with the connection's terminal error if the conn fails first) --
    * mirroring how `sendData()`'s per-stream outbox already works.
    */
-  private enqueueControl(frame: Uint8Array, priority = false): Promise<void> {
+  private enqueueControl(frame: Uint8Array | null, priority = false): Promise<void> {
     return new Promise((resolve, reject) => {
       if (this.closed) {
         reject(new ConnError(ErrorCode.INTERNAL_ERROR, "connection closed"));
@@ -778,24 +777,14 @@ export class MixerConn extends EventEmitter {
   }
 
   /**
-   * Backs `streamHost.retireStream`: retire a fully-closed stream's id. DATA
-   * still queued for it is rejected, never dropped (a dropped item's write
-   * callback would hang forever) -- with the stream's own sendDone() error
-   * (its RESET's, or STREAM_CLOSED after its CLOSE). A stream not yet
-   * destroyed moves to `retired` until its 'close' -- strongly if it holds
-   * a write callback, else weakly (see `retired`).
+   * Backs `streamHost.retireStream`: retire a finished or reset stream's id.
+   * DATA still queued for it is rejected, never dropped (a dropped item's
+   * write would hang forever) -- with the stream's own sendDone() error
+   * (its RESET's, or STREAM_CLOSED after its CLOSE).
    */
   private retireStream(streamId: number): void {
     const stream = this.streams.get(streamId);
     this.streams.delete(streamId);
-    if (stream && !stream.destroyed) {
-      this.pruneRetired();
-      this.retired.set(streamId, stream.hasHeldWriteCallbacks() ? stream : new WeakRef(stream));
-      stream.once("close", () => {
-        this.retired.delete(streamId);
-        this.pruneRetired();
-      });
-    }
     const q = this.outbox.get(streamId);
     this.outbox.delete(streamId);
     if (q) {
@@ -803,22 +792,6 @@ export class MixerConn extends EventEmitter {
       for (const item of q) item.reject(err);
     }
     if (this.streams.size === 0) this.notifyIdle();
-  }
-
-  /** Backs `streamHost.pinRetired`: a retired stream now holding a write callback is held strongly until its 'close'. */
-  private pinRetired(streamId: number): void {
-    const entry = this.retired.get(streamId);
-    if (entry instanceof WeakRef) {
-      const stream = entry.deref();
-      if (stream) this.retired.set(streamId, stream);
-    }
-  }
-
-  /** Drops weak `retired` entries whose stream has been garbage-collected. */
-  private pruneRetired(): void {
-    for (const [id, entry] of this.retired) {
-      if (entry instanceof WeakRef && entry.deref() === undefined) this.retired.delete(id);
-    }
   }
 
   /** Resolves every pending close()'s wait for the stream table to empty, instead of polling. */
@@ -891,7 +864,7 @@ export class MixerConn extends EventEmitter {
       while (this.controlQueue.length > 0) {
         const item = this.controlQueue.shift()!;
         try {
-          await this.writeRaw(item.frame);
+          if (item.frame) await this.writeRaw(item.frame);
           item.resolve();
         } catch (e) {
           item.reject(e as Error);
@@ -914,33 +887,28 @@ export class MixerConn extends EventEmitter {
   }
 
   /**
-   * Writes one frame and resolves once `ws.send`'s callback reports it
-   * flushed. This is how rule 2 (§2.6, "gate the write loop on the socket
-   * send buffer") is satisfied without polling `bufferedAmount` on a timer:
-   * `ws`'s `send(data, cb)` callback fires only once the chunk has actually
-   * been handed to the socket, so awaiting it before writing the next frame
-   * already keeps exactly one write in flight and applies backpressure for
-   * free (runWriter's loop awaits writeRaw() before picking the next chunk).
+   * Hands one frame to the socket, then waits while its `bufferedAmount` is
+   * above SEND_HIGH_WATER (1 MiB), polling every 5 ms doubling to 50 ms --
+   * WIRE.md section 2.6 rule 2 ("gate the write loop on the socket send
+   * buffer"): a WHATWG WebSocket has no per-send completion callback, so
+   * this is the only backpressure signal it offers. runWriter awaits this
+   * before picking the next frame, so one frame is in flight at a time.
    */
-  private writeRaw(frame: Uint8Array): Promise<void> {
-    return new Promise((resolve, reject) => {
-      if (this.closed) {
-        reject(new ConnError(ErrorCode.INTERNAL_ERROR, "connection closed"));
-        return;
-      }
-      try {
-        this.ws.send(frame, (err) => {
-          if (err) {
-            reject(asConnError(err));
-            return;
-          }
-          this.counters.bytesOut += frame.length;
-          resolve();
-        });
-      } catch (e) {
-        reject(asConnError(e instanceof Error ? e : new Error(String(e))));
-      }
-    });
+  private async writeRaw(frame: Uint8Array): Promise<void> {
+    if (this.closed || this.ws.readyState !== 1) {
+      throw new ConnError(ErrorCode.INTERNAL_ERROR, "connection closed");
+    }
+    try {
+      this.ws.send(frame);
+    } catch (e) {
+      throw e instanceof Error ? asConnError(e) : new ConnError(ErrorCode.INTERNAL_ERROR, errorMessage(e), { cause: e });
+    }
+    this.counters.bytesOut += frame.length;
+    let pollMs = SEND_POLL_MIN_MS;
+    while (this.ws.bufferedAmount > SEND_HIGH_WATER && !this.closed) {
+      await new Promise<void>((resolve) => setTimeout(resolve, pollMs));
+      pollMs = Math.min(pollMs * 2, SEND_POLL_MAX_MS);
+    }
   }
 
   // --- app messages -------------------------------------------------------------
@@ -1038,7 +1006,7 @@ export class MixerConn extends EventEmitter {
    * already allows closing on `error` "without reading the close frame that
    * followed".
    */
-  private teardownConn(err: WsMixerError, sendErrorFrame: boolean, streamErrorFactory?: (streamId: number) => WsMixerError): void {
+  private teardownConn(err: WsMixerError, sendErrorFrame: boolean, streamErrorFactory?: (streamId: number) => StreamError): void {
     if (this.closed) return;
     this.closed = true;
     this.stopTimers();
@@ -1059,7 +1027,11 @@ export class MixerConn extends EventEmitter {
     try {
       this.ws.close(wireCloseCode(wsCode), reason);
     } catch {
-      this.ws.terminate?.();
+      try {
+        this.ws.close();
+      } catch {
+        // already closing/closed
+      }
     }
     this.rejectOutstanding(err, streamErrorFactory);
     if (!this.handshakeDone) this.emit("__handshake_failed_internal", err);
@@ -1084,16 +1056,15 @@ export class MixerConn extends EventEmitter {
    *
    * `streamErrorFactory`, when given, overrides the error every live stream
    * is torn down with (`err` is still used for the connection-level frame/
-   * close/rejects) -- used by MixerClient when it fails a *superseded*
-   * (drained) conn: the streams on it aren't erroring, the conn they were
-   * riding on is being replaced, so each gets a stream-scoped CANCEL
+   * close/rejects) -- used when a *superseded* (drained) conn hits its drain
+   * deadline (retire()): the streams still on it get a stream-scoped CANCEL
    * ("connection drained") instead of the connection's own NO_ERROR.
    *
    * Synchronous, but any stream/app/drain event still queued for delivery at
    * this point is not: runDeliveryLoop keeps flushing it after this returns
    * (see close()'s doc comment above for why).
    */
-  fail(err: WsMixerError, streamErrorFactory?: (streamId: number) => WsMixerError): void {
+  fail(err: WsMixerError, streamErrorFactory?: (streamId: number) => StreamError): void {
     this.teardownConn(err, true, streamErrorFactory);
   }
 
@@ -1110,6 +1081,40 @@ export class MixerConn extends EventEmitter {
   }
 
   /**
+   * Drain hand-over (WIRE.md section 2.9): this connection sent `drain` and
+   * its replacement has welcomed. In-flight streams finish normally here;
+   * new ones go to the replacement. Closes with NO_ERROR as soon as the
+   * stream table is empty (after flushing any control frame already queued,
+   * e.g. the last stream's CLOSE), or at `deadlineMs`, failing the streams
+   * still open with a stream-scoped CANCEL ("connection drained").
+   * @internal
+   */
+  retire(deadlineMs: number): void {
+    if (this.closed) return;
+    const closeIdle = (): void => {
+      if (this.closed) return;
+      void this.enqueueControl(null).then(
+        () => {
+          if (!this.closed) this.fail(new WsMixerError(ErrorCode.NO_ERROR, "superseded by a new connection"));
+        },
+        () => {},
+      );
+    };
+    if (this.streams.size === 0) {
+      closeIdle();
+      return;
+    }
+    this.retireTimer = setTimeout(() => {
+      this.retireTimer = null;
+      this.fail(
+        new WsMixerError(ErrorCode.NO_ERROR, "superseded: drain deadline passed"),
+        (id) => new StreamError(ErrorCode.CANCEL, id, "connection drained"),
+      );
+    }, deadlineMs);
+    this.idleWaiters.push(closeIdle);
+  }
+
+  /**
    * Graceful client shutdown: drain{client_requested}, brief grace period,
    * then close(NO_ERROR). This resolves once teardownConn's synchronous
    * steps are done (frame/WS close/rejects/'close' emitted) -- it does NOT
@@ -1123,29 +1128,28 @@ export class MixerConn extends EventEmitter {
     if (this.closed) return;
     if (this.handshakeDone) {
       void this.sendControl({ t: "drain", reason: "client_requested", last_stream_id: this.highestOpened } as ControlMessage).catch(() => {});
-      if (this.streams.size > 0) {
-        // No polling: wait for whichever happens first -- the stream table
-        // draining to empty (notifyIdle, from retireStream), the grace
-        // deadline, or the connection closing out from under us. Both the
-        // timer and the 'close' listener are cleaned up afterwards
-        // regardless of which branch won the race, so neither dangles.
-        let graceTimer: ReturnType<typeof setTimeout> | undefined;
-        let onClose: (() => void) | undefined;
-        try {
-          await Promise.race([
-            this.waitForEmpty(),
-            new Promise<void>((resolve) => {
-              graceTimer = setTimeout(resolve, graceMs);
-            }),
-            new Promise<void>((resolve) => {
-              onClose = () => resolve();
-              this.once("close", onClose);
-            }),
-          ]);
-        } finally {
-          if (graceTimer) clearTimeout(graceTimer);
-          if (onClose) this.off("close", onClose);
-        }
+      // No polling: wait for whichever happens first -- the stream table
+      // draining to empty (notifyIdle, from retireStream), the grace
+      // deadline, or the connection closing out from under us. Both the
+      // timer and the 'close' listener are cleaned up afterwards
+      // regardless of which branch won the race, so neither dangles.
+      let graceTimer: ReturnType<typeof setTimeout> | undefined;
+      let onClose: (() => void) | undefined;
+      const graceOver = new Promise<void>((resolve) => {
+        graceTimer = setTimeout(resolve, graceMs);
+      });
+      const closed = new Promise<void>((resolve) => {
+        onClose = () => resolve();
+        this.once("close", onClose);
+      });
+      try {
+        if (this.streams.size > 0) await Promise.race([this.waitForEmpty(), graceOver, closed]);
+        // Same barrier as retire(): the drain frame and the last stream's
+        // CLOSE are queued control frames, written before the teardown.
+        if (!this.closed) await Promise.race([this.enqueueControl(null).catch(() => {}), graceOver, closed]);
+      } finally {
+        if (graceTimer) clearTimeout(graceTimer);
+        if (onClose) this.off("close", onClose);
       }
     }
     if (this.closed) return;
@@ -1153,34 +1157,25 @@ export class MixerConn extends EventEmitter {
   }
 
   /**
-   * A close frame this side actually *received* from `ws`'s 'close' event.
-   * `code`/`reason` here are always the peer's, per `ws`'s own contract
-   * (`receiverOnConclude` in `ws/lib/websocket.js` only ever updates
-   * `_closeCode`/`_closeMessage` from a frame it parsed off the wire, never
-   * from what this side sent via `.close()`) -- so whenever `this.closed` is
-   * already `true`, this is a close frame arriving after teardownConn()
-   * already ran and reported (never our own echoed close winning a race),
-   * and is correctly ignored rather than folded in after the fact.
+   * The socket's 'close' event, for a close this side did not initiate:
+   * whenever `this.closed` is already `true`, teardownConn() already ran
+   * and reported (this is the echo of our own close, or a peer close frame
+   * racing it), and it is ignored rather than folded in after the fact --
+   * an outgoing reason this side sent is never legitimate `closeReason`.
    *
    * Pre-welcome, this is also the SOLE reporter for a transport failure
-   * before `welcome` -- measured against real `ws` (8.21): a TCP reset,
-   * half-close or peer close frame after the 101 delivers a bare 'close'
-   * with no 'error' at all, and a protocol-level failure `ws` itself
-   * detects (an invalid frame: 1002, an oversized message: 1009, ...)
-   * delivers 'error' immediately followed by 'close' a macrotask or more
-   * later -- 'close' is never racing 'error' for which one wins; it always
-   * arrives after it, if it arrives at all. `onSocketError` below therefore
-   * never finalizes anything itself, only records the error's message here
-   * for `message` to fall back on when the close carries no reason of its
-   * own -- so this always reports the *actual* close code `ws` delivers
-   * (1006, or whatever real close code it sent), never a wsCode fabricated
-   * for a close that never happened.
+   * before `welcome`: a WHATWG WebSocket delivers 'error' (if at all)
+   * before 'close', never after. `onSocketError` below therefore never
+   * finalizes anything itself, only records the error's message here for
+   * `message` to fall back on when the close carries no reason of its own
+   * -- so this always reports the *actual* close code the socket delivers
+   * (1006, or whatever real close code it received), never a wsCode
+   * fabricated for a close that never happened.
    */
-  private onSocketClose(code: number, reason: Buffer): void {
+  private onSocketClose(code: number, reasonStr: string): void {
     if (this.closed) return;
     this.closed = true;
     this.stopTimers();
-    const reasonStr = reason.toString();
     const handshakePhase = !this.handshakeDone;
     const message = reasonStr || (handshakePhase ? this.pendingHandshakeErrorMessage : undefined) || `socket closed with code ${code}`;
     const err = new WsMixerError(ErrorCode.INTERNAL_ERROR, message, {
@@ -1193,26 +1188,25 @@ export class MixerConn extends EventEmitter {
   }
 
   /**
-   * Pre-welcome, `'error'` never arrives in the same microtask as (or after)
-   * a 'close' that never comes -- see onSocketClose's own doc comment for
-   * what real `ws` actually does. So this deliberately does NOT reject or
-   * finalize the handshake itself; it just records the error's message for
-   * onSocketClose (the sole reporter) to use as `message` when the close
-   * that follows carries no reason of its own. If `'close'` somehow never
-   * follows at all (a transport that violates `ws`'s own contract), nothing
-   * here is left waiting on it: `handshake()`'s own hello/welcome timeout
-   * (`handshakeTimer`, 10s default) still fires and produces the one report
-   * (`wsCode` 4001) regardless -- deliberately the only fallback for that
-   * case, not a second mechanism grafted on here.
+   * The socket's 'error' event. This deliberately does NOT reject or
+   * finalize the handshake itself (see onSocketClose's own doc comment); it
+   * just records the error's message for onSocketClose (the sole reporter)
+   * to use as `message` when the close that follows carries no reason of
+   * its own. If `'close'` somehow never follows at all (a transport that
+   * violates the WHATWG contract), nothing here is left waiting on it:
+   * `handshake()`'s own hello/welcome timeout (`handshakeTimer`, 10s
+   * default) still fires and produces the one report (`wsCode` 4001)
+   * regardless -- deliberately the only fallback for that case, not a
+   * second mechanism grafted on here.
    */
-  private onSocketError(err: Error): void {
+  private onSocketError(message: string): void {
     if (!this.handshakeDone && !this.closed) {
-      this.pendingHandshakeErrorMessage = err.message;
+      this.pendingHandshakeErrorMessage = message;
     }
     // Guarded (item 2): onSocketClose (or the hello/welcome timeout above)
     // still follows and emits 'close', so onDisconnect(reason) still
     // reports this even with no 'error' listener.
-    if (this.listenerCount("error") > 0) this.emit("error", new WsMixerError(ErrorCode.INTERNAL_ERROR, err.message));
+    if (this.listenerCount("error") > 0) this.emit("error", new WsMixerError(ErrorCode.INTERNAL_ERROR, message));
   }
 
   private stopTimers(): void {
@@ -1220,13 +1214,15 @@ export class MixerConn extends EventEmitter {
     if (this.watchdogTimer) clearInterval(this.watchdogTimer);
     if (this.handshakeTimer) clearTimeout(this.handshakeTimer);
     if (this.jitterTimer) clearTimeout(this.jitterTimer);
+    if (this.retireTimer) clearTimeout(this.retireTimer);
     this.pingTimer = null;
     this.watchdogTimer = null;
     this.handshakeTimer = null;
     this.jitterTimer = null;
+    this.retireTimer = null;
   }
 
-  private rejectOutstanding(err: Error, streamErrorFactory?: (streamId: number) => WsMixerError): void {
+  private rejectOutstanding(err: Error, streamErrorFactory?: (streamId: number) => StreamError): void {
     const connErr = asConnError(err);
     // Any control frame (including a pending sendApp()) still queued when
     // the connection dies never reaches writeRaw(), so it must be rejected
@@ -1234,26 +1230,13 @@ export class MixerConn extends EventEmitter {
     for (const item of this.controlQueue.splice(0, this.controlQueue.length)) {
       item.reject(connErr);
     }
-    // Same "don't crash a consumer with no 'error' listener" rule as a
-    // stream-level RESET (item 2 / stream.ts handleReset): a connection
-    // failure aborts every live stream the same way -- unless the caller
-    // gave a per-stream override (fail()'s streamErrorFactory), e.g. a
-    // superseded conn's streams getting stream-scoped CANCEL instead of
-    // the connection's own terminal error. Retired streams still awaiting
-    // their destroy are reached too (terminateNoThrow only finishes one
-    // CLOSE'd both ways, without adopting the error), so a write callback
-    // they hold is settled and 'close' fires once nothing is left unread;
-    // one already destroyed keeps the error it was destroyed with.
-    const retired: MixerStream[] = [];
-    for (const entry of this.retired.values()) {
-      const stream = entry instanceof WeakRef ? entry.deref() : entry;
-      if (stream) retired.push(stream);
+    // A connection failure ends every live stream with the connection's
+    // terminal error -- unless the caller gave a per-stream override
+    // (fail()'s streamErrorFactory), e.g. a superseded conn's streams
+    // getting a stream-scoped CANCEL at the drain deadline instead.
+    for (const stream of this.streams.values()) {
+      stream.terminate(streamErrorFactory ? streamErrorFactory(stream.id) : connErr);
     }
-    for (const stream of [...this.streams.values(), ...retired]) {
-      if (stream.destroyed) continue;
-      stream.terminateNoThrow(streamErrorFactory ? streamErrorFactory(stream.id) : connErr);
-    }
-    this.retired.clear();
     // After the streams, so DATA still queued behind another stream's write
     // fails with its own stream's terminal error (sendDone()), the same one
     // `stream.errored` gets -- not the connection's.

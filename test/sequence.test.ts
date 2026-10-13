@@ -113,7 +113,6 @@ describe("sequence fixtures", () => {
       const streams = new Map<number, MixerStream>();
       conn.on("stream", (s) => {
         streams.set(s.id, s);
-        s.on("error", () => {});
       });
       let lastClose: { wsCode: number; errorCode?: number; message: string } | undefined;
       conn.on("close", (c) => (lastClose = c));

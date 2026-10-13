@@ -11,10 +11,14 @@ export type {
 } from "./client.js";
 
 export { MixerConn } from "./conn.js";
-export type { ConnOptions, WSLike } from "./conn.js";
+export type { ConnOptions } from "./conn.js";
+
+export { webSocketFactory, defaultWebSocketFactory } from "./socket.js";
+export type { WebSocketLike, WebSocketInit, WebSocketFactory, WebSocketConstructorLike, WebSocketConstructorWithInit } from "./socket.js";
 
 export { MixerStream } from "./stream.js";
-export type { StreamState } from "./stream.js";
+export type { StreamState, StreamCloseReason } from "./stream.js";
+export { toWebStreams } from "./webstreams.js";
 
 export { ErrorCode, WsMixerError, ConnError, StreamError, TokenUnavailableError, codeName, parseErrorCode, closeCode } from "./errors.js";
 export type { ErrorCodeValue } from "./errors.js";
