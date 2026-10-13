@@ -406,7 +406,7 @@ describe("createTunnel", () => {
     await expect(tunnel.configure(null as unknown as TunnelConfig)).resolves.toBeUndefined();
     expect(tunnel.status.code).toBe(TunnelStatusCode.INVALID_CONFIG);
     expect(edge.upgrades).toHaveLength(0);
-    expect(logs.filter(([l, m]) => l === "error" && m.startsWith("invalid config: "))).toHaveLength(7);
+    expect(logs.filter(([l, m]) => l === "error" && m.startsWith("INVALID_CONFIG: "))).toHaveLength(7);
     expect(logs.some(([, m]) => m.includes(TOKEN) || m.includes("notes") || m.includes("yes") || m.includes("42"))).toBe(false);
     await tunnel.configure(cfg(edge));
     await waitFor(() => tunnel.status.state === "online");

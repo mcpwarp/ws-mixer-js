@@ -132,31 +132,45 @@ connection to close in the background. `close()` and the `TunnelBase` type are d
 
 When something is wrong the status says why in two forms: `code`, one of `TunnelStatusCode` for
 your logic, and `lastError`, the same in plain language to show users as is (`off` and a plain
-`connecting` carry neither):
+`connecting` carry neither). Every `lastError` is a full sentence ending with a period, so you can
+append it to your own text:
 
 | `code` | state | `lastError` |
 |---|---|---|
-| `RETRYING` | `connecting` | "Can't reach mcpwarp; retrying." / "mcpwarp couldn't register the service; retrying." |
-| `DISCONNECTED` | `connecting` | "Connection lost; retrying." |
+| `RETRYING` | `connecting` (a failed dial or register being retried, the very first one included) | "Can't reach mcpwarp; retrying." / "mcpwarp couldn't register the service; retrying." |
+| `DISCONNECTED` | `connecting` (redialing after a lost connection) | "Connection lost; retrying." |
 | `DISABLED` | `disabled` | "This service is disabled in the mcpwarp dashboard." |
 | `TAKEN_OVER` | `conflict` | "Another connection took over this name." |
-| `UNAUTHORIZED` | `error` | "The token was rejected." / "The token is not allowed to publish this service." |
+| `UNAUTHORIZED` | `error` (token rejected, or register refused as `FORBIDDEN`: the token may not publish this service) | "The token was rejected." / "The token is not allowed to publish this service." |
 | `INVALID_CONFIG` | `error` | "The service name is invalid: ..." / "The service name is not set." / "The token is not set." / "The tunnel settings are invalid." |
 | `USERNAME_REQUIRED` | `error` | "Choose a username in your mcpwarp account first." |
 | `QUOTA_EXCEEDED` | `error` | "Your mcpwarp account has no services left in its quota." |
 | `CONFLICT` | `error` | "The name is in use by another server." |
 | `UNSUPPORTED_VERSION` | `error` | "This SDK version is no longer supported; please update." |
-| `DISCONNECTED_FATAL` | `error` | "The connection to mcpwarp failed." |
+| `DISCONNECTED_FATAL` | `error` (a fatal close or transport failure, or `reconnect.maxAttempts` ran out) | "The connection to mcpwarp failed." |
 | `INTERNAL` | `error`, or `connecting` for a non-fatal server error (a register refused after an earlier success with a code not listed above can stay `connecting` until the next `configure()`) | "Something went wrong; the log has the details." |
 
 A register the server refuses (`UNAUTHORIZED`, `INVALID_CONFIG`, `USERNAME_REQUIRED`,
 `QUOTA_EXCEEDED`, `CONFLICT`) is fatal even on a reconnect after an earlier success. An HTTP 401
 at the upgrade is `UNAUTHORIZED` (a 403 or 404 `DISCONNECTED_FATAL`) only when the WebSocket
 factory reports the status (`upgradeFailure`); a standard WebSocket hides it and the tunnel keeps
-retrying.
+retrying. `RETRYING` already shows on the very first failed dial or register, before the tunnel
+was ever online; after a lost connection the redials say `DISCONNECTED` instead. With
+`reconnect.maxAttempts` set, running out of attempts (those before the first registration count
+too) ends in `DISCONNECTED_FATAL`.
 
-The technical message behind each goes to `logger` (retries and disconnects at `warn`, fatal
-failures at `error`). Logger messages carry no `mcpwarp: ` prefix; add your own tag.
+The technical message behind each goes to `logger`. At `error`: fatal failures as
+`CODE: message` with the McpwarpError code (a failure without one, such as an invalid `name`
+caught before dialing, has the message only), and a refused config as
+`INVALID_CONFIG: <which field is wrong>`, never echoing its value. At `warn`: retries as
+`retry #N in MS ms: reason`, disconnects as `disconnected: reason`, and non-fatal errors as
+`CODE: message` (a request handler's error has no code). Progress goes to `info`. Logger messages
+carry no `mcpwarp: ` prefix and never the token; add your own tag.
+
+`TunnelStatus` has no slot for reasons on the host's side (Zotero with no WebSocket-capable window
+to take a factory from, say). Keep your own copy of the status for the UI: until the tunnel can be
+configured, show `{ state: "off", lastError: <your text> }` from a host constant, then relay the
+tunnel's status once you subscribe.
 
 For plugin sandboxes: the controller itself needs no `AbortController` or `DOMException`. The SDK
 needs `setTimeout`/`clearTimeout`, `Promise`, `URL`, `TextEncoder`/`TextDecoder` (`TextDecoder`

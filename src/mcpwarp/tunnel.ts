@@ -24,8 +24,13 @@ interface TunnelCommon {
   /**
    * Default: silent. Never receives the token. Messages carry no "mcpwarp: "
    * prefix; tag them yourself. The technical details behind
-   * `status.lastError` land here: retries and disconnects at "warn", fatal
-   * failures at "error".
+   * `status.lastError` land here. At "error": fatal failures as
+   * "CODE: message" with the McpwarpError code (a failure without one, such
+   * as an invalid `name` caught before dialing, has the message only), and a
+   * refused config as "INVALID_CONFIG: <which field is wrong>", never its
+   * value. At "warn": retries as "retry #N in MS ms: reason", disconnects as
+   * "disconnected: reason", and non-fatal errors as "CODE: message" (a
+   * request handler's error has no code). Progress goes to "info".
    */
   logger?: (level: "info" | "warn" | "error", message: string) => void;
 }
@@ -63,13 +68,19 @@ export type TunnelState = "off" | "connecting" | "online" | "disabled" | "confli
 
 /** `TunnelStatus.code` values; named after the McpwarpError code where one exists. */
 export const TunnelStatusCode = {
-  /** "error": the token was rejected (also a register refused as UNAUTHENTICATED or FORBIDDEN, or an HTTP 401 at the upgrade). */
+  /**
+   * "error": the token was rejected (a register refused as UNAUTHENTICATED, or an HTTP 401 at the
+   * upgrade), or it is not allowed to publish this service (a register refused as FORBIDDEN).
+   */
   UNAUTHORIZED: "UNAUTHORIZED",
   /** "conflict": another connection took the name over. */
   TAKEN_OVER: "TAKEN_OVER",
   /** "connecting": the connection was lost and is being re-established. */
   DISCONNECTED: "DISCONNECTED",
-  /** "connecting": a dial or a register failed and is retried. */
+  /**
+   * "connecting": a dial or a register failed and is retried, the very first attempt included.
+   * Redials after a lost connection stay DISCONNECTED; a register retried then is RETRYING again.
+   */
   RETRYING: "RETRYING",
   /** "disabled": the service is disabled in the mcpwarp dashboard. */
   DISABLED: "DISABLED",
@@ -83,7 +94,10 @@ export const TunnelStatusCode = {
   CONFLICT: "CONFLICT",
   /** "error": mcpwarp no longer supports this SDK version. */
   UNSUPPORTED_VERSION: "UNSUPPORTED_VERSION",
-  /** "error": the connection failed for good (a fatal close, or `reconnect.maxAttempts` ran out). */
+  /**
+   * "error": the connection failed for good: a fatal close or transport failure, or
+   * `reconnect.maxAttempts` ran out (attempts before the first registration count too).
+   */
   DISCONNECTED_FATAL: "DISCONNECTED_FATAL",
   /** A failure none of the above covers; the logger has the details. */
   INTERNAL: "INTERNAL",
@@ -98,9 +112,10 @@ export interface TunnelStatus {
   code?: TunnelStatusCode;
   /**
    * `code` in plain language, fit to show to end users ("The token was
-   * rejected."). Cleared when the tunnel goes online; non-fatal errors while
-   * online (a failing request handler, say) are only logged. The technical
-   * message goes to the logger.
+   * rejected."): always a full sentence ending with a period, so it can be
+   * appended to the host's own text. Cleared when the tunnel goes online;
+   * non-fatal errors while online (a failing request handler, say) are only
+   * logged. The technical message goes to the logger.
    */
   lastError?: string;
 }
@@ -320,7 +335,7 @@ class TunnelImpl implements Tunnel {
     if (this.closed) return Promise.resolve();
     const invalid = invalidConfig(config);
     if (invalid) {
-      this.log("error", `invalid config: ${invalid.detail}`);
+      this.log("error", `${invalid.problem.code}: ${invalid.detail}`);
       this.desired = undefined;
       this.detach();
       this.setStatus({ state: "error", ...invalid.problem });

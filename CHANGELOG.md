@@ -2,6 +2,22 @@
 
 All notable changes to `@mcpwarp/ws-mixer` (the JS/TypeScript client SDK) are documented here.
 
+## Unreleased
+
+### Changed
+
+- Tunnel `logger`: a refused config now logs `INVALID_CONFIG: <which field is wrong>` at `error`
+  (was `invalid config: ...`), matching the `CODE: message` form of other failures. Values are
+  still never echoed.
+
+### Docs
+
+- Tunnel: `lastError` is always a full sentence ending with a period; the `logger` line formats per
+  level are spelled out; `RETRYING` covers the very first failed dial or register too;
+  `DISCONNECTED_FATAL` also means `reconnect.maxAttempts` ran out; `UNAUTHORIZED` also covers a
+  token not allowed to publish the service (register refused as `FORBIDDEN`). README: how a host
+  shows its own reasons (before the tunnel can be configured) next to the tunnel's status.
+
 ## 0.10.0 - 2026-10-13
 
 ### Breaking
