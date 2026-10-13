@@ -2,7 +2,7 @@
 
 All notable changes to `@mcpwarp/ws-mixer` (the JS/TypeScript client SDK) are documented here.
 
-## 0.8.0 - 2026-10-12
+## 0.8.0 - 2026-10-13
 
 ### Breaking
 
