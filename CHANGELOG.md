@@ -2,6 +2,61 @@
 
 All notable changes to `@mcpwarp/ws-mixer` (the JS/TypeScript client SDK) are documented here.
 
+## 0.10.0 - 2026-10-13
+
+### Breaking
+
+- `TunnelStatus.lastError` is now plain language for end users ("The token was rejected.",
+  "Another connection took over this name.", "Connection lost; retrying."): no `mcpwarp: ` prefix,
+  no raw error or retry reason, no mention of `configure()`. The technical message goes to the
+  `logger` (retries and disconnects at `warn`, fatal failures at `error`, with the McpwarpError code).
+  `disabled` now carries a `lastError` too.
+- Tunnel `logger` messages no longer start with `mcpwarp: `; the host adds its own tag.
+- `createTunnel()`: a register the server refuses (UNAUTHENTICATED, FORBIDDEN, INVALID_NAME,
+  QUOTA_EXCEEDED, USERNAME_REQUIRED, CONFLICT) on a reconnect after an earlier success is now fatal
+  (state `error` with its code; the tunnel stays down until the next `configure()`). It used to sit
+  at `connecting` with nothing left to retry it.
+
+### Deprecated
+
+- `TunnelBase` is renamed `TunnelOptions` and `Tunnel.close()` is renamed `dispose()`. The old
+  names stay as deprecated aliases and are removed in 0.11.0.
+
+### Added
+
+- `TunnelStatus.code`: a machine-readable reason next to `lastError`, one of the exported
+  `TunnelStatusCode` values (`RETRYING`, `DISCONNECTED`, `DISABLED`, `TAKEN_OVER`, `UNAUTHORIZED`,
+  `INVALID_CONFIG`, `USERNAME_REQUIRED`, `QUOTA_EXCEEDED`, `CONFLICT`, `UNSUPPORTED_VERSION`,
+  `DISCONNECTED_FATAL`, `INTERNAL`). A change of `code` alone notifies subscribers. `TunnelStatusCode`
+  and `TunnelOptions` are also re-exported from `@mcpwarp/ws-mixer/node`.
+- `TunnelConfig.webSocket`: a WebSocket factory per `configure()` call, overriding the one given
+  to `createTunnel()`. Part of the change check, by reference to the effective factory: a different
+  one restarts, while the options' own factory or none is no change.
+- `WsMixerError.httpStatus`: the HTTP status of a failed upgrade reported via `upgradeFailure`, set
+  whenever the client gives up on it (a fatal status, or the last one when retries run out).
+
+### Changed
+
+- A fatal HTTP 401 at the upgrade (reported via `upgradeFailure`) now rejects `expose()` / closes
+  the handle with `McpwarpError` code `UNAUTHORIZED` instead of `DISCONNECTED_FATAL`; the cause's
+  `httpStatus` is 401. Only the code changed: a reported 401 was already fatal in 0.9.0 (with a
+  static token at once, with a token provider after one refresh). `createTunnel()` shows it as
+  `UNAUTHORIZED`.
+
+### Fixed
+
+- `createTunnel()`: a server drain no longer leaves the status at `connecting` / "Connection lost;
+  retrying." while the replacement connection is online (the drained connection's end is logged
+  at `info` instead).
+- `createTunnel()`: `configure()` threw, or left the status stuck, for a `token` that is not a
+  string (an unset pref). A non-boolean `enabled`, or while enabled with a token a field of the
+  wrong type (including a `webSocket` that is not a function), is now state `error`, code
+  `INVALID_CONFIG`; a disabled config, or one with an empty token, is `off` whatever its other
+  fields hold. `configure()` never throws.
+- `createTunnel()`: a retry of a drain replacement no longer puts a retry message on an `online`
+  status, and an error while `disabled` no longer replaces its `lastError`. Only mcpwarp's own
+  errors update the status, and only while `connecting`; request handler errors are just logged.
+
 ## 0.9.0 - 2026-10-13
 
 ### Added

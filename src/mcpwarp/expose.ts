@@ -11,7 +11,7 @@ import { ErrorCode, WsMixerError } from "../errors.js";
 import { DEFAULT_MAX_BODY_BYTES } from "../http1/request.js";
 import { detectRuntime } from "../runtime.js";
 import type { WebSocketFactory } from "../socket.js";
-import { DEFAULT_URL, INTEGRATION_ID_RE, SERVICE_NAME_MAX, SERVICE_NAME_RE, type ServiceKind } from "./envelope.js";
+import { DEFAULT_URL, INTEGRATION_ID_RE, isValidServiceName, SERVICE_NAME_MAX, type ServiceKind } from "./envelope.js";
 import { McpwarpError } from "./errors.js";
 import { DEFAULT_TARGET_TIMEOUT_MS, MCP_PATH, serveWithHandler, serveWithTarget, type FetchHandler, type ServeContext, type StreamServer } from "./serve.js";
 import { Session, type ExposeConflict, type ExposeRegistration, type ExposeState } from "./session.js";
@@ -206,7 +206,7 @@ export function validateAgent(agent: unknown): void {
 }
 
 function validate(opts: ExposeBaseOptions): void {
-  if (typeof opts.name !== "string" || !SERVICE_NAME_RE.test(opts.name) || opts.name.length > SERVICE_NAME_MAX) {
+  if (!isValidServiceName(opts.name)) {
     throw new TypeError(`mcpwarp: invalid service \`name\`: lowercase letters, digits and inner dashes, at most ${SERVICE_NAME_MAX} characters`);
   }
   validateIntegration(opts.integration);
@@ -233,7 +233,7 @@ function abortError(signal: AbortSignalLike): Error {
 /** A fatal transport error as the McpwarpError `expose()` rejects / the handle closes with; the original is `cause`. */
 function fatalMcpwarpError(err: Error, serviceName: string): McpwarpError {
   if (err instanceof McpwarpError) return err;
-  const code = err instanceof WsMixerError && err.code === ErrorCode.UNAUTHORIZED ? "UNAUTHORIZED" : "DISCONNECTED_FATAL";
+  const code = err instanceof WsMixerError && (err.code === ErrorCode.UNAUTHORIZED || err.httpStatus === 401) ? "UNAUTHORIZED" : "DISCONNECTED_FATAL";
   return new McpwarpError(code, err.message, { fatal: true, serviceName, cause: err });
 }
 

@@ -1,6 +1,6 @@
 # The mcpwarp control plane, as this SDK implements it
 
-Status: descriptive of `src/mcpwarp/*` and `src/http1/*` (0.9.0). The tunnel's source of truth is
+Status: descriptive of `src/mcpwarp/*` and `src/http1/*` (0.10.0). The tunnel's source of truth is
 `mcpwarp-saas/apps/tunnel` (`internal/agentconn`, `internal/reqpath`); the Go CLI
 (`mcpwarp-tui-cli`, `internal/appproto`, `internal/relay`) is the reference agent. This SDK speaks
 ws-mixer.v1 underneath ([WIRE.md](https://github.com/mcpwarp/ws-mixer-spec/blob/main/docs/WIRE.md)).
@@ -26,12 +26,14 @@ refreshes tokens and never reads the environment; pass a provider function if th
 The header is optional (ws-mixer spec v0.5.0, `D-2026-10-13-01`; mcpwarp tunnel 0.5.0):
 `hello.token` is the authoritative credential. An upgrade without `Authorization` is accepted and
 authenticated at `hello`; a header that is present must be a well-formed `Bearer <token>` (else HTTP
-401) equal to `hello.token` (else `4011`). So runtimes whose WebSocket cannot set headers
-(browsers, Electron renderers, Firefox chrome code such as Zotero 7 plugins) connect with
-`webSocketFactory(ctor, { headers: false })`. Those runtimes also send an `Origin` the app cannot
-control (`Origin: null` from Gecko chrome windows); the tunnel accepts any `Origin`, since
-`hello.token` is the credential. The SDK never moves the token anywhere else (no query
-parameter: WIRE.md section 2.1 forbids it).
+401) equal to `hello.token` (else `4011`). When the WebSocket factory reports that 401 via
+`upgradeFailure`, `expose()` rejects with `UNAUTHORIZED` as well, the cause's `httpStatus` 401 (a
+fatal 403/404 stays `DISCONNECTED_FATAL`, with its `httpStatus`). So runtimes whose WebSocket
+cannot set headers (browsers, Electron renderers, Firefox chrome code such as Zotero 7 plugins)
+connect with `webSocketFactory(ctor, { headers: false })`. Those runtimes also send an `Origin`
+the app cannot control (`Origin: null` from Gecko chrome windows); the tunnel accepts any
+`Origin`, since `hello.token` is the credential. The SDK never moves the token anywhere else (no
+query parameter: WIRE.md section 2.1 forbids it).
 
 Before any `101`, the tunnel may refuse the upgrade with HTTP `503` (`Retry-After: 5`; its per-pod
 cap on sockets still waiting for `hello`) or `429` (`Retry-After`; per-client-IP rate limit). Both
@@ -104,7 +106,7 @@ Service names: `^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`, at most 30 characters (checked
 |---|---|
 | `SERVER_DISABLED` (carries `id`) | state `disabled`, `disabled` event; requests get 503 |
 | `INTERNAL`, `NO_RESPONDERS`, `TIMEOUT`, `ABORTED`, `CONNECTION_LOST`, `MALFORMED_REPLY`, `UNAVAILABLE`, `SERVICE_ERROR` | transient: non-fatal `error`, re-register on the same connection after 1 s, 2 s, 4 s, ... capped at 30 s |
-| `INVALID_NAME`, `USERNAME_REQUIRED`, `QUOTA_EXCEEDED`, `CONFLICT`, `BAD_REQUEST`, `UNAUTHENTICATED`, `FORBIDDEN`, `NOT_IMPLEMENTED`, others | before the first successful registration: **fatal** (`expose()` rejects, the handle closes). After it: non-fatal `error`, retried at the next welcome |
+| `INVALID_NAME`, `USERNAME_REQUIRED`, `QUOTA_EXCEEDED`, `CONFLICT`, `BAD_REQUEST`, `UNAUTHENTICATED`, `FORBIDDEN`, `NOT_IMPLEMENTED`, others | before the first successful registration: **fatal** (`expose()` rejects, the handle closes). After it: non-fatal `error`, retried at the next welcome (`createTunnel()` treats the refusals among them, all but `BAD_REQUEST`/`NOT_IMPLEMENTED`/others, as fatal) |
 
 `op: "error"` codes:
 

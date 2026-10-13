@@ -13,6 +13,11 @@ export const DEFAULT_URL = "wss://connect.mcpwarp.io";
 /** Service-name syntax; names are also limited to 30 characters. */
 export const SERVICE_NAME_RE = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/;
 export const SERVICE_NAME_MAX = 30;
+
+/** SERVICE_NAME_RE and SERVICE_NAME_MAX together; false for a non-string. */
+export function isValidServiceName(name: unknown): name is string {
+  return typeof name === "string" && name.length <= SERVICE_NAME_MAX && SERVICE_NAME_RE.test(name);
+}
 /**
  * What the tunnel accepts as an integration id, checked after lowercasing:
  * zod's `z.uuid()` (RFC 9562/4122 text form, version 1-8, variant 8/9/a/b,

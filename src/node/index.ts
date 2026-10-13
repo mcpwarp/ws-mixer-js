@@ -50,6 +50,7 @@ export type { NodeStreamServer, ServeContext, StreamServer } from "./server.js";
 export {
   McpwarpError,
   createTunnel,
+  TunnelStatusCode,
   RegisterErrorCode,
   AppErrorCode,
   TRANSIENT_REGISTER_ERRORS,
@@ -65,6 +66,7 @@ export type {
   ExposeHandle,
   AbortSignalLike,
   Tunnel,
+  TunnelOptions,
   TunnelBase,
   TunnelConfig,
   TunnelState,

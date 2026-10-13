@@ -88,7 +88,7 @@ const tunnel = createTunnel({
   integration: "0f6c2a8e-4c1b-4b7e-9a4e-2f1d9b7c3a10",
   handler: (req) => mcp.fetch(req),
   agent: { runtime: "zotero" },
-  logger: (level, message) => console[level](message),
+  logger: (level, message) => console[level](`[mcpwarp] ${message}`),
 });
 
 // On startup and on prefs changes; unchanged settings are a no-op. Debounced, since a
@@ -103,26 +103,60 @@ prefs.onChange(() => {
 });
 
 // Status UI: called now and on every change.
-const unsubscribe = tunnel.subscribe(({ state, url, lastError }) => renderStatus(state, url, lastError));
+const unsubscribe = tunnel.subscribe(({ state, url, code, lastError }) => renderStatus(state, url, code, lastError));
 
 // On unload: unregister + drain, bounded.
 clearTimeout(debounce);
 unsubscribe();
-await tunnel.close({ timeoutMs: 1500 });
+await tunnel.dispose({ timeoutMs: 1500 });
 ```
 
-`configure()` restarts only when `enabled`, `token`, `name`, `url` or `kind` changed, serializes
-overlapping calls (the last one wins) and resolves once the new connection is dialing; it does not
-wait for `online`. A restart first waits for the old connection to unregister and drain, which
-takes up to ~7 s while requests or SSE streams are open (MCP clients usually keep one); the status
-is `connecting` meanwhile. Disabled or an empty token is `off` without dialing. States: `off`,
-`connecting` (dialing, retrying, after a disconnect), `online` (`url` set), `disabled` (from the
-dashboard), `conflict` (another instance took the name over) and `error` (a fatal failure such as
-a rejected token; `lastError` says why). After `conflict` or `error` the tunnel stays down until the
-next `configure()`, even with the same settings; `stop()` does the same on demand. Call
-`configure()` on settings changes, not from a status listener: re-applying the same settings after
-every `conflict` makes two instances take the name from each other in turn. `close()` is final;
-its `timeoutMs` can cut the drain short, leaving the old connection to close in the background.
+`configure()` restarts only when `enabled`, `token`, `name`, `url`, `kind` or `webSocket` (by
+reference, falling back to the one passed to `createTunnel()`) changed, serializes overlapping
+calls (the last one wins) and resolves once the new connection is dialing; it does not wait for
+`online`. A `webSocket` in the config overrides the one passed to `createTunnel()`, for hosts whose
+socket source changes at runtime. A restart first waits for the old connection to unregister and
+drain, which takes up to ~7 s while requests or SSE streams are open (MCP clients usually keep
+one); the status is `connecting` meanwhile. Disabled or an empty token is `off` without dialing,
+whatever the other fields hold. `configure()` never throws: a non-boolean `enabled`, or (while
+enabled with a token) a field of the wrong type (an unset pref read as `undefined`, say), is
+`error` with `INVALID_CONFIG`. States: `off`, `connecting` (dialing, retrying, after a
+disconnect), `online` (`url` set), `disabled` (from the dashboard), `conflict` (another instance
+took the name over) and `error` (a fatal failure such as a rejected token). After `conflict` or
+`error` the tunnel stays down until the next `configure()`, even with the same settings; `stop()`
+does the same on demand. Call `configure()` on settings changes, not from a status listener:
+re-applying the same settings after every `conflict` makes two instances take the name from each
+other in turn. `dispose()` is final; its `timeoutMs` can cut the drain short, leaving the old
+connection to close in the background. `close()` and the `TunnelBase` type are deprecated aliases of
+`dispose()` and `TunnelOptions`, removed in 0.11.0.
+
+When something is wrong the status says why in two forms: `code`, one of `TunnelStatusCode` for
+your logic, and `lastError`, the same in plain language to show users as is (`off` and a plain
+`connecting` carry neither):
+
+| `code` | state | `lastError` |
+|---|---|---|
+| `RETRYING` | `connecting` | "Can't reach mcpwarp; retrying." / "mcpwarp couldn't register the service; retrying." |
+| `DISCONNECTED` | `connecting` | "Connection lost; retrying." |
+| `DISABLED` | `disabled` | "This service is disabled in the mcpwarp dashboard." |
+| `TAKEN_OVER` | `conflict` | "Another connection took over this name." |
+| `UNAUTHORIZED` | `error` | "The token was rejected." / "The token is not allowed to publish this service." |
+| `INVALID_CONFIG` | `error` | "The service name is invalid: ..." / "The service name is not set." / "The token is not set." / "The tunnel settings are invalid." |
+| `USERNAME_REQUIRED` | `error` | "Choose a username in your mcpwarp account first." |
+| `QUOTA_EXCEEDED` | `error` | "Your mcpwarp account has no services left in its quota." |
+| `CONFLICT` | `error` | "The name is in use by another server." |
+| `UNSUPPORTED_VERSION` | `error` | "This SDK version is no longer supported; please update." |
+| `DISCONNECTED_FATAL` | `error` | "The connection to mcpwarp failed." |
+| `INTERNAL` | `error`, or `connecting` for a non-fatal server error (a register refused after an earlier success with a code not listed above can stay `connecting` until the next `configure()`) | "Something went wrong; the log has the details." |
+
+A register the server refuses (`UNAUTHORIZED`, `INVALID_CONFIG`, `USERNAME_REQUIRED`,
+`QUOTA_EXCEEDED`, `CONFLICT`) is fatal even on a reconnect after an earlier success. An HTTP 401
+at the upgrade is `UNAUTHORIZED` (a 403 or 404 `DISCONNECTED_FATAL`) only when the WebSocket
+factory reports the status (`upgradeFailure`); a standard WebSocket hides it and the tunnel keeps
+retrying.
+
+The technical message behind each goes to `logger` (retries and disconnects at `warn`, fatal
+failures at `error`). Logger messages carry no `mcpwarp: ` prefix; add your own tag.
 
 For plugin sandboxes: the controller itself needs no `AbortController` or `DOMException`. The SDK
 needs `setTimeout`/`clearTimeout`, `Promise`, `URL`, `TextEncoder`/`TextDecoder` (`TextDecoder`

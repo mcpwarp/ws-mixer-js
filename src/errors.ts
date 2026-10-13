@@ -88,11 +88,16 @@ export class WsMixerError extends Error {
   readonly wsCode?: number;
   /** The peer's observed WS close-frame reason, verbatim, under the same condition as `wsCode`. */
   readonly closeReason?: string;
+  /**
+   * The HTTP status of a failed upgrade, set whenever the client gives up on one whose status the
+   * factory reported (a fatal status, or the last one when retries run out); it carries no wire code.
+   */
+  readonly httpStatus?: number;
 
   constructor(
     code: number,
     message: string,
-    opts?: { fatal?: boolean; streamId?: number; wsCode?: number; closeReason?: string; cause?: unknown },
+    opts?: { fatal?: boolean; streamId?: number; wsCode?: number; closeReason?: string; httpStatus?: number; cause?: unknown },
   ) {
     super(message, opts?.cause !== undefined ? { cause: opts.cause } : undefined);
     this.code = code;
@@ -100,6 +105,7 @@ export class WsMixerError extends Error {
     this.streamId = opts?.streamId;
     this.wsCode = opts?.wsCode;
     this.closeReason = opts?.closeReason;
+    this.httpStatus = opts?.httpStatus;
   }
 
   get codeName(): string {

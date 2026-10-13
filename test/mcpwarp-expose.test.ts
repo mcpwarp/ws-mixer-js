@@ -348,6 +348,22 @@ describe("expose({handler})", () => {
     expect(cause).toMatchObject({ code: ErrorCode.UNAUTHORIZED, fatal: true });
   });
 
+  it("an HTTP 401 at the upgrade rejects expose() with UNAUTHORIZED, a 403 with DISCONNECTED_FATAL; the cause carries httpStatus", async () => {
+    const edge = await startEdge();
+    for (const [status, code] of [
+      [401, "UNAUTHORIZED"],
+      [403, "DISCONNECTED_FATAL"],
+    ] as const) {
+      edge.rejectNextUpgrade(status);
+      const err = await expose({ url: edge.url, webSocket: edge.webSocket, token: "t", name: "notes", integration: INTEGRATION, handler: () => new Response() }).catch(
+        (e: unknown) => e,
+      );
+      expect(err).toMatchObject({ code, fatal: true });
+      expect((err as McpwarpError).cause).toBeInstanceOf(WsMixerError);
+      expect((err as McpwarpError).cause).toMatchObject({ httpStatus: status, fatal: true });
+    }
+  });
+
   it("a fatal close after registration closes the handle with a McpwarpError, the transport error as cause", async () => {
     const edge = await startEdge();
     const handle = await exposeOn(edge, { handler: () => new Response() });

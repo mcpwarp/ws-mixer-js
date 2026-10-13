@@ -1,6 +1,16 @@
-/** createTunnel() against the in-process FakeEdge: idempotent configure, generations, status mapping, conflict, stop/close. */
+/** createTunnel() against the in-process FakeEdge: idempotent configure, generations, status mapping, conflict, stop/dispose. */
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createTunnel, type ExposeHandle, type Tunnel, type TunnelBase, type TunnelConfig, type TunnelStatus } from "../src/mcpwarp/index.js";
+import {
+  createTunnel,
+  McpwarpError,
+  TunnelStatusCode,
+  type ExposeHandle,
+  type Tunnel,
+  type TunnelBase,
+  type TunnelConfig,
+  type TunnelOptions,
+  type TunnelStatus,
+} from "../src/mcpwarp/index.js";
 import { FakeEdge } from "../src/testing/index.js";
 import { ErrorCode } from "../src/errors.js";
 import type { WebSocketFactory, WebSocketLike } from "../src/socket.js";
@@ -32,6 +42,27 @@ function fakeHandle(state: ExposeHandle["state"]): ExposeHandle & { close: Retur
     close: vi.fn(async () => {}),
   };
   return h as unknown as ExposeHandle & { close: ReturnType<typeof vi.fn> };
+}
+
+/** A fakeHandle() whose events a test emits. */
+function emittingHandle(state: ExposeHandle["state"]): { handle: ExposeHandle; wired: () => boolean; emit: (event: string, payload: unknown) => void } {
+  const listeners = new Map<string, Array<(payload: unknown) => void>>();
+  const h = {
+    state,
+    url: undefined,
+    on: (event: string, fn: (payload: unknown) => void) => {
+      listeners.set(event, [...(listeners.get(event) ?? []), fn]);
+      return h;
+    },
+    close: vi.fn(async () => {}),
+  };
+  return {
+    handle: h as unknown as ExposeHandle,
+    wired: () => listeners.size > 0,
+    emit: (event, payload) => {
+      for (const fn of listeners.get(event) ?? []) fn(payload);
+    },
+  };
 }
 
 /** Wraps `factory` so the client sees "open" only after `gate` resolves and reads `bufferedAmount()` if given; records the sockets. */
@@ -71,7 +102,7 @@ async function startEdge() {
   return edge;
 }
 
-function tunnelOn(edge: FakeEdge, base: Partial<TunnelBase> = {}): { tunnel: Tunnel; history: TunnelStatus[]; logs: Array<[string, string]> } {
+function tunnelOn(edge: FakeEdge, base: Partial<TunnelOptions> = {}): { tunnel: Tunnel; history: TunnelStatus[]; logs: Array<[string, string]> } {
   const logs: Array<[string, string]> = [];
   const tunnel = createTunnel({
     integration: INTEGRATION,
@@ -80,8 +111,8 @@ function tunnelOn(edge: FakeEdge, base: Partial<TunnelBase> = {}): { tunnel: Tun
     handler: () => new Response("ok"),
     logger: (level, message) => logs.push([level, message]),
     ...base,
-  } as TunnelBase);
-  cleanups.push(() => tunnel.close());
+  } as TunnelOptions);
+  cleanups.push(() => tunnel.dispose());
   const history: TunnelStatus[] = [];
   tunnel.subscribe((s) => history.push(s));
   return { tunnel, history, logs };
@@ -111,6 +142,7 @@ describe("createTunnel", () => {
     expect(history).toEqual([{ state: "off" }, { state: "connecting" }, { state: "online", url: edge.publicUrl("notes") }]);
     expect(logs.some(([l, m]) => l === "info" && m.includes(edge.publicUrl("notes")))).toBe(true);
     expect(logs.some(([, m]) => m.includes(TOKEN))).toBe(false);
+    expect(logs.filter(([, m]) => m.startsWith("mcpwarp: "))).toEqual([]);
   });
 
   it("status is a snapshot copy", async () => {
@@ -296,8 +328,8 @@ describe("createTunnel", () => {
     await waitFor(() => tunnel.status.state === "online");
     await edge.conflict("notes");
     await waitFor(() => tunnel.status.state === "conflict");
-    expect(tunnel.status.lastError).toMatch(/took over/);
-    expect(logs.some(([l, m]) => l === "warn" && m.includes("took over"))).toBe(true);
+    expect(tunnel.status).toEqual({ state: "conflict", code: TunnelStatusCode.TAKEN_OVER, lastError: "Another connection took over this name." });
+    expect(logs.some(([l, m]) => l === "warn" && m.includes("took over") && m.includes('"notes"'))).toBe(true);
     await waitFor(() => edge.connections.length === 0);
     await sleep(200);
     expect(edge.upgrades).toHaveLength(1);
@@ -317,19 +349,20 @@ describe("createTunnel", () => {
     await edge.waitForApp("register");
     await edge.conflict("notes");
     await waitFor(() => tunnel.status.state === "conflict");
+    expect(tunnel.status.code).toBe(TunnelStatusCode.TAKEN_OVER);
     await sleep(100);
     expect(edge.upgrades).toHaveLength(1);
   });
 
-  it("a fatal failure is state error with lastError; the same config then restarts", async () => {
+  it("a fatal failure is state error with code and a plain lastError, the technical message logged; the same config then restarts", async () => {
     const edge = await startEdge();
     const { tunnel, logs } = tunnelOn(edge);
     await tunnel.configure(cfg(edge));
     await waitFor(() => tunnel.status.state === "online");
     edge.closeConnection({ wsCode: 4000 + ErrorCode.UNAUTHORIZED });
     await waitFor(() => tunnel.status.state === "error");
-    expect(tunnel.status.lastError).toBeTruthy();
-    expect(logs.some(([l]) => l === "error")).toBe(true);
+    expect(tunnel.status).toEqual({ state: "error", code: TunnelStatusCode.UNAUTHORIZED, lastError: "The token was rejected." });
+    expect(logs.some(([l, m]) => l === "error" && m.startsWith("UNAUTHORIZED: "))).toBe(true);
     await tunnel.configure(cfg(edge));
     await waitFor(() => tunnel.status.state === "online");
   });
@@ -341,22 +374,212 @@ describe("createTunnel", () => {
     const { tunnel } = tunnelOn(edge);
     await tunnel.configure(cfg(edge));
     await waitFor(() => tunnel.status.state === "error");
+    expect(tunnel.status.code).toBe(TunnelStatusCode.UNAUTHORIZED);
   });
 
   it("an invalid name in the config is state error, not a throw", async () => {
     const edge = await startEdge();
-    const { tunnel } = tunnelOn(edge);
+    const { tunnel, logs } = tunnelOn(edge);
     await tunnel.configure(cfg(edge, { name: "Bad_Name" }));
     expect(tunnel.status.state).toBe("error");
-    expect(tunnel.status.lastError).toMatch(/invalid service `name`/);
+    expect(tunnel.status.code).toBe(TunnelStatusCode.INVALID_CONFIG);
+    expect(tunnel.status.lastError).toMatch(/^The service name is invalid/);
+    expect(logs.some(([l, m]) => l === "error" && m.startsWith("invalid service `name`"))).toBe(true);
     expect(edge.upgrades).toHaveLength(0);
+  });
+
+  it("while enabled, config fields of the wrong type (name or token undefined, as from an unset pref) are state error INVALID_CONFIG, not a throw; values are never echoed", async () => {
+    const edge = await startEdge();
+    const { tunnel, logs } = tunnelOn(edge);
+    const cases: Array<[Record<string, unknown>, string]> = [
+      [{ name: undefined }, "The service name is not set."],
+      [{ token: undefined }, "The token is not set."],
+      [{ name: null }, "The service name is not set."],
+      [{ enabled: "yes" }, "The tunnel settings are invalid."],
+      [{ url: 42 }, "The tunnel settings are invalid."],
+      [{ webSocket: "ws" }, "The tunnel settings are invalid."],
+    ];
+    for (const [over, lastError] of cases) {
+      await expect(tunnel.configure({ ...cfg(edge), ...over } as TunnelConfig)).resolves.toBeUndefined();
+      expect(tunnel.status).toEqual({ state: "error", code: TunnelStatusCode.INVALID_CONFIG, lastError });
+    }
+    await expect(tunnel.configure(null as unknown as TunnelConfig)).resolves.toBeUndefined();
+    expect(tunnel.status.code).toBe(TunnelStatusCode.INVALID_CONFIG);
+    expect(edge.upgrades).toHaveLength(0);
+    expect(logs.filter(([l, m]) => l === "error" && m.startsWith("invalid config: "))).toHaveLength(7);
+    expect(logs.some(([, m]) => m.includes(TOKEN) || m.includes("notes") || m.includes("yes") || m.includes("42"))).toBe(false);
+    await tunnel.configure(cfg(edge));
+    await waitFor(() => tunnel.status.state === "online");
+  });
+
+  it("disabled, or enabled with an empty token, is off whatever the other fields hold (name or token undefined, a bad url)", async () => {
+    const edge = await startEdge();
+    const { tunnel, history, logs } = tunnelOn(edge);
+    for (const over of [{ name: undefined }, { token: undefined }, { token: null, name: 7, url: 42 }]) {
+      await expect(tunnel.configure({ ...cfg(edge), enabled: false, ...over } as unknown as TunnelConfig)).resolves.toBeUndefined();
+      expect(tunnel.status).toEqual({ state: "off" });
+    }
+    for (const over of [{ name: undefined }, { name: 7, url: 42, webSocket: "ws" }]) {
+      await expect(tunnel.configure({ ...cfg(edge), token: "  ", ...over } as unknown as TunnelConfig)).resolves.toBeUndefined();
+      expect(tunnel.status).toEqual({ state: "off" });
+    }
+    expect(history).toEqual([{ state: "off" }]);
+    expect(logs.filter(([l]) => l === "error")).toEqual([]);
+    expect(edge.upgrades).toHaveLength(0);
+    await tunnel.configure(cfg(edge));
+    await waitFor(() => tunnel.status.state === "online");
+    await tunnel.configure({ ...cfg(edge), enabled: false, token: undefined } as unknown as TunnelConfig);
+    expect(tunnel.status).toEqual({ state: "off" });
+    await waitFor(() => edge.connections.length === 0);
+  });
+
+  it("an invalid config while online stops the connection", async () => {
+    const edge = await startEdge();
+    const { tunnel } = tunnelOn(edge);
+    await tunnel.configure(cfg(edge));
+    await waitFor(() => tunnel.status.state === "online");
+    await tunnel.configure(cfg(edge, { name: undefined as unknown as string }));
+    expect(tunnel.status).toEqual({ state: "error", code: TunnelStatusCode.INVALID_CONFIG, lastError: "The service name is not set." });
+    expect(edge.appLog.map((m) => (m.mcpwarp as { op: string }).op)).toEqual(["register", "unregister"]);
+    await waitFor(() => edge.connections.length === 0);
+  });
+
+  it("a server drain while online stays online: the replaced connection's end is no disconnect", async () => {
+    const edge = await startEdge();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    cleanups.push(() => release());
+    let calls = 0;
+    const { tunnel, history, logs } = tunnelOn(edge, {
+      handler: async () => {
+        calls++;
+        await gate;
+        return new Response("late");
+      },
+    });
+    await tunnel.configure(cfg(edge));
+    await waitFor(() => tunnel.status.state === "online");
+    const oldConn = edge.connections[0]!;
+    // An open request (an SSE stream, typically) keeps the old connection up past the replacement's registration.
+    const inflight = edge.fetch(edge.publicUrl("notes")).catch((e: Error) => e);
+    await waitFor(() => calls === 1);
+    await edge.drain({ conn: oldConn, deadlineMs: 10000 });
+    await waitFor(() => logs.filter(([, m]) => m.startsWith("online at ")).length === 2);
+    release();
+    await inflight;
+    await waitFor(() => edge.connections.length === 1 && logs.some(([l, m]) => l === "info" && m.startsWith("a replaced connection ended")));
+    expect(tunnel.status).toEqual({ state: "online", url: edge.publicUrl("notes") });
+    expect(history.map((s) => s.state)).toEqual(["off", "connecting", "online"]);
+  });
+
+  it("a retry of a drain replacement while online leaves the status alone but still reaches base.onRetry", async () => {
+    const edge = await startEdge();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    cleanups.push(() => release());
+    let calls = 0;
+    const retries: string[] = [];
+    const { tunnel, logs } = tunnelOn(edge, {
+      onRetry: (i) => retries.push(i.reason),
+      handler: async () => {
+        calls++;
+        await gate;
+        return new Response("late");
+      },
+    });
+    await tunnel.configure(cfg(edge));
+    await waitFor(() => tunnel.status.state === "online");
+    const oldConn = edge.connections[0]!;
+    const inflight = edge.fetch(edge.publicUrl("notes")).catch((e: Error) => e);
+    await waitFor(() => calls === 1);
+    edge.failRegister("notes", { code: "INTERNAL" });
+    await edge.drain({ conn: oldConn, deadlineMs: 10000 });
+    await waitFor(() => retries.length === 1);
+    expect(tunnel.status).toEqual({ state: "online", url: edge.publicUrl("notes") });
+    expect(logs.some(([l, m]) => l === "warn" && m.startsWith("retry #1"))).toBe(true);
+    release();
+    await inflight;
+  });
+
+  it("the error event: only mcpwarp errors while connecting change the status; a handler TypeError is no INVALID_CONFIG; disabled keeps its code", async () => {
+    const edge = await startEdge();
+    const pending = emittingHandle("registering");
+    exposeHook.fn = () => Promise.resolve(pending.handle);
+    const { tunnel } = tunnelOn(edge);
+    await tunnel.configure(cfg(edge));
+    await waitFor(() => pending.wired());
+    pending.emit("error", new TypeError("handler did not return a Response"));
+    expect(tunnel.status).toEqual({ state: "connecting" });
+    pending.emit("error", new McpwarpError("INTERNAL", "register failed"));
+    expect(tunnel.status).toEqual({ state: "connecting", code: TunnelStatusCode.RETRYING, lastError: "mcpwarp couldn't register the service; retrying." });
+    await tunnel.dispose();
+
+    const disabled = emittingHandle("disabled");
+    exposeHook.fn = () => Promise.resolve(disabled.handle);
+    const second = tunnelOn(edge);
+    await second.tunnel.configure(cfg(edge));
+    await waitFor(() => second.tunnel.status.state === "disabled");
+    disabled.emit("error", new McpwarpError("TOO_MANY_SERVICES", "too many services"));
+    expect(second.tunnel.status).toEqual({ state: "disabled", code: TunnelStatusCode.DISABLED, lastError: "This service is disabled in the mcpwarp dashboard." });
+    expect(second.logs.some(([l, m]) => l === "warn" && m.startsWith("TOO_MANY_SERVICES: "))).toBe(true);
+  });
+
+  it("a register refused after an earlier success is fatal: state error with its code, the connection closed", async () => {
+    const edge = await startEdge();
+    const { tunnel, history } = tunnelOn(edge);
+    await tunnel.configure(cfg(edge));
+    await waitFor(() => tunnel.status.state === "online");
+    edge.failRegister("notes", { code: "UNAUTHENTICATED" });
+    edge.closeConnection({ wsCode: 1006 });
+    await waitFor(() => tunnel.status.state === "error");
+    expect(tunnel.status).toEqual({ state: "error", code: TunnelStatusCode.UNAUTHORIZED, lastError: "The token was rejected." });
+    expect(history).toContainEqual({ state: "connecting", code: TunnelStatusCode.DISCONNECTED, lastError: "Connection lost; retrying." });
+    await waitFor(() => edge.connections.length === 0);
+    await tunnel.configure(cfg(edge));
+    await waitFor(() => tunnel.status.state === "online");
+  });
+
+  it("register CONFLICT and app UNSUPPORTED_VERSION have their own codes", async () => {
+    const edge = await startEdge();
+    const { tunnel } = tunnelOn(edge);
+    edge.failRegister("notes", { code: "CONFLICT" });
+    await tunnel.configure(cfg(edge));
+    await waitFor(() => tunnel.status.state === "error");
+    expect(tunnel.status).toEqual({ state: "error", code: TunnelStatusCode.CONFLICT, lastError: "The name is in use by another server." });
+    await tunnel.configure(cfg(edge));
+    await waitFor(() => tunnel.status.state === "online");
+    await edge.appError("UNSUPPORTED_VERSION", "v1 is gone");
+    await waitFor(() => tunnel.status.state === "error");
+    expect(tunnel.status).toEqual({
+      state: "error",
+      code: TunnelStatusCode.UNSUPPORTED_VERSION,
+      lastError: "This SDK version is no longer supported; please update.",
+    });
+  });
+
+  it("an HTTP 401 at the upgrade (reported via upgradeFailure) is UNAUTHORIZED, a 403 or 404 DISCONNECTED_FATAL", async () => {
+    const edge = await startEdge();
+    const { tunnel } = tunnelOn(edge);
+    const cases = [
+      [401, TunnelStatusCode.UNAUTHORIZED],
+      [403, TunnelStatusCode.DISCONNECTED_FATAL],
+      [404, TunnelStatusCode.DISCONNECTED_FATAL],
+    ] as const;
+    for (const [status, code] of cases) {
+      edge.rejectNextUpgrade(status);
+      await tunnel.configure(cfg(edge));
+      await waitFor(() => tunnel.status.state === "error");
+      expect(tunnel.status.code).toBe(code);
+      await tunnel.stop();
+    }
+    expect(edge.connections).toHaveLength(0);
   });
 
   it("createTunnel validates integration, agent and handler/target up front", () => {
     const handler = () => new Response();
     expect(() => createTunnel({ integration: "nope", handler })).toThrow(/RFC 4122/);
-    expect(() => createTunnel({ integration: INTEGRATION } as TunnelBase)).toThrow(/exactly one/);
-    expect(() => createTunnel({ integration: INTEGRATION, handler, target: "http://x" } as unknown as TunnelBase)).toThrow(/exactly one/);
+    expect(() => createTunnel({ integration: INTEGRATION } as TunnelOptions)).toThrow(/exactly one/);
+    expect(() => createTunnel({ integration: INTEGRATION, handler, target: "http://x" } as unknown as TunnelOptions)).toThrow(/exactly one/);
     expect(() => createTunnel({ integration: INTEGRATION, handler, agent: { runtime: "a\nb" } })).toThrow(/agent\.runtime/);
   });
 
@@ -367,8 +590,10 @@ describe("createTunnel", () => {
     await waitFor(() => tunnel.status.state === "online");
     await edge.disable("notes");
     await waitFor(() => tunnel.status.state === "disabled");
+    expect(tunnel.status.code).toBe(TunnelStatusCode.DISABLED);
     await edge.enable("notes");
     await waitFor(() => tunnel.status.state === "online");
+    expect(tunnel.status).toEqual({ state: "online", url: edge.publicUrl("notes") });
   });
 
   it("expose() resolving disabled maps to disabled", async () => {
@@ -377,29 +602,89 @@ describe("createTunnel", () => {
     const { tunnel } = tunnelOn(edge);
     await tunnel.configure(cfg(edge));
     await waitFor(() => tunnel.status.state === "disabled");
-    expect(tunnel.status.url).toBeUndefined();
+    expect(tunnel.status).toEqual({ state: "disabled", code: TunnelStatusCode.DISABLED, lastError: "This service is disabled in the mcpwarp dashboard." });
   });
 
-  it("a lost connection goes connecting with lastError, then online again", async () => {
+  it("a lost connection goes connecting with code DISCONNECTED, then online again", async () => {
     const edge = await startEdge();
     const { tunnel, history } = tunnelOn(edge);
     await tunnel.configure(cfg(edge));
     await waitFor(() => tunnel.status.state === "online");
     edge.closeConnection({ wsCode: 1006 });
     await waitFor(() => history.length >= 4 && tunnel.status.state === "online");
-    expect(history[3]!.state).toBe("connecting");
-    expect(history[3]!.lastError).toBeTruthy();
+    expect(history[3]).toEqual({ state: "connecting", code: TunnelStatusCode.DISCONNECTED, lastError: "Connection lost; retrying." });
   });
 
-  it("onRetry reasons set lastError without changing state and reach base.onRetry", async () => {
+  it("onRetry reasons set code RETRYING without changing state, log the reason and reach base.onRetry", async () => {
     const edge = await startEdge();
     const retries: string[] = [];
-    const { tunnel } = tunnelOn(edge, { onRetry: (i) => retries.push(i.reason) });
+    const { tunnel, logs } = tunnelOn(edge, { onRetry: (i) => retries.push(i.reason) });
     edge.failRegister("notes", { code: "INTERNAL" });
     await tunnel.configure(cfg(edge));
     await waitFor(() => retries.length === 1);
-    expect(tunnel.status.lastError).toMatch(/INTERNAL/);
+    expect(tunnel.status).toEqual({ state: "connecting", code: TunnelStatusCode.RETRYING, lastError: "mcpwarp couldn't register the service; retrying." });
+    expect(logs.some(([l, m]) => l === "warn" && m.includes("INTERNAL"))).toBe(true);
     await waitFor(() => tunnel.status.state === "online", 4000);
+  });
+
+  it("a failed dial is RETRYING; redials after a lost connection stay DISCONNECTED", async () => {
+    const edge = await startEdge();
+    const retries: string[] = [];
+    const { tunnel, history } = tunnelOn(edge, { onRetry: (i) => retries.push(i.reason) });
+    edge.rejectNextUpgrade(503);
+    await tunnel.configure(cfg(edge));
+    await waitFor(() => retries.length === 1);
+    // The redial can be online before the poll sees RETRYING.
+    expect(history).toContainEqual({ state: "connecting", code: TunnelStatusCode.RETRYING, lastError: "Can't reach mcpwarp; retrying." });
+    await waitFor(() => tunnel.status.state === "online");
+    const n = history.length;
+    edge.rejectNextUpgrade(503);
+    edge.closeConnection({ wsCode: 1006 });
+    await waitFor(() => retries.length >= 3);
+    await waitFor(() => tunnel.status.state === "online");
+    expect(history.slice(n)).toEqual([
+      { state: "connecting", code: TunnelStatusCode.DISCONNECTED, lastError: "Connection lost; retrying." },
+      { state: "online", url: edge.publicUrl("notes") },
+    ]);
+  });
+
+  it("a webSocket in the config overrides the options' one; a different factory restarts, the same one does not", async () => {
+    const edge = await startEdge();
+    const dialsA: WebSocketLike[] = [];
+    const dialsB: WebSocketLike[] = [];
+    const a = wrappedSockets(edge.webSocket, dialsA);
+    const b = wrappedSockets(edge.webSocket, dialsB);
+    const { tunnel } = tunnelOn(edge);
+    await tunnel.configure(cfg(edge, { webSocket: a }));
+    await waitFor(() => tunnel.status.state === "online");
+    expect(dialsA).toHaveLength(1);
+    const toB = tunnel.configure(cfg(edge, { webSocket: b }));
+    await toB;
+    await waitFor(() => tunnel.status.state === "online" && dialsB.length === 1);
+    // An unchanged config returns the earlier apply and queues nothing.
+    expect(tunnel.configure(cfg(edge, { webSocket: b }))).toBe(toB);
+    expect(dialsA).toHaveLength(1);
+    expect(dialsB).toHaveLength(1);
+    expect(edge.upgrades).toHaveLength(2);
+    expect(edge.appLog.map((m) => (m.mcpwarp as { op: string }).op)).toEqual(["register", "unregister", "register"]);
+  });
+
+  it("webSocket equality uses the effective factory: the options' one or undefined is no change, dropping an override restarts on the options' one", async () => {
+    const edge = await startEdge();
+    const dialsB: WebSocketLike[] = [];
+    const b = wrappedSockets(edge.webSocket, dialsB);
+    const { tunnel } = tunnelOn(edge);
+    const first = tunnel.configure(cfg(edge));
+    await first;
+    await waitFor(() => tunnel.status.state === "online");
+    expect(tunnel.configure(cfg(edge, { webSocket: edge.webSocket }))).toBe(first);
+    expect(tunnel.configure(cfg(edge, { webSocket: undefined }))).toBe(first);
+    expect(edge.upgrades).toHaveLength(1);
+    await tunnel.configure(cfg(edge, { webSocket: b }));
+    await waitFor(() => tunnel.status.state === "online" && dialsB.length === 1);
+    await tunnel.configure(cfg(edge));
+    await waitFor(() => tunnel.status.state === "online" && edge.upgrades.length === 3);
+    expect(dialsB).toHaveLength(1);
   });
 
   it("stop() goes off and is reusable; the same config then restarts", async () => {
@@ -477,7 +762,7 @@ describe("createTunnel", () => {
       await tunnel.configure(cfg(edge));
       await waitFor(() => tunnel.status.state === tunnelState);
       if (tunnelState !== "connecting") await waitFor(() => handle.close.mock.calls.length === 1);
-      await tunnel.close();
+      await tunnel.dispose();
     }
   });
 
@@ -495,7 +780,7 @@ describe("createTunnel", () => {
     expect(history.map((s) => s.state)).toEqual(["off", "connecting", "off"]);
   });
 
-  it("close() is final: a final off, listeners cleared, configure()/stop() no-ops; its timer is cleared", async () => {
+  it("dispose() is final: a final off, listeners cleared, configure()/stop() no-ops; its timer is cleared", async () => {
     const edge = await startEdge();
     const { tunnel, history } = tunnelOn(edge);
     await tunnel.configure(cfg(edge));
@@ -503,7 +788,7 @@ describe("createTunnel", () => {
     const setSpy = vi.spyOn(globalThis, "setTimeout");
     const clearSpy = vi.spyOn(globalThis, "clearTimeout");
     try {
-      await tunnel.close({ timeoutMs: 4321 });
+      await tunnel.dispose({ timeoutMs: 4321 });
       const idx = setSpy.mock.calls.findIndex((c) => c[1] === 4321);
       expect(idx).toBeGreaterThanOrEqual(0);
       expect(clearSpy.mock.calls.map((c) => c[0])).toContain(setSpy.mock.results[idx]!.value);
@@ -521,7 +806,7 @@ describe("createTunnel", () => {
     expect(edge.connections).toHaveLength(0);
   });
 
-  it("close() is bounded by timeoutMs when the drain hangs", async () => {
+  it("dispose() is bounded by timeoutMs when the drain hangs", async () => {
     const edge = await startEdge();
     let release!: () => void;
     const gate = new Promise<void>((r) => (release = r));
@@ -539,13 +824,35 @@ describe("createTunnel", () => {
     const inflight = edge.fetch(edge.publicUrl("notes")).catch((e: Error) => e);
     await waitFor(() => calls === 1);
     const started = Date.now();
-    await tunnel.close({ timeoutMs: 150 });
+    await tunnel.dispose({ timeoutMs: 150 });
     const took = Date.now() - started;
     release();
     await inflight;
     expect(took).toBeGreaterThanOrEqual(140);
     expect(took).toBeLessThan(1000);
     expect(tunnel.status).toEqual({ state: "off" });
+  });
+
+  it("the deprecated close() is dispose(): same promise, final", async () => {
+    const edge = await startEdge();
+    const { tunnel } = tunnelOn(edge);
+    await tunnel.configure(cfg(edge));
+    await waitFor(() => tunnel.status.state === "online");
+    const closed = tunnel.close({ timeoutMs: 1000 });
+    expect(tunnel.dispose()).toBe(closed);
+    await closed;
+    await tunnel.configure(cfg(edge, { name: "other" }));
+    expect(tunnel.status).toEqual({ state: "off" });
+    expect(edge.upgrades).toHaveLength(1);
+  });
+
+  it("the deprecated TunnelBase type still types createTunnel()'s options", async () => {
+    const edge = await startEdge();
+    const options: TunnelBase = { integration: INTEGRATION, webSocket: edge.webSocket, handler: () => new Response("ok") };
+    const tunnel = createTunnel(options);
+    cleanups.push(() => tunnel.dispose());
+    await tunnel.configure(cfg(edge));
+    await waitFor(() => tunnel.status.state === "online");
   });
 
   it("a throwing listener does not break later notifications or other listeners", async () => {
@@ -589,7 +896,7 @@ describe("createTunnel", () => {
       edge.withholdRegistered("notes3");
       await tunnel.configure(cfg(edge, { name: "notes3" }));
       await edge.waitForApp("register", { count: 3 });
-      await tunnel.close();
+      await tunnel.dispose();
       expect(history.map((s) => s.state)).toEqual(["off", "connecting", "online", "connecting", "online", "connecting", "off"]);
       await waitFor(() => edge.connections.length === 0);
     } finally {

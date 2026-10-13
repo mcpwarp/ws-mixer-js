@@ -3,10 +3,11 @@ export class McpwarpError extends Error {
   override name = "McpwarpError";
   /**
    * A RegisterErrorCode / AppErrorCode value, or "MALFORMED_ENVELOPE", "CLOSED",
-   * "UNAUTHORIZED" (the edge rejected the token: ws-mixer close 4011),
+   * "UNAUTHORIZED" (the edge rejected the token: ws-mixer close 4011, or a fatal HTTP 401 at the
+   * upgrade, seen via `upgradeFailure`; the cause's `httpStatus` tells them apart),
    * "TAKEN_OVER" (a `conflict` arrived before the first `registered`; `expose()` rejects with it),
    * "DISCONNECTED_FATAL" (any other fatal transport failure, or `reconnect.maxAttempts` ran out;
-   * also a fatal HTTP 401 at the upgrade, seen via `upgradeFailure`: it carries no ws-mixer code).
+   * a fatal HTTP 403/404 at the upgrade has the status as the cause's `httpStatus`).
    */
   readonly code: string;
   /** True when it ended the exposure (the handle closes with it). */

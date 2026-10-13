@@ -48,6 +48,9 @@ export interface SessionDeps {
   fatal(err: McpwarpError): void;
 }
 
+/** How the `retry` reason of a transient register error starts; tunnel.ts tells it from a redial by it. */
+export const REGISTER_RETRY_PREFIX = "register failed";
+
 const RETRY_BASE_MS = 1000;
 const RETRY_CAP_MS = 30_000;
 const OVERLOAD_PAUSE_MS = 1000;
@@ -210,7 +213,7 @@ export class Session {
       this.deps.emit("error", new McpwarpError(err.code, err.message, { serviceName: this.deps.name }));
       const delay = Math.min(RETRY_BASE_MS * 2 ** this.transientFailures, RETRY_CAP_MS);
       this.transientFailures++;
-      this.deps.emit("retry", { attempt: this.transientFailures, delayMs: delay, reason: `register failed: ${err.code}: ${err.message}` });
+      this.deps.emit("retry", { attempt: this.transientFailures, delayMs: delay, reason: `${REGISTER_RETRY_PREFIX}: ${err.code}: ${err.message}` });
       this.clearRetry();
       this.retryTimer = this.deps.setTimeout(() => {
         this.retryTimer = undefined;

@@ -27,7 +27,7 @@ export { SUBPROTOCOL };
 // asserts the two match, so a release bump that forgets this one fails CI
 // instead of silently going stale on the wire in hello.agent.sdk_version /
 // the User-Agent header).
-export const SDK_VERSION = "0.9.0";
+export const SDK_VERSION = "0.10.0";
 
 export type ClientState = "idle" | "dialing" | "connected" | "backoff" | "closed";
 
@@ -1229,7 +1229,7 @@ export class MixerClient extends Emitter {
     // is still the one report for this fatal disconnect.
     const conn = this.conn;
     this.conn = null;
-    const err = new WsMixerError(ctx.errorCode ?? ErrorCode.INTERNAL_ERROR, ctx.message, { fatal: true });
+    const err = new WsMixerError(ctx.errorCode ?? ErrorCode.INTERNAL_ERROR, ctx.message, { fatal: true, httpStatus: ctx.httpStatus });
     if (conn) conn.fail(err);
     this.failSuperseded(err);
     this.emit("fatal", err);
@@ -1269,7 +1269,7 @@ export class MixerClient extends Emitter {
     this.conn = null;
     this.dialingConn = null;
     this.retiringConn = null;
-    const err = new WsMixerError(ctx.errorCode ?? ErrorCode.INTERNAL_ERROR, message, { fatal: true });
+    const err = new WsMixerError(ctx.errorCode ?? ErrorCode.INTERNAL_ERROR, message, { fatal: true, httpStatus: ctx.httpStatus });
     if (conn) conn.fail(err);
     if (dialing && dialing !== conn) dialing.fail(err);
     if (retiring && retiring !== conn && retiring !== dialing) retiring.fail(err);
