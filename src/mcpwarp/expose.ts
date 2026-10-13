@@ -16,6 +16,14 @@ import { McpwarpError } from "./errors.js";
 import { DEFAULT_TARGET_TIMEOUT_MS, MCP_PATH, serveWithHandler, serveWithTarget, type FetchHandler, type ServeContext, type StreamServer } from "./serve.js";
 import { Session, type ExposeConflict, type ExposeRegistration, type ExposeState } from "./session.js";
 
+/** The part of an `AbortSignal` that `expose()` reads; any real `AbortSignal` fits. */
+export interface AbortSignalLike {
+  readonly aborted: boolean;
+  readonly reason?: unknown;
+  addEventListener(type: "abort", listener: () => void, options?: { once?: boolean }): void;
+  removeEventListener(type: "abort", listener: () => void): void;
+}
+
 export interface ExposeBaseOptions {
   /** Default "wss://connect.mcpwarp.io". Routed by Host; the path is ignored. */
   url?: string;
@@ -50,7 +58,7 @@ export interface ExposeBaseOptions {
    * AbortError and closes the client; aborting it later closes the handle
    * (same as `handle.close()`).
    */
-  signal?: AbortSignal;
+  signal?: AbortSignalLike;
   /**
    * Called before every scheduled retry: a reconnect after a failed dial or
    * a lost connection, or a re-sent register after a transient register
@@ -174,36 +182,46 @@ class Handle extends Emitter implements ExposeHandle {
 /** Printable ASCII, capped like detectRuntime's own fields; it also goes into the User-Agent header. */
 const AGENT_FIELD_RE = /^[\x20-\x7e]{1,64}$/;
 
-function validate(opts: ExposeBaseOptions): void {
-  if (typeof opts.name !== "string" || !SERVICE_NAME_RE.test(opts.name) || opts.name.length > SERVICE_NAME_MAX) {
-    throw new TypeError(`mcpwarp: invalid service \`name\`: lowercase letters, digits and inner dashes, at most ${SERVICE_NAME_MAX} characters`);
-  }
-  if (typeof opts.integration !== "string" || opts.integration.length === 0) {
+/** @internal Also run by createTunnel() up front. */
+export function validateIntegration(integration: unknown): void {
+  if (typeof integration !== "string" || integration.length === 0) {
     throw new TypeError("mcpwarp: `integration` (your integration's registration UUID) is required");
   }
-  if (!INTEGRATION_ID_RE.test(opts.integration.toLowerCase())) {
+  if (!INTEGRATION_ID_RE.test(integration.toLowerCase())) {
     throw new TypeError("mcpwarp: `integration` must be an RFC 4122 UUID in text form; the server silently ignores anything else");
   }
-  if (opts.kind !== undefined && opts.kind !== "http" && opts.kind !== "stdio") {
-    throw new TypeError('mcpwarp: `kind` must be "http" or "stdio"');
-  }
-  if (opts.token === undefined || opts.token === null || opts.token === "") {
-    throw new TypeError("mcpwarp: `token` is required");
-  }
-  if (opts.agent !== undefined && (typeof opts.agent !== "object" || opts.agent === null)) {
+}
+
+/** @internal Also run by createTunnel() up front. */
+export function validateAgent(agent: unknown): void {
+  if (agent !== undefined && (typeof agent !== "object" || agent === null)) {
     throw new TypeError("mcpwarp: `agent` must be an object");
   }
   for (const k of ["runtime", "os"] as const) {
-    const v: unknown = opts.agent?.[k];
+    const v: unknown = (agent as Record<string, unknown> | undefined)?.[k];
     if (v !== undefined && (typeof v !== "string" || !AGENT_FIELD_RE.test(v))) {
       throw new TypeError(`mcpwarp: \`agent.${k}\` must be 1-64 printable ASCII characters`);
     }
   }
 }
 
+function validate(opts: ExposeBaseOptions): void {
+  if (typeof opts.name !== "string" || !SERVICE_NAME_RE.test(opts.name) || opts.name.length > SERVICE_NAME_MAX) {
+    throw new TypeError(`mcpwarp: invalid service \`name\`: lowercase letters, digits and inner dashes, at most ${SERVICE_NAME_MAX} characters`);
+  }
+  validateIntegration(opts.integration);
+  if (opts.kind !== undefined && opts.kind !== "http" && opts.kind !== "stdio") {
+    throw new TypeError('mcpwarp: `kind` must be "http" or "stdio"');
+  }
+  if (opts.token === undefined || opts.token === null || opts.token === "") {
+    throw new TypeError("mcpwarp: `token` is required");
+  }
+  validateAgent(opts.agent);
+}
+
 const MAX_TIMER_MS = 2_147_483_647;
 
-function abortError(signal: AbortSignal): Error {
+function abortError(signal: AbortSignalLike): Error {
   const reason: unknown = signal.reason;
   if (reason instanceof Error && reason.name === "AbortError") return reason;
   const message = "mcpwarp: expose() aborted before the service was registered";
@@ -230,6 +248,11 @@ function fatalMcpwarpError(err: Error, serviceName: string): McpwarpError {
  * retried, reported through `onRetry`.
  */
 export function expose(opts: ExposeOptions): Promise<ExposeHandle> {
+  return exposeWithServer(opts, adapterServer(opts));
+}
+
+/** @internal Validates the `handler`/`target` choice and returns its server factory; also used by createTunnel(). */
+export function adapterServer(opts: { handler?: unknown; target?: unknown; targetTimeoutMs?: unknown }): (ctx: ServeContext) => StreamServer {
   const hasHandler = typeof (opts as { handler?: unknown }).handler === "function";
   const hasTarget = (opts as { target?: unknown }).target !== undefined;
   if (hasHandler === hasTarget) throw new TypeError("mcpwarp: pass exactly one of `handler` or `target`");
@@ -248,17 +271,17 @@ export function expose(opts: ExposeOptions): Promise<ExposeHandle> {
     if (typeof timeoutMs !== "number" || !(timeoutMs > 0) || timeoutMs > MAX_TIMER_MS) {
       throw new TypeError(`mcpwarp: targetTimeoutMs must be a positive number of at most ${MAX_TIMER_MS} ms, got ${typeof timeoutMs === "number" ? String(timeoutMs) : typeof timeoutMs}`);
     }
-    return exposeWithServer(opts, (ctx) => serveWithTarget(target, ctx, timeoutMs));
+    return (ctx) => serveWithTarget(target, ctx, timeoutMs);
   }
   const handler = (opts as { handler: FetchHandler }).handler;
-  return exposeWithServer(opts, (ctx) => serveWithHandler(handler, ctx));
+  return (ctx) => serveWithHandler(handler, ctx);
 }
 
 /** @internal Shared by the `handler`/`target` adapters and `./node`'s `server`. */
 export function exposeWithServer(
   opts: ExposeBaseOptions,
   makeServer: (ctx: ServeContext) => StreamServer,
-  hooks?: { onClose?: () => void },
+  hooks?: { onClose?: () => void; onClientClose?: (closed: Promise<void>) => void },
 ): Promise<ExposeHandle> {
   validate(opts);
   const signal = opts.signal;
@@ -292,10 +315,16 @@ export function exposeWithServer(
     }
   };
 
+  // Closes the client outside handle.close() (abort, early conflict, fatal); onClientClose lets the caller await it.
+  const closeClient = (): void => {
+    const closed = client.close().catch(() => {});
+    hooks?.onClientClose?.(closed);
+  };
+
   const onAbort = (): void => {
     if (!settled) {
       const err = abortError(signal!);
-      void client.close().catch(() => {});
+      closeClient();
       finish(err);
     } else {
       void handle.close();
@@ -329,7 +358,7 @@ export function exposeWithServer(
       }
       // Taken over before `registered` arrived: the handle could never serve, so fail like any other first-registration fatal.
       if (event === "conflict" && !settled) {
-        void client.close().catch(() => {});
+        closeClient();
         finish(new McpwarpError("TAKEN_OVER", `mcpwarp: service ${JSON.stringify(opts.name)} was taken over by another connection before it registered`, { fatal: true, serviceName: opts.name }));
         return;
       }
@@ -340,7 +369,7 @@ export function exposeWithServer(
       }
     },
     fatal: (err) => {
-      void client.close().catch(() => {});
+      closeClient();
       finish(err);
     },
   });

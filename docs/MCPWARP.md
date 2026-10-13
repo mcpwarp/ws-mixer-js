@@ -1,6 +1,6 @@
 # The mcpwarp control plane, as this SDK implements it
 
-Status: descriptive of `src/mcpwarp/*` and `src/http1/*` (0.8.0). The tunnel's source of truth is
+Status: descriptive of `src/mcpwarp/*` and `src/http1/*` (0.9.0). The tunnel's source of truth is
 `mcpwarp-saas/apps/tunnel` (`internal/agentconn`, `internal/reqpath`); the Go CLI
 (`mcpwarp-tui-cli`, `internal/appproto`, `internal/relay`) is the reference agent. This SDK speaks
 ws-mixer.v1 underneath ([WIRE.md](https://github.com/mcpwarp/ws-mixer-spec/blob/main/docs/WIRE.md)).
@@ -140,6 +140,11 @@ transient register errors) without limit unless `reconnect.maxAttempts` is set. 
 delayMs, reason})` is called before each scheduled retry, and aborting `signal` rejects `expose()`
 with an `AbortError` and closes the client (after the first registration it closes the handle).
 
+For long-lived host integrations whose settings change at runtime (a plugin toggling the tunnel on
+and off, a rotated token, a renamed service), use `createTunnel()` instead of calling `expose()`
+directly: it restarts the exposure only when the config changed, serializes the restarts and
+reports one `status` (`off`/`connecting`/`online`/`disabled`/`conflict`/`error`).
+
 ## 6. Data plane
 
 - The edge opens **one stream per inbound HTTP request** and writes it as raw HTTP/1.1 in Go
@@ -170,7 +175,8 @@ with an `AbortError` and closes the client (after the first registration it clos
 - Error replies (JSON `{"error": "..."}`): `400` malformed request, `413` body too large, `431` head
   too large, `500` the integration's handler failed, `502` local target unreachable / no request
   handler, `503` disabled or closing, `504` local target sent no headers within `targetTimeoutMs`
-  (default 30 s), `404` (`{"error":"not_found"}`) any path other than `/mcp` (below).
+  (default 30 s; also without an `AbortController` global, where the fetch itself is left to
+  settle), `404` (`{"error":"not_found"}`) any path other than `/mcp` (below).
 - Only `/mcp` is forwarded. The public URL is `handle.url` and nothing else is reachable
   (`handle.path` is `"/mcp"`, for logging). Every adapter (`handler`, `target`, `server`) compares
   the request path (the raw request-target without query and fragment; for absolute-form, the part

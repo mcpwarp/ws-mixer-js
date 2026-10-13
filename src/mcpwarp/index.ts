@@ -1,6 +1,8 @@
 /** Public API of @mcpwarp/ws-mixer/mcpwarp: expose a local MCP server at its public mcpwarp URL. */
 export { expose } from "./expose.js";
-export type { ExposeOptions, ExposeBaseOptions, ExposeHandle } from "./expose.js";
+export type { ExposeOptions, ExposeBaseOptions, ExposeHandle, AbortSignalLike } from "./expose.js";
+export { createTunnel } from "./tunnel.js";
+export type { Tunnel, TunnelBase, TunnelConfig, TunnelState, TunnelStatus } from "./tunnel.js";
 export type { ExposeState, ExposeRegistration, ExposeConflict } from "./session.js";
 export type { FetchHandler } from "./serve.js";
 export { McpwarpError } from "./errors.js";

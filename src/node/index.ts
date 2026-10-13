@@ -49,6 +49,7 @@ export type { NodeStreamServer, ServeContext, StreamServer } from "./server.js";
 // Listed rather than `export *`: ./mcpwarp's own `expose` must not shadow the one above.
 export {
   McpwarpError,
+  createTunnel,
   RegisterErrorCode,
   AppErrorCode,
   TRANSIENT_REGISTER_ERRORS,
@@ -62,6 +63,12 @@ export type {
   ExposeOptions,
   ExposeBaseOptions,
   ExposeHandle,
+  AbortSignalLike,
+  Tunnel,
+  TunnelBase,
+  TunnelConfig,
+  TunnelState,
+  TunnelStatus,
   ExposeState,
   ExposeRegistration,
   ExposeConflict,

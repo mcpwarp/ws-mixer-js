@@ -2,6 +2,27 @@
 
 All notable changes to `@mcpwarp/ws-mixer` (the JS/TypeScript client SDK) are documented here.
 
+## 0.9.0 - 2026-10-13
+
+### Added
+
+- `createTunnel()` (`@mcpwarp/ws-mixer/mcpwarp`): a long-lived controller over `expose()` for
+  integrations whose settings change at runtime. `configure({ enabled, token, name, url?, kind? })`
+  restarts the exposure only when the config changed (calls are serialized, the last one wins);
+  `status`/`subscribe()` report `off`/`connecting`/`online`/`disabled`/`conflict`/`error` with `url`
+  and `lastError`; events from a replaced connection are ignored; after a `conflict` or fatal error
+  it stays down until the next `configure()`; `stop()` and `close({ timeoutMs })` (bounded unregister
+  + drain). Needs no `AbortController`/`DOMException` global. `createTunnel`, the `Tunnel*` types
+  and `AbortSignalLike` are also re-exported from `@mcpwarp/ws-mixer/node`.
+- `AbortSignalLike`: `expose()`'s `signal` is now typed structurally (`aborted`, `reason`,
+  `addEventListener`/`removeEventListener("abort")`); any `AbortSignal` still fits.
+
+### Fixed
+
+- `target` mode without an `AbortController` global answers `504` after `targetTimeoutMs` instead
+  of hanging on a local server that never responds (the fetch itself cannot be cancelled there and
+  is left to settle on its own).
+
 ## 0.8.0 - 2026-10-13
 
 ### Breaking

@@ -27,7 +27,7 @@ export { SUBPROTOCOL };
 // asserts the two match, so a release bump that forgets this one fails CI
 // instead of silently going stale on the wire in hello.agent.sdk_version /
 // the User-Agent header).
-export const SDK_VERSION = "0.8.0";
+export const SDK_VERSION = "0.9.0";
 
 export type ClientState = "idle" | "dialing" | "connected" | "backoff" | "closed";
 

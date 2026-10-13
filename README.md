@@ -76,6 +76,60 @@ Aborting `signal` before the first registration rejects `expose()` with an `Abor
 the client; aborting it later closes the handle like `handle.close()`. `onRetry` is called before
 every scheduled reconnect and every re-sent register.
 
+## Long-lived integrations
+
+A plugin (Zotero, Obsidian, ...) whose tunnel settings live in a preferences pane should not juggle
+handles itself: create one tunnel at startup and hand it the current settings whenever they change.
+
+```ts
+import { createTunnel } from "@mcpwarp/ws-mixer/mcpwarp";
+
+const tunnel = createTunnel({
+  integration: "0f6c2a8e-4c1b-4b7e-9a4e-2f1d9b7c3a10",
+  handler: (req) => mcp.fetch(req),
+  agent: { runtime: "zotero" },
+  logger: (level, message) => console[level](message),
+});
+
+// On startup and on prefs changes; unchanged settings are a no-op. Debounced, since a
+// restart can take seconds and text fields change on every keystroke.
+const applyPrefs = () =>
+  tunnel.configure({ enabled: prefs.enabled, token: prefs.token, name: prefs.name || "zotero" });
+await applyPrefs();
+let debounce: ReturnType<typeof setTimeout> | undefined;
+prefs.onChange(() => {
+  clearTimeout(debounce);
+  debounce = setTimeout(applyPrefs, 500);
+});
+
+// Status UI: called now and on every change.
+const unsubscribe = tunnel.subscribe(({ state, url, lastError }) => renderStatus(state, url, lastError));
+
+// On unload: unregister + drain, bounded.
+clearTimeout(debounce);
+unsubscribe();
+await tunnel.close({ timeoutMs: 1500 });
+```
+
+`configure()` restarts only when `enabled`, `token`, `name`, `url` or `kind` changed, serializes
+overlapping calls (the last one wins) and resolves once the new connection is dialing; it does not
+wait for `online`. A restart first waits for the old connection to unregister and drain, which
+takes up to ~7 s while requests or SSE streams are open (MCP clients usually keep one); the status
+is `connecting` meanwhile. Disabled or an empty token is `off` without dialing. States: `off`,
+`connecting` (dialing, retrying, after a disconnect), `online` (`url` set), `disabled` (from the
+dashboard), `conflict` (another instance took the name over) and `error` (a fatal failure such as
+a rejected token; `lastError` says why). After `conflict` or `error` the tunnel stays down until the
+next `configure()`, even with the same settings; `stop()` does the same on demand. Call
+`configure()` on settings changes, not from a status listener: re-applying the same settings after
+every `conflict` makes two instances take the name from each other in turn. `close()` is final;
+its `timeoutMs` can cut the drain short, leaving the old connection to close in the background.
+
+For plugin sandboxes: the controller itself needs no `AbortController` or `DOMException`. The SDK
+needs `setTimeout`/`clearTimeout`, `Promise`, `URL`, `TextEncoder`/`TextDecoder` (`TextDecoder`
+already when the module loads) and `Request`/`Response`/`Headers` (plus `fetch` for `target`);
+`AbortController` is optional. The `webSocket` factory still has to come from somewhere (see
+Runtimes).
+
 ## Three adapters
 
 Every public request becomes one ws-mixer stream carrying raw HTTP/1.1, served in the background
@@ -85,7 +139,8 @@ Every public request becomes one ws-mixer stream carrying raw HTTP/1.1, served i
 
 `(request: Request) => Response | Promise<Response>`. The request URL is the public URL
 (`https://notes-<user>.mcpwarp.io/mcp?...`). Fits MCP SDK v2's `createMcpHandler(...).fetch`, v1's
-`WebStandardStreamableHTTPServerTransport.handleRequest`, Hono, or a hand-written function. A
+`WebStandardStreamableHTTPServerTransport.handleRequest` (a method, so wrap it:
+`handler: (req) => transport.handleRequest(req)`), Hono, or a hand-written function. A
 Zotero-style `handleMCPRequest(body) -> {status, headers, body}` wraps like this:
 
 ```ts

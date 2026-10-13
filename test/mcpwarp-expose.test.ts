@@ -2,7 +2,7 @@
 import http from "node:http";
 import { gzipSync } from "node:zlib";
 import type { AddressInfo } from "node:net";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { McpwarpError, expose, type ExposeHandle, type ExposeOptions } from "../src/mcpwarp/index.js";
 import { FakeEdge } from "../src/testing/index.js";
 import type { EdgeConnection } from "../src/testing/edge-conn.js";
@@ -762,6 +762,27 @@ describe("expose({target})", () => {
     expect(await res.json()).toEqual({ error: "local server timed out" });
     expect(Date.now() - started).toBeLessThan(2000);
     await closedByProxy;
+  });
+
+  it("without an AbortController a hung target still gets 504 after targetTimeoutMs", async () => {
+    const edge = await startEdge();
+    let fetches = 0;
+    try {
+      vi.stubGlobal("AbortController", undefined);
+      vi.stubGlobal("fetch", () => {
+        fetches++;
+        return new Promise<Response>(() => {});
+      });
+      await exposeOn(edge, { target: "http://127.0.0.1:1/mcp", targetTimeoutMs: 100 });
+      const started = Date.now();
+      const res = await edge.fetch(edge.publicUrl("notes"));
+      expect(res.status).toBe(504);
+      expect(await res.json()).toEqual({ error: "local server timed out" });
+      expect(Date.now() - started).toBeLessThan(2000);
+      expect(fetches).toBe(1);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it("targetTimeoutMs only bounds the wait for headers: a body streaming past it is delivered whole", async () => {

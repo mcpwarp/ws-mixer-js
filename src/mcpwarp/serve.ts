@@ -166,9 +166,11 @@ export function serveWithTarget(target: string | URL, ctx: ServeContext, timeout
 
       const ac = newAbortController();
       let timedOut = false;
+      let rejectOnTimeout: ((e: Error) => void) | undefined;
       const timer = setTimeout(() => {
         timedOut = true;
         ac?.abort(new Error("local server timed out"));
+        rejectOnTimeout?.(new Error("local server timed out"));
       }, timeoutMs);
       if (edgeSignal) {
         if (edgeSignal.aborted) ac?.abort(edgeSignal.reason);
@@ -180,7 +182,19 @@ export function serveWithTarget(target: string | URL, ctx: ServeContext, timeout
       let response: Response;
       try {
         const doFetch = (globalThis as Record<string, any>).fetch as typeof fetch;
-        response = await doFetch(url.href, init);
+        const fetched = doFetch(url.href, init);
+        if (ac) {
+          response = await fetched;
+        } else {
+          // Nothing can cancel this fetch: answer 504 on time and discard whatever it settles with later.
+          fetched.then(
+            (r) => {
+              if (timedOut) void r.body?.cancel().catch(() => {});
+            },
+            () => {},
+          );
+          response = await Promise.race([fetched, new Promise<never>((_, reject) => (rejectOnTimeout = reject))]);
+        }
       } catch (e) {
         clearTimeout(timer);
         if (timedOut) return { error: 504, message: "local server timed out" };
