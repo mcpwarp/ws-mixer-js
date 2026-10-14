@@ -178,6 +178,33 @@ already when the module loads) and `Request`/`Response`/`Headers` (plus `fetch` 
 `AbortController` is optional. The `webSocket` factory still has to come from somewhere (see
 Runtimes).
 
+### Status text
+
+`describeStatus()` turns a status into short UI text in `en`, `de`, `es`, `fr`, `ja` or `zh-CN`
+(`statusLocales`), so you need not translate states and codes yourself:
+
+```ts
+import { describeStatus } from "@mcpwarp/ws-mixer/mcpwarp";
+
+tunnel.subscribe((status) => {
+  const { label, detail } = describeStatus(status, { locale: globalThis.navigator?.language ?? "en" });
+  renderStatus(label, detail); // detail is undefined when online or plainly off
+});
+// Override single strings, over the resolved locale:
+describeStatus(status, { locale: "de", messages: { states: { error: "Problem" } } });
+```
+
+`label` is the state; `detail` the code's sentence, or `lastError` when there is no code (your own
+host-side reasons included), and left out when empty or when it would repeat `label` (`disabled`,
+`conflict`). `INVALID_CONFIG` appends a colon (in French with a no-break space before the colon and
+a space after it, `"："` in Japanese and Chinese, `": "` otherwise) and `lastError`, which names the
+bad field and stays English in every locale ("Ungültige Einstellungen: The service name is not
+set."); the generic "The tunnel settings are invalid." is left out. A `lastError` equal to or
+starting with the localized sentence is shown alone. A `": "` inside `lastError` is rendered as
+`"; "`, so the detail has a single colon. A locale resolves by exact tag (case-insensitive, `_` read
+as `-`), then by language (`de-AT` is `de`), then to English; it never throws. Any `zh-*` (`zh-TW`,
+`zh-HK` and `zh-Hant` included) gets the Simplified Chinese `zh-CN` table.
+
 ## Three adapters
 
 Every public request becomes one ws-mixer stream carrying raw HTTP/1.1, served in the background

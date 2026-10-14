@@ -2,7 +2,17 @@
 
 All notable changes to `@mcpwarp/ws-mixer` (the JS/TypeScript client SDK) are documented here.
 
-## Unreleased
+## 0.10.1 - 2026-10-14
+
+### Added
+
+- `describeStatus(status, { locale, messages })` in `./mcpwarp` (and `./node`): a tunnel status as
+  localized UI text, `{ label, detail? }`, for `en`, `de`, `es`, `fr`, `ja` and `zh-CN`
+  (`statusLocales`). Unknown locales fall back to the language subtag, then English; `messages`
+  overrides single strings. `INVALID_CONFIG` adds the English `lastError` after a per-locale colon
+  (French puts a no-break space before it). A `lastError` equal to or starting with the localized
+  sentence is shown alone. A `": "` inside `lastError` is rendered as `"; "`, so the detail has a
+  single colon. Plain string tables, no `Intl`.
 
 ### Changed
 

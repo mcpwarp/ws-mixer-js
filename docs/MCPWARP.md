@@ -1,6 +1,6 @@
 # The mcpwarp control plane, as this SDK implements it
 
-Status: descriptive of `src/mcpwarp/*` and `src/http1/*` (0.10.0). The tunnel's source of truth is
+Status: descriptive of `src/mcpwarp/*` and `src/http1/*` (0.10.1). The tunnel's source of truth is
 `mcpwarp-saas/apps/tunnel` (`internal/agentconn`, `internal/reqpath`); the Go CLI
 (`mcpwarp-tui-cli`, `internal/appproto`, `internal/relay`) is the reference agent. This SDK speaks
 ws-mixer.v1 underneath ([WIRE.md](https://github.com/mcpwarp/ws-mixer-spec/blob/main/docs/WIRE.md)).
