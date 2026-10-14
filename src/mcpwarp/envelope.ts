@@ -10,11 +10,18 @@ import { McpwarpError } from "./errors.js";
 
 export const MCPWARP_V = 1;
 export const DEFAULT_URL = "wss://connect.mcpwarp.io";
-/** Service-name syntax; names are also limited to 30 characters. */
+/** Service-name syntax; names are also limited to SERVICE_NAME_MAX characters. */
 export const SERVICE_NAME_RE = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/;
+/** Longest service name the tunnel accepts, in characters. */
 export const SERVICE_NAME_MAX = 30;
 
-/** SERVICE_NAME_RE and SERVICE_NAME_MAX together; false for a non-string. */
+/**
+ * Whether `name` is a service name the tunnel accepts: a string of at most
+ * SERVICE_NAME_MAX characters matching SERVICE_NAME_RE (lowercase letters,
+ * digits and inner dashes). `expose()` and the tunnel controller refuse
+ * anything else before dialing; use this to validate user input up front.
+ * False for a non-string.
+ */
 export function isValidServiceName(name: unknown): name is string {
   return typeof name === "string" && name.length <= SERVICE_NAME_MAX && SERVICE_NAME_RE.test(name);
 }
@@ -132,7 +139,8 @@ function list(o: Record<string, unknown>, key: string, where: string): Record<st
 /**
  * Decodes an `app` body. undefined when it has no object-valued `mcpwarp`
  * key (not ours: ignore). `v !== 1` or an unknown op -> `{op:"unknown"}`.
- * Throws McpwarpError("MALFORMED_ENVELOPE") for a known op with wrong field types.
+ * Throws McpwarpError("MALFORMED_ENVELOPE") for a known op with wrong field
+ * types or a `registered` service without a non-empty `url`.
  */
 export function decodeEnvelope(body: Record<string, unknown>): InboundEnvelope | undefined {
   const env = body.mcpwarp;
@@ -145,12 +153,10 @@ export function decodeEnvelope(body: Record<string, unknown>): InboundEnvelope |
         services: list(env, "services", "registered").map((s) => {
           const created = s.created ?? false;
           if (typeof created !== "boolean") throw malformed("registered.services[].created must be a boolean");
-          return {
-            name: reqString(s, "name", "registered.services[]"),
-            id: reqString(s, "id", "registered.services[]"),
-            url: optString(s, "url", "registered.services[]", ""),
-            created,
-          };
+          const name = reqString(s, "name", "registered.services[]");
+          const id = reqString(s, "id", "registered.services[]");
+          if (typeof s.url !== "string" || s.url === "") throw malformed("registered.services[].url must be a non-empty string");
+          return { name, id, url: s.url, created };
         }),
         errors: list(env, "errors", "registered").map((e) => {
           const out: ServiceError = {

@@ -6,11 +6,19 @@
  * of an older one are ignored. Needs only timers and promises from the
  * runtime, so it runs in plugin sandboxes such as Zotero's.
  */
-import { AppErrorCode, isValidServiceName, RegisterErrorCode, SERVICE_NAME_MAX, TRANSIENT_REGISTER_ERRORS } from "./envelope.js";
+import { AppErrorCode, isValidServiceName, RegisterErrorCode, SERVICE_NAME_MAX } from "./envelope.js";
 import { McpwarpError } from "./errors.js";
-import { adapterServer, exposeWithServer, validateAgent, validateIntegration, type AbortSignalLike, type ExposeHandle, type ExposeOptions } from "./expose.js";
+import {
+  adapterServer,
+  exposeWithServer,
+  validateAgent,
+  validateIntegration,
+  type AbortSignalLike,
+  type ExposeHandle,
+  type ExposeOptions,
+  type ExposeSignal,
+} from "./expose.js";
 import type { FetchHandler, ServeContext, StreamServer } from "./serve.js";
-import { REGISTER_RETRY_PREFIX } from "./session.js";
 
 interface TunnelCommon {
   /** Your integration's registration UUID, as for expose(). */
@@ -25,12 +33,13 @@ interface TunnelCommon {
    * Default: silent. Never receives the token. Messages carry no "mcpwarp: "
    * prefix; tag them yourself. The technical details behind
    * `status.lastError` land here. At "error": fatal failures as
-   * "CODE: message" with the McpwarpError code (a failure without one, such
-   * as an invalid `name` caught before dialing, has the message only), and a
-   * refused config as "INVALID_CONFIG: <which field is wrong>", never its
-   * value. At "warn": retries as "retry #N in MS ms: reason", disconnects as
-   * "disconnected: reason", and non-fatal errors as "CODE: message" (a
-   * request handler's error has no code). Progress goes to "info".
+   * "CODE: message" with the McpwarpError code (a failure without one has
+   * the status code, e.g. "INVALID_NAME: <rule>" for a name caught before
+   * dialing), and a refused config as "INVALID_CONFIG: <which field is
+   * wrong>", never its value. At "warn": retries as "retry #N in MS ms:
+   * reason", disconnects as "disconnected: reason", and non-fatal errors as
+   * "CODE: message" (a request handler's error has no code). Progress goes
+   * to "info".
    */
   logger?: (level: "info" | "warn" | "error", message: string) => void;
 }
@@ -41,9 +50,6 @@ export type TunnelOptions = TunnelCommon &
     | { handler: FetchHandler; target?: never; targetTimeoutMs?: never }
     | { target: string | URL; targetTimeoutMs?: number; handler?: never }
   );
-
-/** @deprecated Renamed to TunnelOptions; this alias is removed in 0.11.0. */
-export type TunnelBase = TunnelOptions;
 
 /**
  * What may change at runtime. Disabled, or an empty (after trim) token, means "off" without dialing,
@@ -78,14 +84,16 @@ export const TunnelStatusCode = {
   /** "connecting": the connection was lost and is being re-established. */
   DISCONNECTED: "DISCONNECTED",
   /**
-   * "connecting": a dial or a register failed and is retried, the very first attempt included.
+   * "connecting": a dial failed, or a register failed (or was answered OVERLOADED) and is re-sent.
    * Redials after a lost connection stay DISCONNECTED; a register retried then is RETRYING again.
    */
   RETRYING: "RETRYING",
   /** "disabled": the service is disabled in the mcpwarp dashboard. */
   DISABLED: "DISABLED",
-  /** "error": the config was refused (a field of the wrong type, an invalid name or kind, or INVALID_NAME from the server). */
+  /** "error": the config was refused (a field of the wrong type, an invalid kind or `reconnect` option). */
   INVALID_CONFIG: "INVALID_CONFIG",
+  /** "error": the service name is invalid (checked before dialing, or refused by the server). */
+  INVALID_NAME: "INVALID_NAME",
   /** "error": the mcpwarp account has no username yet. */
   USERNAME_REQUIRED: "USERNAME_REQUIRED",
   /** "error": the account's service quota is used up. */
@@ -141,10 +149,9 @@ export interface Tunnel {
    * 5000), then configure()/stop() do nothing. The bound can cut an
    * in-flight drain short (its worst case is ~7 s): dispose() then resolves
    * while the old connection is still closing in the background.
+   * `timeoutMs` must be a positive finite number (TypeError otherwise).
    */
   dispose(opts?: { timeoutMs?: number }): Promise<void>;
-  /** @deprecated Renamed to dispose(); this alias is removed in 0.11.0. */
-  close(opts?: { timeoutMs?: number }): Promise<void>;
   /** A snapshot copy. */
   readonly status: TunnelStatus;
   /** Calls `listener` now and on every status change; returns the unsubscribe function. */
@@ -229,23 +236,11 @@ const TAKEN_OVER: Problem = { code: TunnelStatusCode.TAKEN_OVER, lastError: "Ano
 const DISABLED: Problem = { code: TunnelStatusCode.DISABLED, lastError: "This service is disabled in the mcpwarp dashboard." };
 const REJECTED: Problem = { code: TunnelStatusCode.UNAUTHORIZED, lastError: "The token was rejected." };
 const INVALID_NAME: Problem = {
-  code: TunnelStatusCode.INVALID_CONFIG,
+  code: TunnelStatusCode.INVALID_NAME,
   lastError: `The service name is invalid: use lowercase letters, digits and dashes (not at the start or end), at most ${SERVICE_NAME_MAX} characters.`,
 };
 const INVALID_SETTINGS: Problem = { code: TunnelStatusCode.INVALID_CONFIG, lastError: "The tunnel settings are invalid." };
-
-/**
- * Register refusals. After an earlier registration session.ts reports them as non-fatal `error`s
- * to retry at the next welcome, but the connection stays up, so nothing retries them.
- */
-const REFUSALS: ReadonlySet<string> = new Set([
-  RegisterErrorCode.UNAUTHENTICATED,
-  RegisterErrorCode.FORBIDDEN,
-  RegisterErrorCode.INVALID_NAME,
-  RegisterErrorCode.QUOTA_EXCEEDED,
-  RegisterErrorCode.USERNAME_REQUIRED,
-  RegisterErrorCode.CONFLICT,
-]);
+const INTERNAL: Problem = { code: TunnelStatusCode.INTERNAL, lastError: "Something went wrong; the log has the details." };
 
 /** A config field of the wrong type, checked before any other use; JS hosts reading prefs get no help from the types. */
 function invalidConfig(config: unknown): { detail: string; problem: Problem } | undefined {
@@ -285,9 +280,8 @@ function describeProblem(err: unknown): Problem {
       case "DISCONNECTED_FATAL":
         return { code: TunnelStatusCode.DISCONNECTED_FATAL, lastError: "The connection to mcpwarp failed." };
     }
-    if (TRANSIENT_REGISTER_ERRORS.has(err.code)) return RETRY_REGISTER;
   }
-  return { code: TunnelStatusCode.INTERNAL, lastError: "Something went wrong; the log has the details." };
+  return INTERNAL;
 }
 
 /** A TypeError expose() threw synchronously from its validation. */
@@ -357,12 +351,12 @@ class TunnelImpl implements Tunnel {
   }
 
   dispose(opts?: { timeoutMs?: number }): Promise<void> {
-    if (!this.closing) this.closing = this.disposeImpl(opts?.timeoutMs ?? DEFAULT_CLOSE_TIMEOUT_MS);
+    const timeoutMs: unknown = opts?.timeoutMs ?? DEFAULT_CLOSE_TIMEOUT_MS;
+    if (typeof timeoutMs !== "number" || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      throw new TypeError("mcpwarp: dispose() `timeoutMs` must be a positive finite number");
+    }
+    if (!this.closing) this.closing = this.disposeImpl(timeoutMs);
     return this.closing;
-  }
-
-  close(opts?: { timeoutMs?: number }): Promise<void> {
-    return this.dispose(opts);
   }
 
   private async disposeImpl(timeoutMs: number): Promise<void> {
@@ -426,102 +420,75 @@ class TunnelImpl implements Tunnel {
           maxRequestBodyBytes: this.base.maxRequestBodyBytes,
           signal,
           onRetry: (info) => {
-            if (!live()) return;
-            this.log("warn", `retry #${info.attempt} in ${info.delayMs} ms: ${info.reason}`);
-            // While online this is a drain replacement's retry; the old connection still serves.
-            if (this.current.state === "connecting") {
-              // Session's reason for a transient register error; anything else is a redial.
-              if (info.reason.startsWith(REGISTER_RETRY_PREFIX)) this.setStatus({ ...this.current, ...RETRY_REGISTER });
-              // After a lost connection the redials keep saying so.
-              else if (this.current.code !== TunnelStatusCode.DISCONNECTED) this.setStatus({ ...this.current, ...RETRY_DIAL });
-            }
-            this.base.onRetry?.(info);
+            if (live()) this.base.onRetry?.(info);
           },
         },
         this.makeServer,
-        { onClientClose: (closed) => clientCloses.push(closed) },
+        {
+          onClientClose: (closed) => clientCloses.push(closed),
+          observe: (s) => {
+            if (live()) this.observe(s, cfg);
+          },
+        },
       );
     } catch (e) {
       this.fail(cfg, e, true);
       return;
     }
     this.active = { gen, abort, started, clientCloses };
-    started.then(
-      (handle) => {
-        if (!live()) return;
-        this.wire(handle, cfg, live);
-        switch (handle.state) {
-          case "registered":
-            this.log("info", `online at ${handle.url}`);
-            this.setStatus({ state: "online", url: handle.url });
-            return;
-          case "disabled":
-            this.log("warn", "the service is disabled in the mcpwarp dashboard");
-            this.setStatus({ state: "disabled", ...DISABLED });
-            return;
-          // The handle moved on between its first `registered`/`disabled` and the resolution reaching us.
-          case "conflict":
-            this.conflicted(cfg);
-            return;
-          case "closing":
-          case "closed":
-            this.fail(cfg, new Error("the connection closed"));
-            return;
-          default:
-            this.setStatus({ state: "connecting" });
-        }
-      },
-      (err: unknown) => {
-        if (!live()) return;
-        this.fail(cfg, err);
-      },
-    );
+    // Every outcome was observed already; a rejection settles nothing more.
+    started.catch(() => {});
   }
 
-  private wire(handle: ExposeHandle, cfg: TunnelConfig, live: () => boolean): void {
-    handle.on("registered", (e) => {
-      if (!live()) return;
-      this.log("info", `online at ${e.url}`);
-      this.setStatus({ state: "online", url: e.url });
-    });
-    handle.on("disabled", (e) => {
-      if (!live()) return;
-      this.log("warn", `the service was disabled (${e.reason})`);
-      this.setStatus({ state: "disabled", ...DISABLED });
-    });
-    handle.on("enabled", () => {
-      if (!live()) return;
-      this.log("info", "the service was enabled, registering again");
-      this.setStatus({ state: "connecting" });
-    });
-    handle.on("error", (err) => {
-      if (!live()) return;
-      if (err instanceof McpwarpError && REFUSALS.has(err.code)) {
-        this.fail(cfg, err);
+  /** One exposure event of the current generation. */
+  private observe(s: ExposeSignal, cfg: TunnelConfig): void {
+    switch (s.event) {
+      case "registered":
+        this.log("info", `online at ${s.registration.url}`);
+        this.setStatus({ state: "online", url: s.registration.url });
         return;
-      }
-      this.log("warn", technical(err));
-      // Request handler failures come here too; only mcpwarp's own errors explain a pending connection.
-      if (this.current.state === "connecting" && err instanceof McpwarpError) this.setStatus({ ...this.current, ...describeProblem(err) });
-    });
-    handle.on("disconnect", (reason) => {
-      if (!live() || reason.fatal) return;
-      // expose() only moves the handle off registered/disabled when no connection is current.
-      if (handle.state === "registered" || handle.state === "disabled") {
-        this.log("info", `a replaced connection ended: ${reason.message}`);
+      case "disabled":
+        this.log("warn", `the service was disabled (${s.reason})`);
+        this.setStatus({ state: "disabled", ...DISABLED });
         return;
-      }
-      this.log("warn", `disconnected: ${reason.message}`);
-      this.setStatus({ state: "connecting", ...LOST });
-    });
-    handle.on("conflict", () => {
-      if (!live()) return;
-      this.conflicted(cfg);
-    });
-    handle.on("close", (e) => {
-      if (!live()) return;
-      this.fail(cfg, e.error ?? new Error("the connection closed"));
-    });
+      case "enabled":
+        this.log("info", "the service was enabled, registering again");
+        this.setStatus({ state: "connecting" });
+        return;
+      case "conflict":
+        this.conflicted(cfg);
+        return;
+      case "error":
+        // Any register refusal is terminal: after an earlier registration nothing would retry it.
+        if (s.origin === "register_refusal") {
+          this.fail(cfg, s.error);
+          return;
+        }
+        this.log("warn", technical(s.error));
+        // Transient register errors are explained by their retry; handler errors never change the status.
+        if ((s.origin === "app" || s.origin === "malformed") && this.current.state === "connecting") this.setStatus({ state: "connecting", ...INTERNAL });
+        return;
+      case "retry":
+        this.log("warn", `retry #${s.info.attempt} in ${s.info.delayMs} ms: ${s.info.reason}`);
+        // While online or disabled this is a drain replacement's register; the old connection still serves.
+        if ((s.kind === "register" || s.kind === "overloaded") && this.current.state === "connecting") this.setStatus({ state: "connecting", ...RETRY_REGISTER });
+        return;
+      case "disconnect":
+        if (s.reason.fatal) return;
+        if (s.superseded) {
+          if (s.reason.phase === "connected") this.log("info", `the superseded connection ended: ${s.reason.message}`);
+          else this.log("warn", `disconnected: ${s.reason.message}`);
+          return;
+        }
+        this.log("warn", `disconnected: ${s.reason.message}`);
+        if (s.reason.phase === "connected") this.setStatus({ state: "connecting", ...LOST });
+        // After a lost connection the failed redials keep saying so.
+        else if (this.current.state === "connecting" && this.current.code !== TunnelStatusCode.DISCONNECTED) this.setStatus({ state: "connecting", ...RETRY_DIAL });
+        return;
+      case "close":
+        this.fail(cfg, s.error ?? new Error("the connection closed"));
+        return;
+    }
   }
 
   private conflicted(cfg: TunnelConfig): void {
@@ -538,7 +505,7 @@ class TunnelImpl implements Tunnel {
       return;
     }
     const problem = sync && err instanceof TypeError ? validationProblem(cfg) : describeProblem(err);
-    this.log("error", technical(err));
+    this.log("error", err instanceof McpwarpError ? technical(err) : `${problem.code}: ${errorMessage(err)}`);
     this.forget(cfg);
     this.detach();
     this.setStatus({ state: "error", ...problem });

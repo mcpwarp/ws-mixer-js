@@ -1,12 +1,12 @@
 /** createTunnel() against the in-process FakeEdge: idempotent configure, generations, status mapping, conflict, stop/dispose. */
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { AbortSignalLike, ExposeSignal } from "../src/mcpwarp/expose.js";
 import {
   createTunnel,
   McpwarpError,
   TunnelStatusCode,
   type ExposeHandle,
   type Tunnel,
-  type TunnelBase,
   type TunnelConfig,
   type TunnelOptions,
   type TunnelStatus,
@@ -16,12 +16,14 @@ import { ErrorCode } from "../src/errors.js";
 import type { WebSocketFactory, WebSocketLike } from "../src/socket.js";
 
 // Real expose by default; a test can put a fake behind exposeWithServer.
-const exposeHook = vi.hoisted(() => ({ fn: undefined as undefined | (() => Promise<ExposeHandle>) }));
+type ExposeHooks = Parameters<typeof import("../src/mcpwarp/expose.js").exposeWithServer>[2];
+const exposeHook = vi.hoisted(() => ({ fn: undefined as undefined | ((hooks: ExposeHooks, signal: AbortSignalLike | undefined) => Promise<ExposeHandle>) }));
 vi.mock("../src/mcpwarp/expose.js", async (importOriginal) => {
   const mod = await importOriginal<typeof import("../src/mcpwarp/expose.js")>();
   return {
     ...mod,
-    exposeWithServer: (...args: Parameters<typeof mod.exposeWithServer>) => (exposeHook.fn ? exposeHook.fn() : mod.exposeWithServer(...args)),
+    exposeWithServer: (...args: Parameters<typeof mod.exposeWithServer>) =>
+      exposeHook.fn ? exposeHook.fn(args[2], args[0].signal) : mod.exposeWithServer(...args),
   };
 });
 
@@ -44,25 +46,14 @@ function fakeHandle(state: ExposeHandle["state"]): ExposeHandle & { close: Retur
   return h as unknown as ExposeHandle & { close: ReturnType<typeof vi.fn> };
 }
 
-/** A fakeHandle() whose events a test emits. */
-function emittingHandle(state: ExposeHandle["state"]): { handle: ExposeHandle; wired: () => boolean; emit: (event: string, payload: unknown) => void } {
-  const listeners = new Map<string, Array<(payload: unknown) => void>>();
-  const h = {
-    state,
-    url: undefined,
-    on: (event: string, fn: (payload: unknown) => void) => {
-      listeners.set(event, [...(listeners.get(event) ?? []), fn]);
-      return h;
-    },
-    close: vi.fn(async () => {}),
+/** Stands in for exposeWithServer(): a pending expose() whose signals a test sends through the tunnel's observe hook. */
+function observedExpose(): { wired: () => boolean; send: (s: ExposeSignal) => void } {
+  let observe: ((s: ExposeSignal) => void) | undefined;
+  exposeHook.fn = (hooks, signal) => {
+    observe = hooks?.observe;
+    return new Promise<ExposeHandle>((_, reject) => signal?.addEventListener("abort", () => reject(new Error("aborted"))));
   };
-  return {
-    handle: h as unknown as ExposeHandle,
-    wired: () => listeners.size > 0,
-    emit: (event, payload) => {
-      for (const fn of listeners.get(event) ?? []) fn(payload);
-    },
-  };
+  return { wired: () => observe !== undefined, send: (s) => observe!(s) };
 }
 
 /** Wraps `factory` so the client sees "open" only after `gate` resolves and reads `bufferedAmount()` if given; records the sockets. */
@@ -354,6 +345,25 @@ describe("createTunnel", () => {
     expect(edge.upgrades).toHaveLength(1);
   });
 
+  it("a drain with reason replaced before the first registration (expose() rejects TAKEN_OVER) is state conflict; nothing is redialed", async () => {
+    // The drain dial's jitter (`Math.random() * 2000`) pinned to 50 ms, so the short wait below shows it never came.
+    const random = vi.spyOn(Math, "random").mockReturnValue(0.025);
+    cleanups.push(() => random.mockRestore());
+    const edge = await startEdge();
+    const retries: string[] = [];
+    const { tunnel } = tunnelOn(edge, { onRetry: (info) => retries.push(info.reason) });
+    edge.withholdRegistered("notes");
+    await tunnel.configure(cfg(edge));
+    await edge.waitForApp("register");
+    await edge.drain({ reason: "replaced", deadlineMs: 25000 });
+    await waitFor(() => tunnel.status.state === "conflict");
+    expect(tunnel.status.code).toBe(TunnelStatusCode.TAKEN_OVER);
+    await sleep(300);
+    expect(edge.upgrades).toHaveLength(1);
+    expect(retries).toEqual([]);
+    expect(tunnel.status.state).toBe("conflict");
+  });
+
   it("a fatal failure is state error with code and a plain lastError, the technical message logged; the same config then restarts", async () => {
     const edge = await startEdge();
     const { tunnel, logs } = tunnelOn(edge);
@@ -382,9 +392,9 @@ describe("createTunnel", () => {
     const { tunnel, logs } = tunnelOn(edge);
     await tunnel.configure(cfg(edge, { name: "Bad_Name" }));
     expect(tunnel.status.state).toBe("error");
-    expect(tunnel.status.code).toBe(TunnelStatusCode.INVALID_CONFIG);
+    expect(tunnel.status.code).toBe(TunnelStatusCode.INVALID_NAME);
     expect(tunnel.status.lastError).toMatch(/^The service name is invalid/);
-    expect(logs.some(([l, m]) => l === "error" && m.startsWith("invalid service `name`"))).toBe(true);
+    expect(logs.some(([l, m]) => l === "error" && m.startsWith("INVALID_NAME: invalid service `name`"))).toBe(true);
     expect(edge.upgrades).toHaveLength(0);
   });
 
@@ -467,7 +477,7 @@ describe("createTunnel", () => {
     await waitFor(() => logs.filter(([, m]) => m.startsWith("online at ")).length === 2);
     release();
     await inflight;
-    await waitFor(() => edge.connections.length === 1 && logs.some(([l, m]) => l === "info" && m.startsWith("a replaced connection ended")));
+    await waitFor(() => edge.connections.length === 1 && logs.some(([l, m]) => l === "info" && m.startsWith("the superseded connection ended")));
     expect(tunnel.status).toEqual({ state: "online", url: edge.publicUrl("notes") });
     expect(history.map((s) => s.state)).toEqual(["off", "connecting", "online"]);
   });
@@ -494,34 +504,40 @@ describe("createTunnel", () => {
     await waitFor(() => calls === 1);
     edge.failRegister("notes", { code: "INTERNAL" });
     await edge.drain({ conn: oldConn, deadlineMs: 10000 });
-    await waitFor(() => retries.length === 1);
+    await waitFor(() => retries.length === 2);
+    expect(retries).toEqual(["drain", "register failed: INTERNAL: internal"]);
     expect(tunnel.status).toEqual({ state: "online", url: edge.publicUrl("notes") });
-    expect(logs.some(([l, m]) => l === "warn" && m.startsWith("retry #1"))).toBe(true);
+    expect(logs.some(([l, m]) => l === "warn" && m.startsWith("retry #1 in 1000 ms: register failed: INTERNAL"))).toBe(true);
     release();
     await inflight;
   });
 
-  it("the error event: only mcpwarp errors while connecting change the status; a handler TypeError is no INVALID_CONFIG; disabled keeps its code", async () => {
+  it("errors move the status by origin, never by code: handler errors and transient register errors leave connecting alone, an app error is INTERNAL, disabled keeps its code", async () => {
     const edge = await startEdge();
-    const pending = emittingHandle("registering");
-    exposeHook.fn = () => Promise.resolve(pending.handle);
-    const { tunnel } = tunnelOn(edge);
+    const pending = observedExpose();
+    const { tunnel, logs } = tunnelOn(edge);
     await tunnel.configure(cfg(edge));
     await waitFor(() => pending.wired());
-    pending.emit("error", new TypeError("handler did not return a Response"));
+    pending.send({ event: "error", error: new TypeError("handler did not return a Response") });
     expect(tunnel.status).toEqual({ state: "connecting" });
-    pending.emit("error", new McpwarpError("INTERNAL", "register failed"));
+    // A transient register error named INTERNAL is explained by its retry, not by its code.
+    pending.send({ event: "error", error: new McpwarpError("INTERNAL", "backend error"), origin: "register_transient" });
+    expect(tunnel.status).toEqual({ state: "connecting" });
+    pending.send({ event: "retry", info: { attempt: 1, delayMs: 1000, reason: "register failed: INTERNAL: backend error" }, kind: "register" });
     expect(tunnel.status).toEqual({ state: "connecting", code: TunnelStatusCode.RETRYING, lastError: "mcpwarp couldn't register the service; retrying." });
-    await tunnel.dispose();
-
-    const disabled = emittingHandle("disabled");
-    exposeHook.fn = () => Promise.resolve(disabled.handle);
-    const second = tunnelOn(edge);
-    await second.tunnel.configure(cfg(edge));
-    await waitFor(() => second.tunnel.status.state === "disabled");
-    disabled.emit("error", new McpwarpError("TOO_MANY_SERVICES", "too many services"));
-    expect(second.tunnel.status).toEqual({ state: "disabled", code: TunnelStatusCode.DISABLED, lastError: "This service is disabled in the mcpwarp dashboard." });
-    expect(second.logs.some(([l, m]) => l === "warn" && m.startsWith("TOO_MANY_SERVICES: "))).toBe(true);
+    // A redial's reason that happens to start like a register retry's is still a redial.
+    pending.send({ event: "retry", info: { attempt: 1, delayMs: 10, reason: "register failed somewhere" }, kind: "reconnect" });
+    expect(tunnel.status.code).toBe(TunnelStatusCode.RETRYING);
+    pending.send({ event: "error", error: new McpwarpError("UNKNOWN_OP", "unknown op"), origin: "app" });
+    expect(tunnel.status).toEqual({ state: "connecting", code: TunnelStatusCode.INTERNAL, lastError: "Something went wrong; the log has the details." });
+    pending.send({ event: "disabled", reason: "disabled" });
+    pending.send({ event: "error", error: new McpwarpError("TOO_MANY_SERVICES", "too many services"), origin: "app" });
+    expect(tunnel.status).toEqual({ state: "disabled", code: TunnelStatusCode.DISABLED, lastError: "This service is disabled in the mcpwarp dashboard." });
+    expect(logs.some(([l, m]) => l === "warn" && m.startsWith("TOO_MANY_SERVICES: "))).toBe(true);
+    // Any register refusal is terminal, after a registration too.
+    pending.send({ event: "error", error: new McpwarpError("SOMETHING_NEW", "newer edge"), origin: "register_refusal" });
+    expect(tunnel.status).toEqual({ state: "error", code: TunnelStatusCode.INTERNAL, lastError: "Something went wrong; the log has the details." });
+    expect(logs.some(([l, m]) => l === "error" && m === "SOMETHING_NEW: newer edge")).toBe(true);
   });
 
   it("a register refused after an earlier success is fatal: state error with its code, the connection closed", async () => {
@@ -747,23 +763,15 @@ describe("createTunnel", () => {
     expect(history.map((s) => s.state)).toEqual(["off", "connecting", "off"]);
   });
 
-  it("a handle that already moved on when expose() resolves maps by its state", async () => {
+  it("an exposure that closes with no error, not by the tunnel, is error INTERNAL (T36)", async () => {
     const edge = await startEdge();
-    const cases: Array<[ExposeHandle["state"], string]> = [
-      ["closed", "error"],
-      ["closing", "error"],
-      ["conflict", "conflict"],
-      ["registering", "connecting"],
-    ];
-    for (const [handleState, tunnelState] of cases) {
-      const handle = fakeHandle(handleState);
-      exposeHook.fn = () => Promise.resolve(handle);
-      const { tunnel } = tunnelOn(edge);
-      await tunnel.configure(cfg(edge));
-      await waitFor(() => tunnel.status.state === tunnelState);
-      if (tunnelState !== "connecting") await waitFor(() => handle.close.mock.calls.length === 1);
-      await tunnel.dispose();
-    }
+    const pending = observedExpose();
+    const { tunnel, logs } = tunnelOn(edge);
+    await tunnel.configure(cfg(edge));
+    await waitFor(() => pending.wired());
+    pending.send({ event: "close" });
+    expect(tunnel.status).toEqual({ state: "error", code: TunnelStatusCode.INTERNAL, lastError: "Something went wrong; the log has the details." });
+    expect(logs).toContainEqual(["error", "INTERNAL: the connection closed"]);
   });
 
   it("a handle resolving after stop() is closed and never shown", async () => {
@@ -833,26 +841,17 @@ describe("createTunnel", () => {
     expect(tunnel.status).toEqual({ state: "off" });
   });
 
-  it("the deprecated close() is dispose(): same promise, final", async () => {
+  it("dispose() is memoized; a timeoutMs that is not a positive finite number is a TypeError that does not echo it", async () => {
     const edge = await startEdge();
     const { tunnel } = tunnelOn(edge);
-    await tunnel.configure(cfg(edge));
-    await waitFor(() => tunnel.status.state === "online");
-    const closed = tunnel.close({ timeoutMs: 1000 });
+    for (const bad of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, "100"]) {
+      expect(() => tunnel.dispose({ timeoutMs: bad as number })).toThrow(new TypeError("mcpwarp: dispose() `timeoutMs` must be a positive finite number"));
+    }
+    expect(tunnel.status).toEqual({ state: "off" });
+    const closed = tunnel.dispose({ timeoutMs: 1000 });
     expect(tunnel.dispose()).toBe(closed);
     await closed;
-    await tunnel.configure(cfg(edge, { name: "other" }));
-    expect(tunnel.status).toEqual({ state: "off" });
-    expect(edge.upgrades).toHaveLength(1);
-  });
-
-  it("the deprecated TunnelBase type still types createTunnel()'s options", async () => {
-    const edge = await startEdge();
-    const options: TunnelBase = { integration: INTEGRATION, webSocket: edge.webSocket, handler: () => new Response("ok") };
-    const tunnel = createTunnel(options);
-    cleanups.push(() => tunnel.dispose());
-    await tunnel.configure(cfg(edge));
-    await waitFor(() => tunnel.status.state === "online");
+    expect("close" in tunnel).toBe(false);
   });
 
   it("a throwing listener does not break later notifications or other listeners", async () => {

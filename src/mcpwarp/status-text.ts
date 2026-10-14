@@ -1,7 +1,9 @@
 /**
  * describeStatus(): a createTunnel() status as short localized UI text, so
  * hosts need not translate states and codes themselves. Plain string tables,
- * no Intl, so it runs in plugin sandboxes too.
+ * no Intl, so it runs in plugin sandboxes too. The strings are normative:
+ * they must equal ws-mixer-spec's spec/fixtures/mcpwarp/status-text/<locale>.json
+ * (test/spec-status-text-fixtures.test.ts), and change only with a spec release.
  */
 import type { TunnelState, TunnelStatus, TunnelStatusCode } from "./tunnel.js";
 
@@ -35,6 +37,7 @@ const en: StatusMessages = {
     RETRYING: "Connection failed, retrying",
     DISABLED: "Disabled in the mcpwarp dashboard",
     INVALID_CONFIG: "Invalid settings",
+    INVALID_NAME: "Invalid service name (lowercase letters, digits and inner dashes, at most 30 characters)",
     USERNAME_REQUIRED: "Set a username in your mcpwarp account",
     QUOTA_EXCEEDED: "Plan limit reached",
     CONFLICT: "Name already in use",
@@ -60,6 +63,7 @@ const de: StatusMessages = {
     RETRYING: "Verbindung fehlgeschlagen, neuer Versuch",
     DISABLED: "Im mcpwarp-Dashboard deaktiviert",
     INVALID_CONFIG: "Ungültige Einstellungen",
+    INVALID_NAME: "Ungültiger Dienstname (Kleinbuchstaben, Ziffern und innere Bindestriche, höchstens 30 Zeichen)",
     USERNAME_REQUIRED: "Legen Sie in Ihrem mcpwarp-Konto einen Benutzernamen fest",
     QUOTA_EXCEEDED: "Tariflimit erreicht",
     CONFLICT: "Name wird bereits verwendet",
@@ -85,6 +89,7 @@ const es: StatusMessages = {
     RETRYING: "Error de conexión, reintentando",
     DISABLED: "Desactivado en el panel de mcpwarp",
     INVALID_CONFIG: "Configuración no válida",
+    INVALID_NAME: "Nombre de servicio no válido (letras minúsculas, dígitos y guiones internos, 30 caracteres como máximo)",
     USERNAME_REQUIRED: "Define un nombre de usuario en tu cuenta de mcpwarp",
     QUOTA_EXCEEDED: "Límite del plan alcanzado",
     CONFLICT: "El nombre ya está en uso",
@@ -110,6 +115,7 @@ const fr: StatusMessages = {
     RETRYING: "Échec de la connexion, nouvel essai en cours",
     DISABLED: "Désactivé dans le tableau de bord mcpwarp",
     INVALID_CONFIG: "Paramètres non valides",
+    INVALID_NAME: "Nom de service non valide (lettres minuscules, chiffres et tirets internes, 30 caractères au maximum)",
     USERNAME_REQUIRED: "Définissez un nom d'utilisateur dans votre compte mcpwarp",
     QUOTA_EXCEEDED: "Limite de l'offre atteinte",
     CONFLICT: "Nom déjà utilisé",
@@ -135,6 +141,7 @@ const ja: StatusMessages = {
     RETRYING: "接続に失敗したため再試行しています",
     DISABLED: "mcpwarp ダッシュボードで無効化されています",
     INVALID_CONFIG: "設定が無効です",
+    INVALID_NAME: "サービス名が無効です（英小文字、数字、先頭と末尾以外のハイフン、30 文字以内）",
     USERNAME_REQUIRED: "mcpwarp アカウントでユーザー名を設定してください",
     QUOTA_EXCEEDED: "プランの上限に達しました",
     CONFLICT: "この名前は既に使用されています",
@@ -160,6 +167,7 @@ const zhCN: StatusMessages = {
     RETRYING: "连接失败，正在重试",
     DISABLED: "已在 mcpwarp 控制台中停用",
     INVALID_CONFIG: "设置无效",
+    INVALID_NAME: "服务名称无效（小写字母、数字和中间的连字符，最多 30 个字符）",
     USERNAME_REQUIRED: "请在 mcpwarp 账户中设置用户名",
     QUOTA_EXCEEDED: "已达到套餐限额",
     CONFLICT: "名称已被占用",

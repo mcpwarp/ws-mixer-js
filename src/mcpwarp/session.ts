@@ -20,11 +20,15 @@ import { McpwarpError } from "./errors.js";
 /** "conflict": another connection of the same account took the name over; sticky until close(). */
 export type ExposeState = "connecting" | "registering" | "registered" | "disabled" | "conflict" | "closing" | "closed";
 
-/** The `conflict` event: the tunnel gave the service to a newer connection that registered the same name. */
+/**
+ * The `conflict` event: the tunnel gave the service to a newer connection that registered the same name,
+ * or drained this connection with reason "replaced".
+ */
 export interface ExposeConflict {
-  readonly serverId: string;
+  /** Absent only for a "replaced" drain when no server id is known (the service was refused as disabled without one). */
+  readonly serverId?: string;
   readonly name: string;
-  /** "taken_over". */
+  /** "taken_over" (the `conflict` message's reason), or "replaced" (a ws-mixer drain). */
   readonly reason: string;
 }
 
@@ -42,14 +46,25 @@ export interface SessionDeps {
   sendApp(body: Record<string, unknown>): Promise<void>;
   setTimeout(fn: () => void, ms: number): unknown;
   clearTimeout(handle: unknown): void;
-  /** "retry": a transient register error, re-sent after `delayMs` ({ attempt, delayMs, reason }). */
-  emit(event: "registered" | "disabled" | "enabled" | "conflict" | "error" | "retry" | "state", payload: unknown): void;
+  /**
+   * "retry": a register re-sent after `delayMs` ({ attempt, delayMs, reason }), `detail` its RegisterRetryKind.
+   * "error": `detail` is its ErrorOrigin.
+   */
+  emit(event: "registered" | "disabled" | "enabled" | "conflict" | "error" | "retry" | "state", payload: unknown, detail?: string): void;
   /** expose.ts closes the client and ends the handle. */
   fatal(err: McpwarpError): void;
 }
 
-/** How the `retry` reason of a transient register error starts; tunnel.ts tells it from a redial by it. */
-export const REGISTER_RETRY_PREFIX = "register failed";
+/** @internal Why a register is re-sent: a transient register error, or `OVERLOADED`. */
+export type RegisterRetryKind = "register" | "overloaded";
+
+/**
+ * @internal Where a non-fatal `error` came from: an envelope that failed to decode, a transient register error (retried),
+ * a register refusal after an earlier registration (nothing retries it), or an `error` op.
+ */
+export type ErrorOrigin = "malformed" | "register_transient" | "register_refusal" | "app";
+
+const REGISTER_RETRY_PREFIX = "register failed";
 
 const RETRY_BASE_MS = 1000;
 const RETRY_CAP_MS = 30_000;
@@ -70,6 +85,8 @@ export class Session {
   private sentRegisterThisConn = false;
   private outstanding: "register" | "unregister" | undefined;
   private transientFailures = 0;
+  /** Consecutive `OVERLOADED` register re-sends since the last successful register. */
+  private overloadedResends = 0;
   private retryTimer: unknown;
   private overloadTimer: unknown;
   private unregisteredWaiter: (() => void) | null = null;
@@ -103,7 +120,7 @@ export class Session {
     try {
       env = decodeEnvelope(body);
     } catch (e) {
-      this.deps.emit("error", e);
+      this.deps.emit("error", e, "malformed");
       return;
     }
     if (!env) return;
@@ -139,13 +156,7 @@ export class Session {
         // onApp carries no connection: safe because the tunnel never sends `conflict` to a connection it is draining.
         if (this.isEnding() || this.takenOver) return;
         if (env.name !== this.deps.name && (this.serverId === undefined || env.id !== this.serverId)) return;
-        this.takenOver = true;
-        this.outstanding = undefined;
-        // The tunnel no longer holds the name for this connection: close() has nothing to unregister.
-        this.sentRegisterThisConn = false;
-        this.cancelTimers();
-        this.setState("conflict");
-        this.deps.emit("conflict", Object.freeze({ serverId: env.id, name: env.name, reason: env.reason }));
+        this.takeOver({ serverId: env.id, name: env.name, reason: env.reason });
         return;
       case "error":
         this.onAppError(env.code, env.message);
@@ -153,6 +164,16 @@ export class Session {
       case "unknown":
         return;
     }
+  }
+
+  /**
+   * @internal A ws-mixer drain with reason "replaced": the edge handed the name to another connection, like `conflict`.
+   * False when it changes nothing (closing, or already taken over).
+   */
+  onReplaced(): boolean {
+    if (this.isEnding() || this.takenOver) return false;
+    this.takeOver(this.serverId === undefined ? { name: this.deps.name, reason: "replaced" } : { serverId: this.serverId, name: this.deps.name, reason: "replaced" });
+    return true;
   }
 
   /** Sends unregister if a register went out on the live connection; resolves on `unregistered` for our name or after `budgetMs`. Never rejects. */
@@ -192,6 +213,7 @@ export class Session {
     if (svc) {
       this.outstanding = undefined;
       this.transientFailures = 0;
+      this.overloadedResends = 0;
       this.url = svc.url;
       this.serverId = svc.id;
       this.registration = Object.freeze({ url: svc.url, serverId: svc.id, created: svc.created });
@@ -210,10 +232,10 @@ export class Session {
       return;
     }
     if (TRANSIENT_REGISTER_ERRORS.has(err.code)) {
-      this.deps.emit("error", new McpwarpError(err.code, err.message, { serviceName: this.deps.name }));
+      this.deps.emit("error", new McpwarpError(err.code, err.message, { serviceName: this.deps.name }), "register_transient");
       const delay = Math.min(RETRY_BASE_MS * 2 ** this.transientFailures, RETRY_CAP_MS);
       this.transientFailures++;
-      this.deps.emit("retry", { attempt: this.transientFailures, delayMs: delay, reason: `${REGISTER_RETRY_PREFIX}: ${err.code}: ${err.message}` });
+      this.deps.emit("retry", { attempt: this.transientFailures, delayMs: delay, reason: `${REGISTER_RETRY_PREFIX}: ${err.code}: ${err.message}` }, "register");
       this.clearRetry();
       this.retryTimer = this.deps.setTimeout(() => {
         this.retryTimer = undefined;
@@ -225,8 +247,8 @@ export class Session {
       this.deps.fatal(new McpwarpError(err.code, err.message, { fatal: true, serviceName: this.deps.name }));
       return;
     }
-    // Registered before on an earlier connection: keep going, the next welcome retries.
-    this.deps.emit("error", new McpwarpError(err.code, err.message, { serviceName: this.deps.name }));
+    // Registered before: expose() keeps the handle; createTunnel() treats it as terminal.
+    this.deps.emit("error", new McpwarpError(err.code, err.message, { serviceName: this.deps.name }), "register_refusal");
   }
 
   private onAppError(code: string, message: string): void {
@@ -244,10 +266,24 @@ export class Session {
           if (op === "register" && !this.isEnding()) this.sendRegister();
           else if (op === "unregister" && this.state === "closing") void this.deps.sendApp(encodeUnregister(this.deps.name)).catch(() => {});
         }, OVERLOAD_PAUSE_MS);
+        if (op === "register" && !this.isEnding()) {
+          this.overloadedResends++;
+          this.deps.emit("retry", { attempt: this.overloadedResends, delayMs: OVERLOAD_PAUSE_MS, reason: `${REGISTER_RETRY_PREFIX}: ${code}: ${message}` }, "overloaded");
+        }
       }
       return;
     }
-    this.deps.emit("error", new McpwarpError(code, message, { serviceName: this.deps.name }));
+    this.deps.emit("error", new McpwarpError(code, message, { serviceName: this.deps.name }), "app");
+  }
+
+  private takeOver(conflict: ExposeConflict): void {
+    this.takenOver = true;
+    this.outstanding = undefined;
+    // The tunnel no longer holds the name for this connection: close() has nothing to unregister.
+    this.sentRegisterThisConn = false;
+    this.cancelTimers();
+    this.setState("conflict");
+    this.deps.emit("conflict", Object.freeze(conflict));
   }
 
   private sendRegister(): void {

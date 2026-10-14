@@ -19,10 +19,10 @@ const msg = (locale: string) => ({
 describe("describeStatus tables", () => {
   it("ships en, de, es, fr, ja, zh-CN", () => {
     expect([...statusLocales]).toEqual(["en", "de", "es", "fr", "ja", "zh-CN"]);
-    expect(CODES).toHaveLength(12);
+    expect(CODES).toHaveLength(13);
   });
 
-  it("every locale has a non-empty string for all 6 states and 12 codes", () => {
+  it("every locale has a non-empty string for all 6 states and 13 codes", () => {
     for (const locale of statusLocales) {
       const m = msg(locale);
       for (const s of STATES) expect(typeof m.states[s] === "string" && m.states[s]!.length > 0, `${locale} states.${s}`).toBe(true);
@@ -130,11 +130,15 @@ describe("describeStatus detail", () => {
     expect(describeStatus(invalid("The tunnel settings are invalid."), { locale: "ja" }).detail).toBe("設定が無効です");
     expect(describeStatus(invalid("Invalid settings"))).toEqual({ label: "Error", detail: "Invalid settings" });
     expect(describeStatus(invalid("Invalid settings: no token."))).toEqual({ label: "Error", detail: "Invalid settings: no token." });
-    const name = "The service name is invalid: use lowercase letters, digits and dashes (not at the start or end), at most 63 characters.";
+    const name = "The service name is invalid: use lowercase letters, digits and dashes (not at the start or end), at most 30 characters.";
     expect(describeStatus(invalid(name)).detail).toBe(
-      "Invalid settings: The service name is invalid; use lowercase letters, digits and dashes (not at the start or end), at most 63 characters.",
+      "Invalid settings: The service name is invalid; use lowercase letters, digits and dashes (not at the start or end), at most 30 characters.",
     );
     expect(describeStatus(invalid(name), { locale: "de" }).detail!.split(":")).toHaveLength(2);
+    expect(describeStatus({ state: "error", code: "INVALID_NAME", lastError: name })).toEqual({
+      label: "Error",
+      detail: "Invalid service name (lowercase letters, digits and inner dashes, at most 30 characters)",
+    });
     expect(describeStatus(invalid("Bad url https://x.example/mcp.")).detail).toBe("Invalid settings: Bad url https://x.example/mcp.");
   });
 

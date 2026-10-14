@@ -14,7 +14,26 @@ import type { WebSocketFactory } from "../socket.js";
 import { DEFAULT_URL, INTEGRATION_ID_RE, isValidServiceName, SERVICE_NAME_MAX, type ServiceKind } from "./envelope.js";
 import { McpwarpError } from "./errors.js";
 import { DEFAULT_TARGET_TIMEOUT_MS, MCP_PATH, serveWithHandler, serveWithTarget, type FetchHandler, type ServeContext, type StreamServer } from "./serve.js";
-import { Session, type ExposeConflict, type ExposeRegistration, type ExposeState } from "./session.js";
+import { Session, type ErrorOrigin, type ExposeConflict, type ExposeRegistration, type ExposeState, type RegisterRetryKind } from "./session.js";
+
+type RetryInfo = { attempt: number; delayMs: number; reason: string };
+
+/**
+ * @internal What createTunnel() observes of one exposure, from the start (before `expose()` settles):
+ * the handle's events, `onRetry` calls, and how each was classified.
+ */
+export type ExposeSignal =
+  | { event: "registered"; registration: ExposeRegistration }
+  | { event: "disabled"; reason: string }
+  | { event: "enabled" }
+  | { event: "conflict" }
+  /** `origin` absent: a handler, listener or `onRetry` failure. */
+  | { event: "error"; error: unknown; origin?: ErrorOrigin }
+  /** `superseded`: the report is about a drained connection whose replacement welcomed, or a replacement dial failing while the drained one serves. */
+  | { event: "disconnect"; reason: DisconnectPayload; superseded: boolean }
+  /** "reconnect": a redial after a failure; "drain": a drain's replacement dial. */
+  | { event: "retry"; info: RetryInfo; kind: RegisterRetryKind | "reconnect" | "drain" }
+  | { event: "close"; error?: Error };
 
 /** The part of an `AbortSignal` that `expose()` reads; any real `AbortSignal` fits. */
 export interface AbortSignalLike {
@@ -61,9 +80,13 @@ export interface ExposeBaseOptions {
   signal?: AbortSignalLike;
   /**
    * Called before every scheduled retry: a reconnect after a failed dial or
-   * a lost connection, or a re-sent register after a transient register
-   * error. `expose()` keeps retrying until it registers (or `signal`
-   * aborts, or `reconnect.maxAttempts` runs out), so this is where to log.
+   * a lost connection (zero delays included), a drain's replacement dial
+   * (`{ attempt: 0, delayMs: <0-2 s jitter>, reason: "drain" }`), the one-shot
+   * token-refresh redial (`{ attempt: 1, delayMs: 0, reason: "token-refresh" }`),
+   * or a re-sent register after a transient register error or `OVERLOADED`
+   * (reason "register failed: <CODE>: <message>"). `expose()` keeps retrying
+   * until it registers (or `signal` aborts, or `reconnect.maxAttempts` runs
+   * out), so this is where to log.
    */
   onRetry?(info: { attempt: number; delayMs: number; reason: string }): void;
 }
@@ -113,7 +136,9 @@ export interface ExposeHandle {
   /**
    * Another connection of the same account registered this name and the
    * tunnel moved the service there (it can arrive up to ~30 s later when the
-   * other connection is on another tunnel pod). State becomes "conflict" for
+   * other connection is on another tunnel pod), or the tunnel drained this
+   * connection with reason "replaced" (reason "replaced"; the client is then
+   * closed, no replacement is dialed). State becomes "conflict" for
    * good: the SDK stops serving (stray streams are RESET with CANCEL) and
    * never registers again, also across reconnects. Restarting the loser is
    * up to a human (or the app); `close()` still works.
@@ -217,9 +242,29 @@ function validate(opts: ExposeBaseOptions): void {
     throw new TypeError("mcpwarp: `token` is required");
   }
   validateAgent(opts.agent);
+  validateReconnect(opts.reconnect);
+}
+
+/** Checked here so a bad value is a validation TypeError, not the client's RangeError at construction. */
+function validateReconnect(reconnect: unknown): void {
+  if (reconnect === undefined) return;
+  if (typeof reconnect !== "object" || reconnect === null) throw new TypeError("mcpwarp: `reconnect` must be an object");
+  const r = reconnect as Record<string, unknown>;
+  const check = (key: string, ok: (n: number) => boolean, rule: string): void => {
+    const v = r[key];
+    if (v !== undefined && (typeof v !== "number" || !ok(v))) throw new TypeError(`mcpwarp: \`reconnect.${key}\` must be ${rule}`);
+  };
+  check("base", (n) => Number.isFinite(n) && n >= 0, "a finite number >= 0");
+  check("cap", (n) => Number.isFinite(n) && n >= 0, "a finite number >= 0");
+  check("connectTimeout", (n) => Number.isFinite(n) && n > 0, "a positive finite number");
+  check("maxAttempts", (n) => n >= 0, "a number >= 0 (Infinity for no limit)");
+  check("stableAfter", (n) => Number.isFinite(n) && n >= 0, "a finite number >= 0");
 }
 
 const MAX_TIMER_MS = 2_147_483_647;
+
+/** @internal The `/mcp` 503 reasons; also read by the bridging fixture runner. */
+export const UNAVAILABLE_REASONS = { disabled: "service disabled", closing: "service closing" } as const;
 
 function abortError(signal: AbortSignalLike): Error {
   const reason: unknown = signal.reason;
@@ -281,7 +326,7 @@ export function adapterServer(opts: { handler?: unknown; target?: unknown; targe
 export function exposeWithServer(
   opts: ExposeBaseOptions,
   makeServer: (ctx: ServeContext) => StreamServer,
-  hooks?: { onClose?: () => void; onClientClose?: (closed: Promise<void>) => void },
+  hooks?: { onClose?: () => void; onClientClose?: (closed: Promise<void>) => void; observe?: (signal: ExposeSignal) => void },
 ): Promise<ExposeHandle> {
   validate(opts);
   const signal = opts.signal;
@@ -292,6 +337,7 @@ export function exposeWithServer(
   let handle!: Handle;
   let settled = false;
   let finished = false;
+  let pendingDrainRetry: RetryInfo | undefined;
   let resolveStart!: (h: ExposeHandle) => void;
   let rejectStart!: (e: Error) => void;
   const started = new Promise<ExposeHandle>((resolve, reject) => {
@@ -299,15 +345,24 @@ export function exposeWithServer(
     rejectStart = reject;
   });
 
+  const observe = (s: ExposeSignal): void => {
+    try {
+      hooks?.observe?.(s);
+    } catch {
+      // createTunnel() guards its own listeners; nothing here may unwind into the transport
+    }
+  };
   // A throwing "error" listener has nowhere left to report to.
-  const reportError = (err: unknown): void => {
+  const reportError = (err: unknown, origin?: ErrorOrigin): void => {
+    observe({ event: "error", error: err, origin });
     handle.emitAll("error", err);
   };
   // Listener failures must never unwind into the transport (its delivery loop, timers, socket callbacks).
   const emitSafely = (event: string, payload: unknown): void => {
     for (const e of handle.emitAll(event, payload)) reportError(e);
   };
-  const onRetry = (info: { attempt: number; delayMs: number; reason: string }): void => {
+  const onRetry = (info: RetryInfo, kind: RegisterRetryKind | "reconnect" | "drain"): void => {
+    observe({ event: "retry", info, kind });
     try {
       opts.onRetry?.(info);
     } catch (e) {
@@ -337,6 +392,7 @@ export function exposeWithServer(
     signal?.removeEventListener("abort", onAbort);
     session.markClosed();
     hooks?.onClose?.();
+    observe({ event: "close", error });
     emitSafely("close", error ? { error } : {});
     if (!settled) {
       settled = true;
@@ -350,10 +406,10 @@ export function exposeWithServer(
     sendApp: (body) => client.sendApp(body),
     setTimeout: (fn, ms) => setTimeout(fn, ms),
     clearTimeout: (h) => clearTimeout(h as Parameters<typeof clearTimeout>[0]),
-    emit: (event, payload) => {
+    emit: (event, payload, detail) => {
       if (event === "state") return;
       if (event === "retry") {
-        onRetry(payload as { attempt: number; delayMs: number; reason: string });
+        onRetry(payload as RetryInfo, detail as RegisterRetryKind);
         return;
       }
       // Taken over before `registered` arrived: the handle could never serve, so fail like any other first-registration fatal.
@@ -362,7 +418,14 @@ export function exposeWithServer(
         finish(new McpwarpError("TAKEN_OVER", `mcpwarp: service ${JSON.stringify(opts.name)} was taken over by another connection before it registered`, { fatal: true, serviceName: opts.name }));
         return;
       }
-      emitSafely(event, payload);
+      if (event === "error") {
+        reportError(payload, detail as ErrorOrigin);
+      } else {
+        if (event === "registered") observe({ event, registration: payload as ExposeRegistration });
+        else if (event === "disabled") observe({ event, reason: (payload as { reason: string }).reason });
+        else if (event === "enabled" || event === "conflict") observe({ event });
+        emitSafely(event, payload);
+      }
       if (!settled && (event === "registered" || event === "disabled")) {
         settled = true;
         resolveStart(handle);
@@ -376,7 +439,7 @@ export function exposeWithServer(
 
   const ctx: ServeContext = {
     isAvailable: () => session.state !== "disabled" && session.state !== "closing" && session.state !== "closed",
-    unavailableReason: () => (session.state === "disabled" ? "service disabled" : "service closing"),
+    unavailableReason: () => (session.state === "disabled" ? UNAVAILABLE_REASONS.disabled : UNAVAILABLE_REASONS.closing),
     maxBodyBytes: opts.maxRequestBodyBytes ?? DEFAULT_MAX_BODY_BYTES,
     onError: reportError,
   };
@@ -388,9 +451,21 @@ export function exposeWithServer(
     agent: opts.agent && { runtime: opts.agent.runtime, os: opts.agent.os },
     headers: { "X-Mcpwarp-Integration": integration },
     webSocket: opts.webSocket,
-    reconnect: opts.reconnect,
+    // An own `undefined` key would override the client's default in its spread merge.
+    reconnect: opts.reconnect && (Object.fromEntries(Object.entries(opts.reconnect).filter(([, v]) => v !== undefined)) as ReconnectOptions),
+    // A drain's replacement dial is announced before the drain event itself, which may turn out a take-over.
+    // It does not consult the backoff counter (attempt 0); the token refresh is always attempt 1.
+    onReconnect: (info) => {
+      const attempt = info.cause === "drain" ? 0 : info.cause === "token-refresh" ? 1 : info.attempt;
+      const retry = { attempt, delayMs: info.delayMs, reason: info.cause };
+      if (info.cause === "drain") pendingDrainRetry = retry;
+      else onRetry(retry, "reconnect");
+    },
     onConnect: () => session.onWelcome(),
-    onApp: (body) => session.onApp(body),
+    // A drained connection's messages after its replacement's welcome belong to a superseded registration.
+    onAppFrom: (body, superseded) => {
+      if (!superseded) session.onApp(body);
+    },
     // Never awaited: the delivery loop must not wait for one request before the next.
     onStream: (stream) => {
       // The tunnel routes nothing here after a conflict; whatever still arrives is not ours to answer.
@@ -400,10 +475,12 @@ export function exposeWithServer(
       }
       void serve(stream);
     },
-    onDisconnect: (reason) => {
-      // A drain-superseded connection (or the drain's parallel dial) can end
-      // while the replacement is the active, registered connection.
-      if (!client.currentConn()) session.onDisconnect();
+    onDisconnectFrom: (reason, superseded) => {
+      // Decided by connection identity: a drained connection that ends once
+      // its replacement has welcomed (or that replacement's failing dial
+      // while the drained one still serves) leaves the session alone.
+      if (!superseded) session.onDisconnect();
+      observe({ event: "disconnect", reason, superseded });
       emitSafely("disconnect", reason);
       // Exhausted reconnects emit no client "fatal". Deferred so a fatal close
       // code's own "fatal" event (emitted right after this report) wins.
@@ -419,8 +496,21 @@ export function exposeWithServer(
     await client.close().catch(() => {});
     finish();
   };
-  client.on("reconnecting", (info: { attempt: number; delayMs: number; cause: string }) => {
-    if (info.cause !== "drain") onRetry({ attempt: info.attempt, delayMs: info.delayMs, reason: info.cause });
+  client.on("drain", (d: { reason: string }) => {
+    const retry = pendingDrainRetry;
+    pendingDrainRetry = undefined;
+    if (d.reason !== "replaced") {
+      if (retry) onRetry(retry, "drain");
+      return;
+    }
+    // A take-over, not a hand-over: closing the client cancels the replacement dial before it starts.
+    // Before settling, the TAKEN_OVER path closes it; a close() started by a conflict listener closes it
+    // too. One already running is still in its unregister wait, so the client is closed here.
+    const closingAlready = handle.closePromise !== null;
+    const wasSettled = settled;
+    const tookOver = session.onReplaced();
+    if (finished) return;
+    if (closingAlready || (tookOver && wasSettled && !handle.closePromise)) closeClient();
   });
   client.on("fatal", (err: Error) => finish(fatalMcpwarpError(err, opts.name)));
   signal?.addEventListener("abort", onAbort, { once: true });

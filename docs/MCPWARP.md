@@ -1,9 +1,15 @@
 # The mcpwarp control plane, as this SDK implements it
 
-Status: descriptive of `src/mcpwarp/*` and `src/http1/*` (0.10.1). The tunnel's source of truth is
-`mcpwarp-saas/apps/tunnel` (`internal/agentconn`, `internal/reqpath`); the Go CLI
-(`mcpwarp-tui-cli`, `internal/appproto`, `internal/relay`) is the reference agent. This SDK speaks
-ws-mixer.v1 underneath ([WIRE.md](https://github.com/mcpwarp/ws-mixer-spec/blob/main/docs/WIRE.md)).
+Status: descriptive of `src/mcpwarp/*` and `src/http1/*` (0.11.0). The **normative** specification
+of this layer is ws-mixer-spec's
+[`docs/MCPWARP.md`](https://github.com/mcpwarp/ws-mixer-spec/blob/v0.6.1/docs/MCPWARP.md) at the tag in
+`spec.pin` (v0.6.1); where the two disagree, the spec wins. Its envelope, bridging, tunnel and
+status-text fixtures run in this repo's CI (`test/spec-envelope-fixtures.test.ts`,
+`test/spec-bridging-fixtures.test.ts`, `test/spec-tunnel-fixtures.test.ts`,
+`test/spec-status-text-fixtures.test.ts`). The
+tunnel's source of truth is `mcpwarp-saas/apps/tunnel` (`internal/agentconn`, `internal/reqpath`);
+the Go CLI (`mcpwarp-tui-cli`, `internal/appproto`, `internal/relay`) is the reference agent. This
+SDK speaks ws-mixer.v1 underneath ([WIRE.md](https://github.com/mcpwarp/ws-mixer-spec/blob/main/docs/WIRE.md)).
 
 ## 1. Endpoint and routing
 
@@ -19,7 +25,8 @@ header when the runtime can set one:
 - a JWT whose audience is `https://connect.<domain>`.
 
 A bad token: `error{code: 11 UNAUTHORIZED}` + close `4011` (fatal; with a token provider the SDK
-retries once with a fresh token first; `expose()` rejects, or the handle closes, with
+retries once with a fresh token first, reported through `onRetry` as `{attempt: 1, delayMs: 0, reason:
+"token-refresh"}`; `expose()` rejects, or the handle closes, with
 `McpwarpError` code `UNAUTHORIZED`, the transport's `WsMixerError` as `cause`). Backend unavailable: close `4002` (retryable). The SDK never
 refreshes tokens and never reads the environment; pass a provider function if the token rotates.
 
@@ -93,12 +100,15 @@ Tunnel -> agent:
 
 Decoding (`decodeEnvelope`): a body without an object `mcpwarp` key is not ours (ignored); `v != 1`
 or an unknown op decode as `unknown` (ignored); a known op with wrong field types is
-`MALFORMED_ENVELOPE` (a non-fatal `error` event). Defaults: `services`/`errors` `[]`, `url` `""`,
-`created` `false`, error `message` `""`, `disable.reason` `"disabled"`, `conflict.reason`
-`"taken_over"` (`conflict.id` and `conflict.name` are required strings).
+`MALFORMED_ENVELOPE` (a non-fatal `error` event), and so is a `registered` service whose `url` is
+missing or `""`. Defaults: `services`/`errors` `[]`, `created` `false`, error `message` `""`,
+`disable.reason` `"disabled"`, `conflict.reason` `"taken_over"` (`conflict.id` and `conflict.name`
+are required strings).
 
-Service names: `^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`, at most 30 characters (checked synchronously by
-`expose()`). Public URL: `https://<name>-<username>.<domain>/mcp`, taken from `registered.services[].url`.
+Service names: `SERVICE_NAME_RE` `^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`, at most `SERVICE_NAME_MAX` (30)
+characters; `isValidServiceName(name)` checks both (all three exported from `./mcpwarp`; checked
+synchronously by `expose()`). Public URL: `https://<name>-<username>.<domain>/mcp`, taken from
+`registered.services[].url`.
 
 `registered.errors[].code`:
 
@@ -106,14 +116,14 @@ Service names: `^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`, at most 30 characters (checked
 |---|---|
 | `SERVER_DISABLED` (carries `id`) | state `disabled`, `disabled` event; requests get 503 |
 | `INTERNAL`, `NO_RESPONDERS`, `TIMEOUT`, `ABORTED`, `CONNECTION_LOST`, `MALFORMED_REPLY`, `UNAVAILABLE`, `SERVICE_ERROR` | transient: non-fatal `error`, re-register on the same connection after 1 s, 2 s, 4 s, ... capped at 30 s |
-| `INVALID_NAME`, `USERNAME_REQUIRED`, `QUOTA_EXCEEDED`, `CONFLICT`, `BAD_REQUEST`, `UNAUTHENTICATED`, `FORBIDDEN`, `NOT_IMPLEMENTED`, others | before the first successful registration: **fatal** (`expose()` rejects, the handle closes). After it: non-fatal `error`, retried at the next welcome (`createTunnel()` treats the refusals among them, all but `BAD_REQUEST`/`NOT_IMPLEMENTED`/others, as fatal) |
+| `INVALID_NAME`, `USERNAME_REQUIRED`, `QUOTA_EXCEEDED`, `CONFLICT`, `BAD_REQUEST`, `UNAUTHENTICATED`, `FORBIDDEN`, `NOT_IMPLEMENTED`, others | before the first successful registration: **fatal** (`expose()` rejects, the handle closes). After it: non-fatal `error` from `expose()`, retried at the next welcome; `createTunnel()` treats every one of them as fatal (state `error` with its code, the connection closed) |
 
 `op: "error"` codes:
 
 | Code | SDK reaction |
 |---|---|
 | `UNSUPPORTED_VERSION` | fatal |
-| `OVERLOADED` (more than 256 app messages in flight) | re-send the outstanding register/unregister once after 1 s (the CLI's overload pause) |
+| `OVERLOADED` (more than 256 app messages in flight) | re-send the outstanding register/unregister once after 1 s (the CLI's overload pause); a register re-send is reported through `onRetry` with `attempt` counting consecutive re-sends (1, 2, ...; reset by a successful register) |
 | `CONNECTION_LIMIT` (more than 10 connections per owner and pod) | non-fatal `error`; the tunnel follows with close `4014`, which backs off from the cap |
 | `TOO_MANY_SERVICES` (more than 100), `UNKNOWN_OP`, `BAD_REQUEST` | non-fatal `error` |
 
@@ -127,6 +137,7 @@ the loser is told with `conflict` (section 9).
 |---|---|---|
 | any but closing/closed/conflict | `welcome` (first connect, reconnect, drain replacement) | send `register` -> `registering` |
 | any but closing/closed/conflict | `conflict` with our name or our id | `conflict` (sticky), `conflict` event `{serverId, name, reason}`, timers and the outstanding op dropped; before `expose()` has settled (the `conflict` overtook the first `registered`): **fatal** instead, `expose()` rejects with `McpwarpError` `TAKEN_OVER` and the client closes |
+| any but closing/closed/conflict | ws-mixer `drain` with reason `replaced` | a take-over, not a hand-over: as `conflict` above (`conflict` event `{serverId, name, reason: "replaced"}`, `serverId` absent when none is known), and the client is closed, so no replacement is dialed; before `expose()` has settled: `TAKEN_OVER` rejection. During `close()` the client is closed at once as well |
 | `conflict` | `welcome`, disconnect, `enable`, `disable`, `registered` | ignored: no register, state stays `conflict`; inbound streams are RESET `CANCEL` |
 | `registering` | `registered` with our name | `registered`, `registered` event `{url, serverId, created}`, also kept as `handle.registration` |
 | `registering` | error `SERVER_DISABLED` | `disabled` |
@@ -134,12 +145,18 @@ the loser is told with `conflict` (section 9).
 | `registering` | other error | fatal before the first registration, else non-fatal |
 | `registered`, `registering` | `disable` (our id, or no id yet) | `disabled`, `disabled` event |
 | any but conflict | `enable` with our name | `enabled` event, send `register` -> `registering` |
-| any but closing/closed/conflict | disconnect leaving no active connection | `connecting`, retry timers cancelled (the end of a drain-superseded connection, or of the drain's parallel dial, does not count: the registration lives on the active connection) |
+| any but closing/closed/conflict | disconnect leaving no active connection | `connecting`, retry timers cancelled (the end of a drain-superseded connection, or of the drain's parallel dial, does not count: the registration lives on the active connection; decided by connection identity, so a drained connection ending after its replacement already died still does not count) |
+| any | app message from a drained connection after its replacement's `welcome` | ignored |
 | any | `close()` | `closing`: if a register went out on the live connection (never after `conflict`), send `unregister` and wait for `unregistered` (2 s budget; any `unregistered` ends the wait, since the tunnel answers `services: []` for a name this connection does not hold); then the transport closes (`drain{client_requested}`, up to 5 s grace, close 1000) -> `closed` |
 
 Before the first registration, `expose()` retries non-fatal failures (dial errors, refused upgrades,
 transient register errors) without limit unless `reconnect.maxAttempts` is set. `onRetry({attempt,
-delayMs, reason})` is called before each scheduled retry, and aborting `signal` rejects `expose()`
+delayMs, reason})` is called before every scheduled retry: a reconnect after a failed dial or a lost
+connection (zero-delay redials included, e.g. close `4013`'s immediate retry), the one-shot
+token-refresh redial (`{attempt: 1, delayMs: 0, reason: "token-refresh"}`), a drain's replacement
+dial (`{attempt: 0, delayMs: <0-2 s jitter>, reason: "drain"}`, the backoff counter not consulted; not
+for a `replaced` drain), and a register re-sent after a transient register error or `OVERLOADED` (reason
+`register failed: <CODE>: <message>`). Aborting `signal` rejects `expose()`
 with an `AbortError` and closes the client (after the first registration it closes the handle).
 
 For long-lived host integrations whose settings change at runtime (a plugin toggling the tunnel on
@@ -159,21 +176,26 @@ reports one `status` (`off`/`connecting`/`online`/`disabled`/`conflict`/`error`)
   behind the tunnel: a check that requires the header rejects every request, and one that treats a
   missing header as anonymous lets everything through. The SDK adds
   `x-forwarded-host` (the public host) and `x-forwarded-proto: https` for `target` and `server`.
-- The agent reads the head (64 KiB cap, 10 s deadline, else RESET CANCEL), then the body. It strips
+- The agent reads the head (64 KiB cap, 10 s deadline, else RESET CANCEL), then, for `/mcp` on an
+  available service, the body. It strips
   `Expect` and never sends a 1xx (the edge treats any response head as final).
 - Request body cap: `maxRequestBodyBytes` on `expose()`, default 4 MiB, applied by every adapter
   (`handler`, `target`, `server`) before the app sees the request; above it the SDK answers `413`
   itself. The app's own limits only matter below the SDK's: with the default, an
   `express.json({ limit: "8mb" })` never sees a body over 4 MiB, so raise `maxRequestBodyBytes` to
   match when the app accepts more. `handler` and `target` read the whole body into memory before
-  calling the app, so the cap also bounds per-request memory.
+  calling the app, so the cap also bounds per-request memory, and an over-cap body is always `413`.
+  `server` streams the body to the app as it arrives (spec v0.6.1 allows it): the cap still applies,
+  counted on the decoded body, and the chunk that crosses it is withheld, so the app never reads a
+  byte past the cap. When it trips, the reply is `413` if no response byte was written yet, else
+  RESET `CANCEL` (a response the app already finished ends with CLOSE instead).
 - The response is written raw HTTP/1.1: Content-Length when the local response declares one, else
   chunked, one chunk per body read (SSE flushes event by event), then CLOSE. A body shorter than its
   Content-Length, or one that errors mid-stream, is RESET (`INTERNAL_ERROR`; the error goes to the
   handle's `error` event). The `./node` adapter removes Node's own `Connection`/`Keep-Alive`
   response headers, answers a head over 64 KiB with `431` and a body over the cap with `413`
-  (`Content-Length` is checked up front; a chunked body is cut off once the raw request passes the
-  cap plus 64 KiB: `413` if the app has not started its response, else RESET `CANCEL`).
+  (`Content-Length` is checked up front; a chunked body is cut off at the cap, as above). A malformed body after a complete response (an SDK refusal or the
+  app's finished one) ends the stream with CLOSE; during an unfinished response, with RESET.
 - Error replies (JSON `{"error": "..."}`): `400` malformed request, `413` body too large, `431` head
   too large, `500` the integration's handler failed, `502` local target unreachable / no request
   handler, `503` disabled or closing, `504` local target sent no headers within `targetTimeoutMs`
@@ -187,9 +209,13 @@ reports one `status` (`off`/`connecting`/`online`/`disabled`/`conflict`/`error`)
   `/mcp` (`/mcp?x=1` matches, `/mcp/` and `/MCP` do not). `OPTIONS *` and authority-form targets
   are `400`. Any other request is answered `404` with only `Content-Type: application/json` and
   `Content-Length` (to `HEAD`: the same length, no body), right after the head is read: the handler, target or
-  `http.Server` never sees it, and the rest of the body is read and dropped. The `404` takes
-  precedence over the `503` (an unknown path is never served, whatever the state); `/mcp` while
-  disabled or closing still gets `503`. Not configurable.
+  `http.Server` never sees it, and the rest of the body is read and dropped. Not configurable.
+- Precedence, in every adapter: `404` (path) > `503` (disabled/closing) > `413` (body cap) > the
+  app. `404` and `503` are answered right after the head, before any body byte is read, so a
+  disabled or closing service answers an oversized `/mcp` request `503`, not `413`; the rest of the
+  body is then read and dropped. Error replies
+  are byte-exact per the spec (`Content-Type: application/json`, `Content-Length`, RFC 9110 reason
+  phrases: `413 Content Too Large`, `431 Request Header Fields Too Large`).
 - The edge waits for the response head for its request timeout; the body streams until EOF. When
   the public client disconnects the edge RESETs the stream with CANCEL; the SDK then aborts the
   handler's `Request.signal` / the target `fetch`. On `disable` the tunnel RESETs open streams with
@@ -203,10 +229,18 @@ reports one `status` (`off`/`connecting`/`online`/`disabled`/`conflict`/`error`)
 On `drain` the SDK dials a replacement in parallel. When the replacement welcomes, it re-registers
 there (new requests are routed to it), while in-flight requests finish on the old connection, which
 then closes itself (empty) or is cut at `deadline_ms` + 1 s; the tunnel's own deadline sweep RESETs
-survivors and closes `4012`. Either end is reported once as a non-fatal disconnect.
+survivors and closes `4012`. Either end is reported once as a non-fatal disconnect. App messages
+that still arrive on the old connection after the replacement's `welcome` are ignored. Every
+replacement dial is reported through `onRetry` with reason `drain`.
 
 A connection the tunnel is draining hands its services over silently: it never gets `conflict` for
 the replacement's re-register.
+
+A `drain` with reason `replaced` is different: the tunnel gave the name to another connection, so
+it is a take-over, not a hand-over. Before `expose()` settles it rejects `TAKEN_OVER`; after, the
+handle goes to `conflict` and emits `conflict` with `reason: "replaced"`. Either way the client is
+closed and no replacement is dialed (also during `close()`), and no `onRetry` fires for it.
+`createTunnel()` shows `conflict`/`TAKEN_OVER` until the next `configure()`.
 
 ## 8. Known limitations
 

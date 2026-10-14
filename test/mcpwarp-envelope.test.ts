@@ -3,6 +3,8 @@ import { z } from "zod";
 import { decodeEnvelope, encodeRegister, encodeUnregister, INTEGRATION_ID_RE, SERVICE_NAME_RE, TRANSIENT_REGISTER_ERRORS } from "../src/mcpwarp/envelope.js";
 import { McpwarpError } from "../src/mcpwarp/errors.js";
 import { AppErrorCode, RegisterErrorCode } from "../src/mcpwarp/index.js";
+import * as mcpwarp from "../src/mcpwarp/index.js";
+import * as root from "../src/index.js";
 
 describe("mcpwarp envelope encoding", () => {
   it("register and unregister are byte-exact with the tunnel's shapes", () => {
@@ -40,6 +42,15 @@ describe("mcpwarp envelope encoding", () => {
     for (const bad of ["", "-a", "a-", "A", "a_b", "a.b"]) expect(SERVICE_NAME_RE.test(bad)).toBe(false);
   });
 
+  it("SERVICE_NAME_MAX, isValidServiceName and webSocketFactory are public from ./mcpwarp (MCPWARP.md sections 2.4, 9)", () => {
+    expect(mcpwarp.SERVICE_NAME_MAX).toBe(30);
+    expect(mcpwarp.isValidServiceName("a".repeat(30))).toBe(true);
+    expect(mcpwarp.isValidServiceName("a".repeat(31))).toBe(false);
+    expect(mcpwarp.isValidServiceName("zotero-library-notes-search-01")).toBe(true);
+    for (const bad of ["", "a-", "-a", "Anki", "a b", 7, null, undefined]) expect(mcpwarp.isValidServiceName(bad)).toBe(false);
+    expect(mcpwarp.webSocketFactory).toBe(root.webSocketFactory);
+  });
+
   it("error-code constants: exported from ./mcpwarp, each value equals its key, lists match the tunnel's (DECISIONS.md)", () => {
     // registered.errors[].code: the tunnel's own codes, then the pass-through RPC codes.
     const register = [
@@ -69,7 +80,7 @@ describe("decodeEnvelope", () => {
       mcpwarp: {
         v: 1,
         op: "registered",
-        services: [{ name: "anki", id: "srv_1", url: "https://anki-u.mcpwarp.io/mcp", created: true }, { name: "b", id: "srv_2" }],
+        services: [{ name: "anki", id: "srv_1", url: "https://anki-u.mcpwarp.io/mcp", created: true }, { name: "b", id: "srv_2", url: "https://b-u.mcpwarp.io/mcp", created: null }],
         errors: [{ name: "c", code: "CONFLICT" }, { name: "d", code: "SERVER_DISABLED", message: "off", id: "srv_4" }],
       },
     });
@@ -77,13 +88,28 @@ describe("decodeEnvelope", () => {
       op: "registered",
       services: [
         { name: "anki", id: "srv_1", url: "https://anki-u.mcpwarp.io/mcp", created: true },
-        { name: "b", id: "srv_2", url: "", created: false },
+        { name: "b", id: "srv_2", url: "https://b-u.mcpwarp.io/mcp", created: false },
       ],
       errors: [
         { name: "c", code: "CONFLICT", message: "" },
         { name: "d", code: "SERVER_DISABLED", message: "off", id: "srv_4" },
       ],
     });
+  });
+
+  it("registered.services[].url missing or empty -> MALFORMED_ENVELOPE (MCPWARP.md section 2.8 rule 8)", () => {
+    for (const url of [undefined, "", null, 7]) {
+      const svc: Record<string, unknown> = { name: "anki", id: "srv_1", created: true };
+      if (url !== undefined) svc.url = url;
+      try {
+        decodeEnvelope({ mcpwarp: { v: 1, op: "registered", services: [svc] } });
+        expect.unreachable(JSON.stringify(svc));
+      } catch (e) {
+        expect(e).toBeInstanceOf(McpwarpError);
+        expect((e as McpwarpError).code).toBe("MALFORMED_ENVELOPE");
+        expect((e as McpwarpError).message).toBe("registered.services[].url must be a non-empty string");
+      }
+    }
   });
 
   it("registered with no services/errors arrays defaults both to []", () => {

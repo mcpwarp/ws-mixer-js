@@ -2,7 +2,7 @@
 export { expose } from "./expose.js";
 export type { ExposeOptions, ExposeBaseOptions, ExposeHandle, AbortSignalLike } from "./expose.js";
 export { createTunnel, TunnelStatusCode } from "./tunnel.js";
-export type { Tunnel, TunnelOptions, TunnelBase, TunnelConfig, TunnelState, TunnelStatus } from "./tunnel.js";
+export type { Tunnel, TunnelOptions, TunnelConfig, TunnelState, TunnelStatus } from "./tunnel.js";
 export { describeStatus, statusLocales } from "./status-text.js";
 export type { StatusText, StatusMessages, StatusLocale } from "./status-text.js";
 export type { ExposeState, ExposeRegistration, ExposeConflict } from "./session.js";
@@ -14,8 +14,11 @@ export {
   TRANSIENT_REGISTER_ERRORS,
   DEFAULT_URL,
   SERVICE_NAME_RE,
+  SERVICE_NAME_MAX,
+  isValidServiceName,
   encodeRegister,
   encodeUnregister,
   decodeEnvelope,
 } from "./envelope.js";
 export type { ServiceKind, RegisteredService, ServiceError, InboundEnvelope } from "./envelope.js";
+export { webSocketFactory } from "../socket.js";

@@ -74,7 +74,9 @@ const handle = await expose({
 
 Aborting `signal` before the first registration rejects `expose()` with an `AbortError` and stops
 the client; aborting it later closes the handle like `handle.close()`. `onRetry` is called before
-every scheduled reconnect and every re-sent register.
+every scheduled reconnect (zero-delay redials included; a drain's replacement dial as `{ attempt: 0,
+delayMs: <0-2 s jitter>, reason: "drain" }`; the one-shot token-refresh redial as `{ attempt: 1,
+delayMs: 0, reason: "token-refresh" }`) and every re-sent register.
 
 ## Long-lived integrations
 
@@ -120,15 +122,16 @@ drain, which takes up to ~7 s while requests or SSE streams are open (MCP client
 one); the status is `connecting` meanwhile. Disabled or an empty token is `off` without dialing,
 whatever the other fields hold. `configure()` never throws: a non-boolean `enabled`, or (while
 enabled with a token) a field of the wrong type (an unset pref read as `undefined`, say), is
-`error` with `INVALID_CONFIG`. States: `off`, `connecting` (dialing, retrying, after a
+`error` with `INVALID_CONFIG`; an invalid name is `error` with `INVALID_NAME`. States: `off`, `connecting` (dialing, retrying, after a
 disconnect), `online` (`url` set), `disabled` (from the dashboard), `conflict` (another instance
 took the name over) and `error` (a fatal failure such as a rejected token). After `conflict` or
 `error` the tunnel stays down until the next `configure()`, even with the same settings; `stop()`
 does the same on demand. Call `configure()` on settings changes, not from a status listener:
 re-applying the same settings after every `conflict` makes two instances take the name from each
-other in turn. `dispose()` is final; its `timeoutMs` can cut the drain short, leaving the old
-connection to close in the background. `close()` and the `TunnelBase` type are deprecated aliases of
-`dispose()` and `TunnelOptions`, removed in 0.11.0.
+other in turn. A ws-mixer `drain` with reason `replaced` is a take-over too (`conflict`, no
+replacement dial); any other drain is a hand-over that keeps the status. `dispose()` is final; its
+`timeoutMs` (a positive finite number, else a `TypeError`) can cut the drain short, leaving the old
+connection to close in the background.
 
 When something is wrong the status says why in two forms: `code`, one of `TunnelStatusCode` for
 your logic, and `lastError`, the same in plain language to show users as is (`off` and a plain
@@ -137,21 +140,22 @@ append it to your own text:
 
 | `code` | state | `lastError` |
 |---|---|---|
-| `RETRYING` | `connecting` (a failed dial or register being retried, the very first one included) | "Can't reach mcpwarp; retrying." / "mcpwarp couldn't register the service; retrying." |
-| `DISCONNECTED` | `connecting` (redialing after a lost connection) | "Connection lost; retrying." |
+| `RETRYING` | `connecting` (a failed dial, or a register re-sent after a transient error or `OVERLOADED`, the very first one included) | "Can't reach mcpwarp; retrying." / "mcpwarp couldn't register the service; retrying." |
+| `DISCONNECTED` | `connecting` (redialing after a lost connection, including a drained one that ended before its replacement got `welcome`) | "Connection lost; retrying." |
 | `DISABLED` | `disabled` | "This service is disabled in the mcpwarp dashboard." |
 | `TAKEN_OVER` | `conflict` | "Another connection took over this name." |
 | `UNAUTHORIZED` | `error` (token rejected, or register refused as `FORBIDDEN`: the token may not publish this service) | "The token was rejected." / "The token is not allowed to publish this service." |
-| `INVALID_CONFIG` | `error` | "The service name is invalid: ..." / "The service name is not set." / "The token is not set." / "The tunnel settings are invalid." |
+| `INVALID_CONFIG` | `error` (a field of the wrong type, an invalid `kind` or `reconnect` option) | "The service name is not set." / "The token is not set." / "The tunnel settings are invalid." |
+| `INVALID_NAME` | `error` (the name fails the syntax or the 30-character limit, or the server refused it) | "The service name is invalid: use lowercase letters, digits and dashes (not at the start or end), at most 30 characters." |
 | `USERNAME_REQUIRED` | `error` | "Choose a username in your mcpwarp account first." |
 | `QUOTA_EXCEEDED` | `error` | "Your mcpwarp account has no services left in its quota." |
 | `CONFLICT` | `error` | "The name is in use by another server." |
 | `UNSUPPORTED_VERSION` | `error` | "This SDK version is no longer supported; please update." |
 | `DISCONNECTED_FATAL` | `error` (a fatal close or transport failure, or `reconnect.maxAttempts` ran out) | "The connection to mcpwarp failed." |
-| `INTERNAL` | `error`, or `connecting` for a non-fatal server error (a register refused after an earlier success with a code not listed above can stay `connecting` until the next `configure()`) | "Something went wrong; the log has the details." |
+| `INTERNAL` | `error` (incl. a register refused as `BAD_REQUEST`, `NOT_IMPLEMENTED` or a code this SDK does not know), or `connecting` for a non-fatal server error | "Something went wrong; the log has the details." |
 
-A register the server refuses (`UNAUTHORIZED`, `INVALID_CONFIG`, `USERNAME_REQUIRED`,
-`QUOTA_EXCEEDED`, `CONFLICT`) is fatal even on a reconnect after an earlier success. An HTTP 401
+A register the server refuses, with a listed code or one this SDK does not know, is fatal even on
+a reconnect after an earlier success: nothing would retry it. An HTTP 401
 at the upgrade is `UNAUTHORIZED` (a 403 or 404 `DISCONNECTED_FATAL`) only when the WebSocket
 factory reports the status (`upgradeFailure`); a standard WebSocket hides it and the tunnel keeps
 retrying. `RETRYING` already shows on the very first failed dial or register, before the tunnel
@@ -160,8 +164,8 @@ was ever online; after a lost connection the redials say `DISCONNECTED` instead.
 too) ends in `DISCONNECTED_FATAL`.
 
 The technical message behind each goes to `logger`. At `error`: fatal failures as
-`CODE: message` with the McpwarpError code (a failure without one, such as an invalid `name`
-caught before dialing, has the message only), and a refused config as
+`CODE: message` with the McpwarpError code (a failure without one has the status code, such as
+`INVALID_NAME: <the rule>` for a name caught before dialing), and a refused config as
 `INVALID_CONFIG: <which field is wrong>`, never echoing its value. At `warn`: retries as
 `retry #N in MS ms: reason`, disconnects as `disconnected: reason`, and non-fatal errors as
 `CODE: message` (a request handler's error has no code). Progress goes to `info`. Logger messages
@@ -203,7 +207,9 @@ before the colon and a space after it, `"："` in Japanese and Chinese, `": "` o
 Einstellungen: The service name is not set."); the generic "The tunnel settings are invalid." is
 left out. A `lastError` equal to or starting with the localized sentence is shown alone. When the
 two are joined, a `": "` inside `lastError` is rendered as `"; "`, so the detail has a single
-colon; this applies only to `INVALID_CONFIG`, and a code-less `lastError` is returned unchanged. A
+colon; this applies only to `INVALID_CONFIG`, and a code-less `lastError` is returned unchanged.
+`INVALID_NAME` shows its sentence alone, which states the name rule. The tables are ws-mixer-spec's
+normative status-text data, string for string; the SDK's tests check them against it. A
 locale resolves by exact tag (case-insensitive, `_` read as `-`), then by language (`de-AT` is
 `de`), then to English; it never throws. Any `zh-*` (`zh-TW`, `zh-HK` and `zh-Hant` included) gets
 the Simplified Chinese `zh-CN` table.
@@ -278,10 +284,12 @@ The server is never `listen()`ed and never modified: each stream is handed as a 
 private `http.Server`, which passes real `IncomingMessage`/`ServerResponse` objects to yours via
 its `request` event. `req.headers.host` is `localhost`, with the public host in `x-forwarded-host`.
 Node's own `Connection`/`Keep-Alive` response headers are removed before the response reaches the
-edge. The body cap below is checked against `Content-Length` up front; a chunked request body is
-cut off once the raw request (chunk framing included) passes the cap plus 64 KiB: `413` if your
-server has not started its response, else the stream is reset. Either way your `req` is aborted
-(`'aborted'`, plus `'error'` if you listen for it) and later `res` writes are dropped.
+edge. Unlike `handler`/`target`, `server` streams the request body to your server as it arrives.
+The body cap below is checked against `Content-Length` up front; a chunked request body is counted
+as it is decoded, and the chunk that would take it past the cap never reaches your server: `413` if
+your server has not written any response byte yet, else the stream is reset with `CANCEL` (or, if your response
+was already complete, it simply ends). Either way, unless your response was already complete, your `req` is aborted (`'aborted'`, plus
+`'error'` if you listen for it) and later `res` writes are dropped.
 
 `server` needs Node's own `http` internals: the private server is fed each stream through
 `emit("connection", socket)`. **It does not work on Bun**, whose `node:http` ignores sockets passed
@@ -294,17 +302,20 @@ The public URL is `handle.url` and nothing else is reachable. Only requests whos
 `/mcp` reach your app (`handle.path`, for logging). The match is exact and case-sensitive on the
 path alone: `/mcp?x=1` passes, `/mcp/`, `/MCP` and `/healthz` do not. Every other request is
 answered `404 {"error":"not_found"}` by the SDK in all three adapters, before your handler, target
-or server sees it. The `404` comes before the disabled/closing `503`: an unknown path is never
-served, whatever the state. This is not configurable.
+or server sees it. This is not configurable. The order is `404` (path) > `503` (disabled or
+closing) > `413` (body over `maxRequestBodyBytes`) > your app: an unknown path is never served,
+whatever the state, and the `404`/`503` go out right after the head without reading the body, so
+an oversized `/mcp` request to a disabled service gets `503`, not `413`.
 
 ### What your server sees
 
 - One HTTP/1.1 request per stream, only for `/mcp` (above): method, path + query, headers, body
   (Content-Length or chunked, up to `maxRequestBodyBytes`, default 4 MiB; `413` above it).
-- The body cap is the SDK's, applies to all three adapters, and is enforced before your server
-  sees the request, so your own limit only matters below it: `express.json({ limit: "8mb" })`
-  behind the default cap still rejects anything over 4 MiB with the SDK's `413`. Raise
-  `maxRequestBodyBytes` on `expose()` to match.
+- The body cap is the SDK's and applies to all three adapters, so your own limit only matters below
+  it: `express.json({ limit: "8mb" })` behind the default cap never sees more than 4 MiB of body.
+  `handler`/`target` enforce it before your app is called (`413`). `server` streams: a chunked body
+  reaches your server up to the cap and is then cut off (`413` if you have not answered yet, else
+  RESET, see above). Raise `maxRequestBodyBytes` on `expose()` to match.
 - No `Authorization` header: the edge verifies the caller's token and strips the header before
   forwarding, so **your app's own bearer-token auth cannot be enforced behind the tunnel**. The SDK
   adds `x-forwarded-host`/`x-forwarded-proto` (`target`, `server`). No `Expect` header and no
@@ -324,7 +335,9 @@ SDK never reads the environment itself) or a JWT with audience `https://connect.
 also be a provider, `() => string | Promise<string>`, called on every dial. The SDK does **not**
 refresh tokens: a provider that needs refreshing does it itself. Throw `TokenUnavailableError` from
 a provider for a temporary failure (it is retried with backoff instead of being fatal). A rejected
-token ends the exposure (`error{UNAUTHORIZED}` + close `4011`, fatal).
+token ends the exposure (`error{UNAUTHORIZED}` + close `4011`, fatal); with a provider, the SDK
+first redials once with a fresh token, which `onRetry` reports as `{ attempt: 1, delayMs: 0, reason:
+"token-refresh" }`.
 
 The token travels in `hello.token`, which is what the tunnel checks, and also in the upgrade's
 `Authorization: Bearer` header when the runtime can set one (ws-mixer spec v0.5.0 makes the header
@@ -350,7 +363,7 @@ on every disconnect, then `closing` -> `closed`. `conflict` is sticky: see below
 | `registered` | `{ url, serverId, created }`, after every successful register (the service is re-registered after every reconnect: the edge keeps no state across connections); the latest one is also `handle.registration` |
 | `disabled` | `{ serverId, reason }`: disabled from the dashboard; requests get `503` |
 | `enabled` | `{ serverId }`: re-enabled; the SDK re-registers |
-| `conflict` | `{ serverId, name, reason: "taken_over" }`: another connection of the same account registered this name and now owns it (below) |
+| `conflict` | `{ serverId, name, reason: "taken_over" }`: another connection of the same account registered this name and now owns it (below); `reason: "replaced"` for a ws-mixer drain that moved the name elsewhere (`serverId` is absent when none is known) |
 | `error` | non-fatal: a failing handler or response body, a rejected re-registration, a transient register error (retried with backoff 1 s, 2 s, 4 s, ... up to 30 s), an exception thrown by one of your handle listeners |
 | `disconnect` | every transport disconnect (`DisconnectPayload`, see below); the SDK reconnects itself |
 | `close` | once, terminal: `{}` after `close()`, `{ error }` (a `McpwarpError`) after a fatal failure |
@@ -384,6 +397,7 @@ The default factory passes `{ protocols, headers }` only to a `WebSocket` known 
 (Node's, Deno's, Bun's); an Electron renderer is detected as such even though it has `process`.
 `webSocketFactory(ctor)` (headers) takes a constructor accepting that init object;
 `webSocketFactory(ctor, { headers: false })` takes any standard one (`typeof WebSocket` from the DOM lib).
+`webSocketFactory` is exported from the package root and also from `./mcpwarp` (and `./node`).
 
 The detection guesses from the global `WebSocket`. The `ws` package's class (or a subclass of it)
 is recognised as a non-native constructor with `ping`/`terminate` on its prototype and `ws`'s
@@ -567,7 +581,8 @@ RESET always discards buffered data.
 `stableAfter` (default 10000 ms) is how long a connection must stay up past **its own** `welcome`
 before the attempt counter, the `4013` one-shot retry and the token refresh-retry budget reset. A
 server that welcomes and then disconnects can therefore not turn backoff into a tight loop. Must be
-a finite number `>= 0` (`RangeError` otherwise); `0` resets on the next tick. Differs from
+a finite number `>= 0` (`RangeError` from `connect()` otherwise; `expose()` throws a `TypeError`
+and `createTunnel()` reports `error`/`INVALID_CONFIG`); `0` resets on the next tick. Differs from
 `ws-mixer-go`, where `StableAfter: 0` means "use the default".
 
 ### Disconnect reason shape

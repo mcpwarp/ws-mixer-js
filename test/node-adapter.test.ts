@@ -10,6 +10,7 @@ import { ErrorCode } from "../src/errors.js";
 import type { EdgeConnection } from "../src/testing/edge-conn.js";
 import { StreamByteReader } from "../src/http1/reader.js";
 import { readResponse } from "../src/http1/response.js";
+import { serveWithHandler } from "../src/mcpwarp/serve.js";
 
 const INTEGRATION = "0f6c2a8e-4c1b-4b7e-9a4e-2f1d9b7c3a10";
 const cleanups: Array<() => Promise<void> | void> = [];
@@ -310,6 +311,7 @@ describe("serveWithNodeServer on a raw stream", () => {
   const head = "POST /mcp HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n";
   const chunk = (n: number) => `${n.toString(16)}\r\n${"x".repeat(n)}\r\n`;
   const enc = (s: string) => new TextEncoder().encode(s);
+  const unavailableCtx = (available: boolean) => ({ isAvailable: () => available, unavailableReason: () => "service disabled", maxBodyBytes: 16, onError: () => {} });
 
   function make() {
     const out: string[] = [];
@@ -353,15 +355,266 @@ describe("serveWithNodeServer on a raw stream", () => {
     expect(errors).toHaveLength(1);
   });
 
+  it("a malformed chunk after a 503 refusal: the stream ends with CLOSE, not RESET", async () => {
+    const { stream, out } = make();
+    const serve = serveWithNodeServer(() => {}, { isAvailable: () => false, unavailableReason: () => "service disabled", maxBodyBytes: 16, onError: () => {} });
+    const done = serve(stream);
+    stream.handleData(enc(head));
+    await waitFor(() => out.join("").includes('"}'));
+    stream.handleData(enc("zz\r\nbad\r\n"));
+    stream.handleClose();
+    await done;
+    await waitFor(() => out.includes("<CLOSE>"));
+    expect(out.filter((s) => !s.startsWith("<")).join("")).toBe(
+      'HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: 28\r\n\r\n{"error":"service disabled"}',
+    );
+    expect(out.some((s) => s.startsWith("<RESET"))).toBe(false);
+  });
+
+  it("a chunked body over the cap after the app wrote its head (response unfinished): RESET CANCEL, one status line, the app reads no byte past the cap", async () => {
+    const { stream, out } = make();
+    const flushed = countdown(1);
+    let received = 0;
+    let ended = false;
+    const serve = serveWithNodeServer(
+      (req, res) => {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.flushHeaders();
+        req.on("error", () => {});
+        req.on("data", (c: Buffer) => (received += c.length));
+        req.on("end", () => (ended = true));
+        flushed.tick();
+      },
+      { isAvailable: () => true, maxBodyBytes: 10, onError: () => {} },
+    );
+    const done = serve(stream);
+    stream.handleData(enc(head + chunk(4)));
+    await flushed.done;
+    for (let i = 0; i < 40 && !out.some((s) => s.startsWith("<RESET")); i++) {
+      stream.handleData(enc(chunk(4096)));
+      await new Promise((r) => setImmediate(r));
+    }
+    await done;
+    expect(out.at(-1)).toBe(`<RESET ${ErrorCode.CANCEL}>`);
+    expect(out.join("").match(/HTTP\/1\.1 /g)).toHaveLength(1);
+    expect(received).toBe(4);
+    expect(ended).toBe(false);
+  });
+
+  it("a chunked body just over a 16-byte cap (1000 bytes, one chunk, complete request) to a buffering app: 413 and no RESET; the app sees no body byte and no end", async () => {
+    const { stream, out } = make();
+    let received = 0;
+    let ended = false;
+    const serve = serveWithNodeServer(
+      (req, res) => {
+        req.on("error", () => {});
+        req.on("data", (c: Buffer) => (received += c.length));
+        req.on("end", () => {
+          ended = true;
+          res.end(`read ${received}`);
+        });
+      },
+      { isAvailable: () => true, maxBodyBytes: 16, onError: () => {} },
+    );
+    const done = serve(stream);
+    stream.handleData(enc(head + chunk(1000) + "0\r\n\r\n"));
+    stream.handleClose();
+    await done;
+    await waitFor(() => out.includes("<CLOSE>"));
+    expect(out.filter((s) => !s.startsWith("<")).join("")).toBe(
+      'HTTP/1.1 413 Content Too Large\r\nContent-Type: application/json\r\nContent-Length: 34\r\n\r\n{"error":"request body too large"}',
+    );
+    expect(out.some((s) => s.startsWith("<RESET"))).toBe(false);
+    expect(received).toBe(0);
+    expect(ended).toBe(false);
+  });
+
+  it("a chunked body over the cap after writeHead() with nothing flushed: 413, no RESET, no 200 on the wire", async () => {
+    const { stream, out } = make();
+    const serve = serveWithNodeServer(
+      (req, res) => {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        req.on("error", () => {});
+        req.resume();
+      },
+      { isAvailable: () => true, maxBodyBytes: 16, onError: () => {} },
+    );
+    const done = serve(stream);
+    stream.handleData(enc(head));
+    await new Promise((r) => setTimeout(r, 10));
+    stream.handleData(enc(chunk(20) + "0\r\n\r\n"));
+    stream.handleClose();
+    await done;
+    await waitFor(() => out.includes("<CLOSE>"));
+    expect(out.filter((s) => !s.startsWith("<")).join("")).toBe(
+      'HTTP/1.1 413 Content Too Large\r\nContent-Type: application/json\r\nContent-Length: 34\r\n\r\n{"error":"request body too large"}',
+    );
+    expect(out.some((s) => s.startsWith("<RESET"))).toBe(false);
+  });
+
+  it("a body under the cap in 1-byte chunks (framing far over 64 KiB) reaches the app whole", async () => {
+    const { stream, out } = make();
+    const serve = serveWithNodeServer(
+      (req, res) => {
+        let received = 0;
+        req.on("data", (c: Buffer) => (received += c.length));
+        req.on("end", () => res.end(`read ${received}`));
+      },
+      { isAvailable: () => true, maxBodyBytes: 40000, onError: () => {} },
+    );
+    const done = serve(stream);
+    stream.handleData(enc(head));
+    for (let i = 0; i < 30; i++) {
+      stream.handleData(enc("1\r\nx\r\n".repeat(1000)));
+      await new Promise((r) => setImmediate(r));
+    }
+    stream.handleData(enc("0\r\n\r\n"));
+    stream.handleClose();
+    await done;
+    await waitFor(() => out.includes("<CLOSE>"));
+    expect(out.filter((s) => !s.startsWith("<")).join("")).toMatch(/^HTTP\/1\.1 200 OK\r\n[\s\S]*\r\n\r\nread 30000$/);
+    expect(out.some((s) => s.startsWith("<RESET"))).toBe(false);
+  });
+
+  it("pathological framing (1-byte chunks with 100-byte extensions) under the cap: 413 once framing passes 128 KiB + 8 bytes per body byte", async () => {
+    const { stream, out } = make();
+    let received = 0;
+    const serve = serveWithNodeServer(
+      (req) => {
+        req.on("error", () => {});
+        req.on("data", (c: Buffer) => (received += c.length));
+      },
+      { isAvailable: () => true, maxBodyBytes: 1 << 20, onError: () => {} },
+    );
+    const done = serve(stream);
+    stream.handleData(enc(head));
+    for (let i = 0; i < 100 && !out.includes("<CLOSE>"); i++) {
+      stream.handleData(enc(`1;${"e".repeat(100)}\r\nx\r\n`.repeat(100)));
+      await new Promise((r) => setImmediate(r));
+    }
+    stream.handleClose();
+    await done;
+    await waitFor(() => out.includes("<CLOSE>"));
+    expect(out.filter((s) => !s.startsWith("<")).join("")).toBe(
+      'HTTP/1.1 413 Content Too Large\r\nContent-Type: application/json\r\nContent-Length: 34\r\n\r\n{"error":"request body too large"}',
+    );
+    expect(received).toBeGreaterThan(0);
+    expect(received).toBeLessThan(2000);
+  });
+
+  it("a malformed chunk after a complete Connection: close response is reported to onError once; the stream ends with CLOSE", async () => {
+    const errors: unknown[] = [];
+    const { stream, out } = make();
+    const serve = serveWithNodeServer(
+      (_req, res) => {
+        res.setHeader("Connection", "close");
+        res.end("ok");
+      },
+      { isAvailable: () => true, maxBodyBytes: 1 << 20, onError: (e) => errors.push(e) },
+    );
+    const done = serve(stream);
+    stream.handleData(enc(head));
+    await waitFor(() => out.join("").includes("ok"));
+    stream.handleData(enc(chunk(5)));
+    stream.handleData(enc("zz\r\n" + "y".repeat(100_000)));
+    stream.handleClose();
+    await done;
+    await stream.closed;
+    expect(out.at(-1)).toBe("<CLOSE>");
+    expect(out.some((s) => s.startsWith("<RESET"))).toBe(false);
+    expect(errors).toHaveLength(1);
+  });
+
+  for (const [adapter, mk] of [
+    ["handler", (available: boolean) => serveWithHandler(() => new Response("app"), unavailableCtx(available))],
+    ["server", (available: boolean) => serveWithNodeServer((_req, res) => res.end("app"), unavailableCtx(available))],
+  ] as const) {
+    it(`${adapter}: disabled + chunked body with Expect: 503 before any body byte, no 1xx, the body drained, CLOSE without RESET`, async () => {
+      const { stream, out } = make();
+      const done = mk(false)(stream);
+      stream.handleData(enc("POST /mcp HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nExpect: 100-continue\r\n\r\n"));
+      await waitFor(() => out.join("").includes('"}'));
+      for (let i = 0; i < 32; i++) {
+        stream.handleData(enc(chunk(30000)));
+        await new Promise((r) => setImmediate(r));
+      }
+      stream.handleData(enc("0\r\n\r\n"));
+      stream.handleClose();
+      await done;
+      await waitFor(() => out.includes("<CLOSE>"));
+      expect(out.filter((s) => !s.startsWith("<")).join("")).toBe(
+        'HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: 28\r\n\r\n{"error":"service disabled"}',
+      );
+      expect(out.some((s) => s.startsWith("<RESET"))).toBe(false);
+    });
+
+    it(`${adapter}: HEAD /mcp while disabled is a bodyless 503 with the GET Content-Length`, async () => {
+      const { stream, out } = make();
+      const done = mk(false)(stream);
+      stream.handleData(enc("HEAD /mcp HTTP/1.1\r\nHost: x\r\n\r\n"));
+      stream.handleClose();
+      await done;
+      await waitFor(() => out.includes("<CLOSE>"));
+      expect(out.filter((s) => !s.startsWith("<")).join("")).toBe("HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: 28\r\n\r\n");
+      expect(out.some((s) => s.startsWith("<RESET"))).toBe(false);
+    });
+  }
+
+  it("error replies are byte-exact (MCPWARP.md section 4.5): 413 Content Too Large; 503 beats 413 without reading the body", async () => {
+    const cl = "POST /mcp HTTP/1.1\r\nHost: x\r\nContent-Length: 95\r\n\r\n";
+    const run = async (available: boolean) => {
+      const seen: string[] = [];
+      const { stream, out } = make();
+      const serve = serveWithNodeServer((req, res) => (seen.push(req.url!), res.end("app")), {
+        isAvailable: () => available,
+        unavailableReason: () => "service closing",
+        maxBodyBytes: 16,
+        onError: () => {},
+      });
+      const done = serve(stream);
+      stream.handleData(enc(cl));
+      await waitFor(() => out.join("").includes('"}'));
+      stream.handleData(enc("x".repeat(95)));
+      stream.handleClose();
+      await done;
+      expect(seen).toEqual([]);
+      return out.filter((s) => !s.startsWith("<")).join("");
+    };
+    expect(await run(true)).toBe('HTTP/1.1 413 Content Too Large\r\nContent-Type: application/json\r\nContent-Length: 34\r\n\r\n{"error":"request body too large"}');
+    expect(await run(false)).toBe('HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: 27\r\n\r\n{"error":"service closing"}');
+  });
+
+  it("a chunked body over the cap before the app answers: 413 Content Too Large", async () => {
+    const { stream, out } = make();
+    const serve = serveWithNodeServer(
+      (req) => {
+        req.on("error", () => {});
+        req.resume();
+      },
+      { isAvailable: () => true, maxBodyBytes: 10, onError: () => {} },
+    );
+    const done = serve(stream);
+    stream.handleData(enc(head));
+    for (let i = 0; i < 20 && !out.includes("<CLOSE>"); i++) {
+      stream.handleData(enc(chunk(4096)));
+      await new Promise((r) => setImmediate(r));
+    }
+    stream.handleClose();
+    await done;
+    await waitFor(() => out.includes("<CLOSE>"));
+    expect(out.filter((s) => !s.startsWith("<")).join("")).toBe(
+      'HTTP/1.1 413 Content Too Large\r\nContent-Type: application/json\r\nContent-Length: 34\r\n\r\n{"error":"request body too large"}',
+    );
+    expect(out.some((s) => s.startsWith("<RESET"))).toBe(false);
+  });
+
   it("a chunked body over the cap after the app finished its response: the response ends with CLOSE, no RESET", async () => {
     const { stream, out } = make();
     const serve = serveWithNodeServer((_req, res) => res.end("early"), { isAvailable: () => true, maxBodyBytes: 10, onError: () => {} });
     const done = serve(stream);
     stream.handleData(enc(head));
-    for (let i = 0; i < 20; i++) {
-      stream.handleData(enc(chunk(4096)));
-      await new Promise((r) => setImmediate(r));
-    }
+    await waitFor(() => out.join("").includes("early"));
+    stream.handleData(enc(chunk(20)));
     stream.handleData(enc("0\r\n\r\n"));
     stream.handleClose();
     await done;

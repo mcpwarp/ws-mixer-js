@@ -58,9 +58,12 @@ export {
   TRANSIENT_REGISTER_ERRORS,
   DEFAULT_URL,
   SERVICE_NAME_RE,
+  SERVICE_NAME_MAX,
+  isValidServiceName,
   encodeRegister,
   encodeUnregister,
   decodeEnvelope,
+  webSocketFactory,
 } from "../mcpwarp/index.js";
 export type {
   ExposeOptions,
@@ -69,7 +72,6 @@ export type {
   AbortSignalLike,
   Tunnel,
   TunnelOptions,
-  TunnelBase,
   TunnelConfig,
   TunnelState,
   TunnelStatus,

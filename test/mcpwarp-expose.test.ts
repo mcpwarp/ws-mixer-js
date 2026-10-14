@@ -4,6 +4,7 @@ import { gzipSync } from "node:zlib";
 import type { AddressInfo } from "node:net";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { McpwarpError, expose, type ExposeHandle, type ExposeOptions } from "../src/mcpwarp/index.js";
+import { adapterServer, exposeWithServer, type ExposeSignal } from "../src/mcpwarp/expose.js";
 import { FakeEdge } from "../src/testing/index.js";
 import type { EdgeConnection } from "../src/testing/edge-conn.js";
 import { SDK_VERSION } from "../src/client.js";
@@ -142,6 +143,44 @@ describe("expose({handler})", () => {
     expect((thrown as Error).message).not.toContain(secret);
     expect(() => expose({ token: "t", name: "ok", integration: INTEGRATION } as never)).toThrow(/exactly one/);
     expect(() => expose({ ...base, name: "ok", target: "http://x" } as never)).toThrow(/exactly one/);
+  });
+
+  it("validates `reconnect` synchronously as a TypeError, never the client's RangeError, without echoing the value", () => {
+    const base = { token: "t", name: "ok", integration: INTEGRATION, handler: () => new Response() };
+    const bad: Array<[Record<string, unknown> | number, RegExp]> = [
+      [7, /`reconnect` must be an object/],
+      [{ stableAfter: Number.NaN }, /`reconnect.stableAfter` must be a finite number >= 0/],
+      [{ stableAfter: -1 }, /`reconnect.stableAfter`/],
+      [{ base: "10" }, /`reconnect.base`/],
+      [{ cap: Number.POSITIVE_INFINITY }, /`reconnect.cap`/],
+      [{ connectTimeout: 0 }, /`reconnect.connectTimeout`/],
+      [{ maxAttempts: -1 }, /`reconnect.maxAttempts`/],
+    ];
+    for (const [reconnect, re] of bad) {
+      let thrown: unknown;
+      try {
+        expose({ ...base, reconnect } as never);
+      } catch (e) {
+        thrown = e;
+      }
+      expect(thrown).toBeInstanceOf(TypeError);
+      expect((thrown as Error).message).toMatch(re);
+      expect((thrown as Error).message).not.toMatch(/NaN|-1|"10"/);
+    }
+  });
+
+  it("`reconnect` keys set to undefined keep the client's defaults", async () => {
+    const edge = await startEdge();
+    for (const reconnect of [{ stableAfter: undefined }, { base: undefined, cap: undefined }, { maxAttempts: undefined, connectTimeout: undefined }]) {
+      let pending: Promise<ExposeHandle> | undefined;
+      expect(() => {
+        pending = expose({ url: edge.url, webSocket: edge.webSocket, token: "t", name: "notes", integration: INTEGRATION, handler: () => new Response(), reconnect });
+      }).not.toThrow();
+      const handle = await pending!;
+      const opts = (handle.client as unknown as { reconnectOpts: Record<string, number> }).reconnectOpts;
+      expect(opts).toEqual({ base: 1000, cap: 60000, connectTimeout: 10000, maxAttempts: Infinity, stableAfter: 10000 });
+      await handle.close();
+    }
   });
 
   it("an upper-case integration UUID (and the nil/max UUIDs) are accepted and sent lowercased", async () => {
@@ -425,6 +464,139 @@ describe("expose({handler})", () => {
     expect(edge.appLog.map((b) => (b.mcpwarp as { op: string }).op)).toEqual(["register"]);
   });
 
+  /** Pins the drain dial's jitter (`Math.random() * 2000`) to 50 ms, so a short wait shows it never came. */
+  function shortDrainJitter() {
+    const random = vi.spyOn(Math, "random").mockReturnValue(0.025);
+    cleanups.push(() => random.mockRestore());
+  }
+
+  it("a drain with reason replaced before the first registered rejects TAKEN_OVER; nothing is dialed again", async () => {
+    shortDrainJitter();
+    const edge = await startEdge();
+    edge.withholdRegistered("notes");
+    const retries: string[] = [];
+    const outcome = expose({
+      url: edge.url,
+      webSocket: edge.webSocket,
+      token: "t",
+      name: "notes",
+      integration: INTEGRATION,
+      handler: () => new Response(),
+      reconnect: { base: 5, cap: 10 },
+      onRetry: (info) => retries.push(info.reason),
+    }).catch((e: unknown) => e);
+    await edge.waitForApp("register");
+    await edge.drain({ reason: "replaced", deadlineMs: 25000 });
+    expect(await outcome).toMatchObject({ code: "TAKEN_OVER", fatal: true });
+    await new Promise((r) => setTimeout(r, 300));
+    expect(edge.upgrades).toHaveLength(1);
+    expect(retries).toEqual([]);
+  });
+
+  it("a drain with reason replaced after registration is a take-over: conflict event, client closed, no replacement, never registers again", async () => {
+    shortDrainJitter();
+    const edge = await startEdge();
+    const retries: string[] = [];
+    const handle = await exposeOn(edge, { handler: () => new Response(), onRetry: (info) => retries.push(info.reason) });
+    const conflicts: unknown[] = [];
+    handle.on("conflict", (e) => conflicts.push(e));
+    await edge.drain({ reason: "replaced", deadlineMs: 25000 });
+    await waitFor(() => conflicts.length === 1);
+    expect(conflicts[0]).toEqual({ serverId: handle.serverId, name: "notes", reason: "replaced" });
+    expect(handle.state).toBe("conflict");
+    await waitFor(() => edge.connections.length === 0);
+    await new Promise((r) => setTimeout(r, 300));
+    expect(edge.upgrades).toHaveLength(1);
+    expect(retries).toEqual([]);
+    expect(edge.appLog.map((b) => (b.mcpwarp as { op: string }).op)).toEqual(["register"]);
+    await handle.close();
+    expect(handle.state).toBe("closed");
+  });
+
+  it("a drain with reason replaced after a disabled refusal without an id: the conflict event has no serverId", async () => {
+    const edge = await startEdge();
+    edge.failRegister("notes", { code: "SERVER_DISABLED", message: "disabled" });
+    const handle = await exposeOn(edge, { handler: () => new Response() });
+    expect(handle.state).toBe("disabled");
+    const conflicts: object[] = [];
+    handle.on("conflict", (e) => conflicts.push(e));
+    await edge.drain({ reason: "replaced", deadlineMs: 25000 });
+    await waitFor(() => conflicts.length === 1);
+    expect(conflicts[0]).toEqual({ name: "notes", reason: "replaced" });
+    expect("serverId" in conflicts[0]!).toBe(false);
+  });
+
+  it("a replaced drain during close()'s unregister wait dials no replacement", async () => {
+    const edge = await startEdge();
+    const handle = await exposeOn(edge, { handler: () => new Response() });
+    // No `unregistered` reply: close() sits out its 2 s unregister budget.
+    (edge as unknown as { onUnregister: () => void }).onUnregister = () => {};
+    const closing = handle.close();
+    await edge.waitForApp("unregister");
+    await edge.drain({ reason: "replaced", deadlineMs: 25000 });
+    await closing;
+    await new Promise((r) => setTimeout(r, 100));
+    expect(edge.upgrades).toHaveLength(1);
+    expect(handle.state).toBe("closed");
+  });
+
+  /** A handler whose requests wait for `release()`, so one in flight keeps a drained connection open. */
+  function holdingHandler() {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    cleanups.push(() => release());
+    return async () => {
+      await gate;
+      return new Response("done");
+    };
+  }
+
+  it("after a drain hand-over, app messages from the drained connection are ignored", async () => {
+    const edge = await startEdge();
+    const handle = await exposeOn(edge, { handler: holdingHandler() });
+    const first = edge.connections[0]! as EdgeConnection;
+    const disabled: unknown[] = [];
+    handle.on("disabled", (e) => disabled.push(e));
+    edge.fetch(edge.publicUrl("notes")).catch(() => {});
+    await waitFor(() => handle.client.currentConn()!.liveStreamCount() === 1);
+    await edge.drain({ deadlineMs: 25000, conn: first });
+    await edge.waitForApp("register", { count: 2 });
+    await waitFor(() => handle.state === "registered" && edge.connections.length === 2);
+    // The client emits `app` for a drained connection's message too, before expose drops it.
+    const delivered = new Promise((r) => handle.client.once("app", r));
+    await edge.sendApp({ mcpwarp: { v: 1, op: "disable", id: edge.serverId("notes"), reason: "stale" } }, first);
+    await delivered;
+    expect(handle.state).toBe("registered");
+    expect(disabled).toEqual([]);
+    await edge.sendApp({ mcpwarp: { v: 1, op: "disable", id: edge.serverId("notes"), reason: "live" } }, edge.connections[1]!);
+    await waitFor(() => disabled.length === 1);
+    expect(handle.state).toBe("disabled");
+  });
+
+  it("a drained connection ending after its replacement died is still reported as superseded", async () => {
+    const edge = await startEdge();
+    const signals: ExposeSignal[] = [];
+    const handle = await exposeWithServer(
+      { url: edge.url, webSocket: edge.webSocket, token: "t", name: "notes", integration: INTEGRATION, reconnect: { base: 5000, cap: 5000 } },
+      adapterServer({ handler: holdingHandler() }),
+      { observe: (s) => signals.push(s) },
+    );
+    cleanups.push(() => handle.close());
+    const first = edge.connections[0]! as EdgeConnection;
+    edge.fetch(edge.publicUrl("notes")).catch(() => {});
+    await waitFor(() => handle.client.currentConn()!.liveStreamCount() === 1);
+    await edge.drain({ deadlineMs: 25000, conn: first });
+    await edge.waitForApp("register", { count: 2 });
+    await waitFor(() => edge.connections.length === 2);
+    const second = edge.connections[1]! as EdgeConnection;
+    edge.closeConnection({ wsCode: 4009, conn: second });
+    await waitFor(() => second.closed);
+    edge.closeConnection({ wsCode: 4012, conn: first });
+    await waitFor(() => signals.filter((s) => s.event === "disconnect").length === 2);
+    const disconnects = signals.filter((s): s is Extract<ExposeSignal, { event: "disconnect" }> => s.event === "disconnect");
+    expect(disconnects.map((d) => d.superseded)).toEqual([false, true]);
+  });
+
   it("drain: an SSE response in flight on the old connection completes there; the service re-registers and new requests land on the replacement", async () => {
     const edge = await startEdge();
     let release!: () => void;
@@ -681,6 +853,45 @@ describe("expose(): signal and onRetry", () => {
     await closed;
     expect(handle.state).toBe("closed");
     expect(edge.appLog.map((b) => (b.mcpwarp as { op: string }).op)).toEqual(["register", "unregister"]);
+  });
+
+  it("onRetry fires for a zero-delay redial, a drain's replacement dial and an OVERLOADED re-send", async () => {
+    const edge = await startEdge();
+    const retries: Array<{ attempt: number; delayMs: number; reason: string }> = [];
+    const handle = await exposeOn(edge, { handler: () => new Response(), onRetry: (info) => retries.push(info) });
+    // 4013 KEEPALIVE_TIMEOUT: one immediate redial, which the client's `reconnecting` event skips.
+    edge.closeConnection({ wsCode: 4013 });
+    await waitFor(() => retries.length === 1);
+    expect(retries[0]).toMatchObject({ delayMs: 0, reason: "keepalive_timeout" });
+    await waitFor(() => handle.state === "registered" && edge.connections.length === 1);
+    await edge.drain({ deadlineMs: 25000 });
+    await waitFor(() => retries.length === 2);
+    // The connection never went stable, so the client's counter is past 0; a drain dial ignores it.
+    expect(retries[1]).toMatchObject({ attempt: 0, reason: "drain" });
+    expect(retries[1]!.delayMs).toBeGreaterThan(0);
+    expect(retries[1]!.delayMs).toBeLessThan(2000);
+    await waitFor(() => edge.upgrades.length === 3 && handle.state === "registered");
+    edge.withholdRegistered("notes");
+    await edge.enable("notes");
+    await edge.waitForApp("register", { count: 4 });
+    await edge.appError("OVERLOADED", "too many messages in flight");
+    await waitFor(() => retries.length === 3);
+    expect(retries[2]).toEqual({ attempt: 1, delayMs: 1000, reason: "register failed: OVERLOADED: too many messages in flight" });
+  });
+
+  it("onRetry reports the one-shot token-refresh redial after an HTTP 401 with a token provider", async () => {
+    const edge = await startEdge();
+    edge.rejectNextUpgrade(401);
+    const retries: Array<{ attempt: number; delayMs: number; reason: string }> = [];
+    let calls = 0;
+    const handle = await exposeOn(edge, {
+      handler: () => new Response(),
+      token: () => `mcpwarp_pat_id_${++calls}`,
+      onRetry: (info) => retries.push(info),
+    });
+    expect(handle.state).toBe("registered");
+    expect(calls).toBe(2);
+    expect(retries).toEqual([{ attempt: 1, delayMs: 0, reason: "token-refresh" }]);
   });
 
   it("onRetry reports a transient register error before the first registration", async () => {

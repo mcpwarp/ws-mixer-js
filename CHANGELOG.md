@@ -2,10 +2,94 @@
 
 All notable changes to `@mcpwarp/ws-mixer` (the JS/TypeScript client SDK) are documented here.
 
-## Unreleased
+## 0.11.0 - 2026-10-14
+
+Aligned with ws-mixer-spec v0.6.1 (`spec.pin`).
+
+### Breaking
+
+- `createTunnel()`: an invalid service name (local check or a register refused `INVALID_NAME`) is now
+  `error`/`INVALID_NAME`, a new `TunnelStatusCode` (13 codes), instead of `INVALID_CONFIG`.
+  `describeStatus()` has the six `error.INVALID_NAME` strings from ws-mixer-spec v0.6.0.
+- Removed the deprecated `TunnelBase` type and `Tunnel.close()` alias (use `TunnelOptions`, `dispose()`).
+- `tunnel.dispose({ timeoutMs })` throws a `TypeError` unless `timeoutMs` is a positive finite number.
+- `expose()`/`createTunnel()`: a `reconnect` option of the wrong type or range (`stableAfter` finite
+  >= 0, `base`/`cap` finite >= 0, `connectTimeout` > 0, `maxAttempts` >= 0) is a synchronous
+  `TypeError` from `expose()` and `error`/`INVALID_CONFIG` in the tunnel (was the client's
+  `RangeError`, mapped to `INTERNAL`). Keys set to `undefined` keep the defaults.
+- `ExposeConflict.serverId` is optional: a `drain` with reason `replaced` when no server id is known
+  (the service was refused as disabled without one) omits it.
+- `/mcp` precedence (§4.4): `404` (path) > `503` (disabled/closing) > `413` (body cap) > the app.
+  `handler` and `target` now check availability right after the request head, before reading the
+  body, so a disabled or closing service answers an oversized `/mcp` request `503` (it used to be
+  `413`), and a `503` no longer waits for the request body. `server` already had this order.
+- `registered.services[].url` is required: `decodeEnvelope` rejects a missing or empty `url` with
+  `MALFORMED_ENVELOPE` (a non-fatal `error` event) and no longer defaults it to `""`.
+
+### Added
+
+- `SERVICE_NAME_MAX` (30), `isValidServiceName(name)` and `webSocketFactory` are exported from
+  `@mcpwarp/ws-mixer/mcpwarp` (and `@mcpwarp/ws-mixer/node`).
+- Spec fixture runners in CI: envelope (`test/spec-envelope-fixtures.test.ts`, checked against
+  `spec/mcpwarp.schema.json` with ajv), bridging (`test/spec-bridging-fixtures.test.ts`, raw HTTP/1.1
+  in/out), tunnel (`test/spec-tunnel-fixtures.test.ts`, all 32 fixtures, fake edge + fake clock,
+  exact snapshots, dial counts and retry kinds) and status text
+  (`test/spec-status-text-fixtures.test.ts`, tables string-identical to the six locale files,
+  `cases.json`, `rules.json`). Each fails under `CI` when its fixtures are missing. Locally, a
+  `.spec/` whose `.pin` differs from `spec.pin` is skipped in favour of a `../ws-mixer-spec` sibling,
+  which is used only when it is checked out exactly at that tag with no local changes under `spec/`.
+
+### Changed
+
+- A ws-mixer `drain` with reason `replaced` is a take-over, not a hand-over: `expose()` rejects
+  `TAKEN_OVER` before it settles, otherwise the handle enters `conflict` and emits `conflict` with
+  `reason: "replaced"`; the client is closed and no replacement is dialed (also during `close()`).
+  The tunnel goes `conflict`/`TAKEN_OVER`, sticky until the next `configure()`.
+- Tunnel: a register refused after an earlier registration, with any code, is `error` with its code
+  and the connection closed (`BAD_REQUEST`, `NOT_IMPLEMENTED` or an unknown code used to leave it
+  stuck at `connecting`/`INTERNAL`).
+- Tunnel: `connecting` codes are chosen by cause, not by the `onRetry` reason text: a failed dial is
+  `RETRYING`, a lost established connection `DISCONNECTED`, a transient register error or an
+  `OVERLOADED` re-send `RETRYING`; a non-fatal `error` op or malformed envelope `INTERNAL`.
+- Tunnel: a drained connection's end changes nothing once its replacement has received `welcome`
+  (even while it is still registering, and even if the replacement has died since); before that it
+  is `connecting`/`DISCONNECTED`. Decided by connection identity. Logged at `info` as `the
+  superseded connection ended: ...`.
+- `onRetry` now also fires for zero-delay redials (e.g. close 4013's immediate retry), a drain's
+  replacement dial (`{ attempt: 0, delayMs: <0-2 s jitter>, reason: "drain" }`, whatever the backoff
+  counter), the one-shot token-refresh redial after a 401/4011 with a token provider
+  (`{ attempt: 1, delayMs: 0, reason: "token-refresh" }`) and `OVERLOADED` register re-sends
+  (reason `register failed: OVERLOADED: <message>`, `delayMs` 1000, `attempt` counting consecutive
+  re-sends and reset by a successful register).
+- Tunnel `logger`: synchronous validation failures log `INVALID_NAME: <detail>` /
+  `INVALID_CONFIG: <detail>` at `error`; any other fatal failure without a McpwarpError code logs
+  with its status code (`INTERNAL: the connection closed`).
+- `413 Content Too Large`: the `./node` `server` adapter now uses the RFC 9110 reason phrase (it
+  used to send Node's `Payload Too Large`), and its JSON error replies use the same byte-exact head
+  as `handler`/`target` (`Content-Type`, `Content-Length`).
+
+### Fixed
+
+- `reconnect` keys explicitly set to `undefined` (e.g. from unset prefs) no longer override the
+  client's defaults: `stableAfter: undefined` threw, `base`/`cap` gave a tight redial loop,
+  `maxAttempts` disabled reconnecting.
+- App messages (`disable`, `error`, a late `registered`, `OVERLOADED`) arriving on a drained
+  connection after its replacement's `welcome` are ignored instead of moving the session.
+- `./node` `server`: a malformed request body after a complete response (an SDK `404`/`503`/`413` or
+  the app's finished one) ends the stream with CLOSE instead of RESET.
+- `./node` `server`: a chunked body over `maxRequestBodyBytes` trips at the cap, counted on the
+  decoded body, and the app never reads past it. It used to trip only once the raw request passed
+  the cap plus 64 KiB, so a body up to about 64 KiB over the cap reached the app whole.
+- `./node` `server`: a `request` listener that throws is answered `500 {"error":"handler error"}`
+  like a throwing `handler` (§4.5); it used to say `internal error`.
 
 ### Docs
 
+- docs/MCPWARP.md: the spec is normative at the pinned tag; url rule, name exports, precedence; all
+  register refusals after registration are fatal in the tunnel; `drain{replaced}` in the state table
+  and §7; `onRetry` coverage; the `server` adapter streams the body (the app never reads past the
+  cap: `413` before any response byte, RESET `CANCEL` during an unfinished response, CLOSE after a
+  complete one).
 - README "Status text": the `": "` to `"; "` rewrite applies only to the `INVALID_CONFIG` detail (a
   code-less `lastError` is returned unchanged); state `conflict` (`TAKEN_OVER`) has no detail, state
   `error` with `CONFLICT` shows "Name already in use".

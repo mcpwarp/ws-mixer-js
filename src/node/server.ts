@@ -9,7 +9,7 @@
 import http, { type IncomingMessage, type RequestListener, type Server, type ServerResponse } from "node:http";
 import type { Duplex } from "node:stream";
 import type { MixerStream } from "../stream.js";
-import { concatBytes, latin1Decode, latin1Encode } from "../http1/headers.js";
+import { concatBytes, latin1Decode, latin1Encode, reasonPhrase } from "../http1/headers.js";
 import { HEAD_DEADLINE_MS, MAX_HEAD_BYTES, requestPath } from "../http1/request.js";
 import { MCP_PATH, type ServeContext, type StreamServer } from "../mcpwarp/serve.js";
 import { toDuplex, type DuplexSource } from "./duplex.js";
@@ -23,13 +23,13 @@ function sendJson(res: ServerResponse, status: number, message: string): void {
   }
   const body = JSON.stringify({ error: message });
   res.sendDate = false;
-  res.writeHead(status, { "content-type": "application/json", "content-length": Buffer.byteLength(body) });
+  res.writeHead(status, reasonPhrase(status), { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) });
   res.end(body);
 }
 
-function rawErrorResponse(status: number, reason: string, message: string): string {
+function rawErrorResponse(status: number, message: string): string {
   const body = JSON.stringify({ error: message });
-  return `HTTP/1.1 ${status} ${reason}\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`;
+  return `HTTP/1.1 ${status} ${reasonPhrase(status)}\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`;
 }
 
 const CRLFCRLF = "\r\n\r\n";
@@ -41,41 +41,44 @@ interface Exchange {
   res?: ServerResponse;
   /** We answered (404/503/413/431/400) and Node is only discarding the rest of the request. */
   answered: boolean;
+  /** The body went over the cap: the stream was taken over and the socket source is detached. */
+  overflowed: boolean;
+  /** A response byte reached the stream (a head Node has buffered but not flushed does not count). */
+  wrote: boolean;
+  /** Decoded request body bytes Node's parser pushed into `req`. */
+  bodyBytes: number;
+  /** Takes the stream over for a body over the cap; runs once. */
+  overflow: () => void;
 }
+
+const never = () => new Promise<never>(() => {});
 
 /**
  * The stream as the private server's socket, minus Node's own
  * `Connection`/`Keep-Alive` lines in the response head (the edge copies
- * response headers to the public client). Counts the raw request bytes
- * before Node parses them: past `limit` (a chunked body over the cap),
- * `onOverflow` takes the stream over and nothing more reaches Node; from
- * then on the source is detached (reads never settle, writes and resets
- * are dropped).
+ * response headers to the public client). Once `ex.overflowed`, the source
+ * is detached (reads never settle, writes and resets are dropped), so nothing
+ * more reaches Node.
  */
-function nodeSocketSource(stream: MixerStream, ex: Exchange, limit: number, onOverflow: () => void): DuplexSource {
+function nodeSocketSource(stream: MixerStream, ex: Exchange): DuplexSource {
   let head: Uint8Array | null = new Uint8Array(0);
-  let received = 0;
-  let detached = false;
   return {
     read: async () => {
-      if (detached) return new Promise<never>(() => {});
+      if (ex.overflowed) return never();
       const chunk = await stream.read();
-      if (chunk === null) return chunk;
-      received += chunk.length;
-      // Until the head is dispatched, Node's own head cap (431) applies.
-      if (received <= limit || ex.answered || !ex.res) return chunk;
-      detached = true;
-      onOverflow();
-      return new Promise<never>(() => {});
+      return ex.overflowed ? never() : chunk;
     },
-    closeWrite: () => (detached ? Promise.resolve() : stream.closeWrite()),
+    closeWrite: () => (ex.overflowed ? Promise.resolve() : stream.closeWrite()),
     getState: () => stream.getState(),
     reset: (code, message) => {
-      if (!detached) stream.reset(code, message);
+      if (!ex.overflowed) stream.reset(code, message);
     },
     write: (chunk) => {
-      if (detached) return Promise.resolve();
-      if (head === null) return stream.write(chunk);
+      if (ex.overflowed) return Promise.resolve();
+      if (head === null) {
+        ex.wrote = true;
+        return stream.write(chunk);
+      }
       const bytes = concatBytes([head, typeof chunk === "string" ? latin1Encode(chunk) : chunk]);
       const text = latin1Decode(bytes);
       const end = text.indexOf(CRLFCRLF);
@@ -84,6 +87,7 @@ function nodeSocketSource(stream: MixerStream, ex: Exchange, limit: number, onOv
         return Promise.resolve();
       }
       head = null;
+      ex.wrote = true;
       const lines = text.slice(0, end).split("\r\n").filter((line, i) => i === 0 || !NODE_CONNECTION_HEADERS.has(line.slice(0, line.indexOf(":")).trim().toLowerCase()));
       return stream.write(concatBytes([latin1Encode(lines.join("\r\n") + CRLFCRLF), bytes.subarray(end + CRLFCRLF.length)]));
     },
@@ -145,6 +149,22 @@ export function serveWithNodeServer(server: Server | RequestListener, ctx: Serve
     if (publicHost !== undefined) req.headers["x-forwarded-host"] = publicHost;
     req.headers["x-forwarded-proto"] = "https";
     req.headers.host = "localhost";
+    // A chunked body is counted as Node's parser pushes it into `req`, decoded:
+    // the chunk that crosses the cap is withheld, so the app never reads past it.
+    if (ex) {
+      const push = req.push.bind(req);
+      req.push = (chunk: Buffer | null, encoding?: BufferEncoding): boolean => {
+        if (ex.overflowed) return false;
+        if (chunk !== null && !ex.answered) {
+          ex.bodyBytes += chunk.length;
+          if (ex.bodyBytes > ctx.maxBodyBytes) {
+            ex.overflow();
+            return false;
+          }
+        }
+        return push(chunk, encoding);
+      };
+    }
     try {
       if (typeof server === "function") {
         server(req, res);
@@ -155,7 +175,7 @@ export function serveWithNodeServer(server: Server | RequestListener, ctx: Serve
       }
     } catch (e) {
       ctx.onError(e);
-      answer(500, "internal error");
+      answer(500, "handler error");
     }
   };
 
@@ -168,39 +188,53 @@ export function serveWithNodeServer(server: Server | RequestListener, ctx: Serve
   priv.on("checkExpectation", (req, res) => priv.emit("request", req, res));
   // Having a listener stops Node's own reply, so answer like the handler/target adapters do.
   priv.on("clientError", (err: Error & { code?: string }, socket: Duplex) => {
-    if (!socket.writable) return;
     const ex = exchanges.get(socket);
-    if (ex) ex.answered = true;
-    ctx.onError(err);
-    // A bad body after the app started its response: a second status line would corrupt it (Node's own handler destroys too).
-    if (ex?.res?.headersSent) {
-      socket.destroy();
+    // Node already ended the socket (a `Connection: close` response); `parser.finish()` can report the same error again.
+    if (!socket.writable) {
+      if (!ex?.answered) ctx.onError(err);
+      if (ex) ex.answered = true;
       return;
     }
-    socket.end(
-      err.code === "HPE_HEADER_OVERFLOW"
-        ? rawErrorResponse(431, "Request Header Fields Too Large", "request head too large")
-        : rawErrorResponse(400, "Bad Request", "malformed request"),
-    );
+    if (ex) ex.answered = true;
+    ctx.onError(err);
+    if (ex?.res?.headersSent) {
+      // A bad body after a response that is still being written: a second status line would corrupt it (Node's own handler destroys too).
+      if (!ex.res.writableFinished) {
+        socket.destroy();
+        return;
+      }
+      // The response (ours or the app's) is complete: end with CLOSE, not RESET.
+      socket.end();
+    } else {
+      socket.end(
+        err.code === "HPE_HEADER_OVERFLOW"
+          ? rawErrorResponse(431, "request head too large")
+          : rawErrorResponse(400, "malformed request"),
+      );
+    }
     // Read and drop the rest of the request (away from Node's parser) so the edge's writer is never left blocked on credit.
     socket.removeAllListeners("data");
     socket.resume();
   });
 
-  // Raw bytes, so chunk framing counts too: a chunked body may run up to the head cap past the body cap.
-  const rawLimit = MAX_HEAD_BYTES + ctx.maxBodyBytes;
+  // Raw request bytes minus the decoded body: the head plus chunk framing,
+  // which the decoded count never sees. Allowed: the head cap, 64 KiB, and
+  // 8 bytes per decoded body byte (a 1-byte chunk, `1\r\nx\r\n`, costs 5), so
+  // only pathological framing (long chunk extensions, padded sizes) trips it.
+  const framingLimit = (bodyBytes: number) => 2 * MAX_HEAD_BYTES + 8 * bodyBytes;
 
   const serve = ((stream: MixerStream) => {
-    const ex: Exchange = { answered: false };
     // A chunked body over the cap (Content-Length is checked in `dispatch`):
-    // a 413 if the app has not started its response, a plain CLOSE if it
-    // already finished it, else a RESET. Destroying the socket aborts `req`
+    // a 413 if no response byte reached the stream yet (a `writeHead` Node
+    // has not flushed does not count), a plain CLOSE if the app already
+    // finished its response, else a RESET. Destroying the socket aborts `req`
     // (Node emits its 'error' only to existing listeners) and turns the
     // app's later `res` writes into no-ops.
     const onOverflow = (): void => {
-      const res = ex.res!;
-      if (!res.headersSent || res.writableFinished) {
-        const answer = res.headersSent ? null : rawErrorResponse(413, "Payload Too Large", "request body too large");
+      if (ex.overflowed) return;
+      ex.overflowed = true;
+      if (!ex.wrote || ex.res!.writableFinished) {
+        const answer = ex.wrote ? null : rawErrorResponse(413, "request body too large");
         void (async () => {
           try {
             if (answer !== null) await stream.write(answer);
@@ -217,7 +251,8 @@ export function serveWithNodeServer(server: Server | RequestListener, ctx: Serve
       }
       sock.destroy();
     };
-    const sock = toDuplex(nodeSocketSource(stream, ex, rawLimit, onOverflow));
+    const ex: Exchange = { answered: false, overflowed: false, wrote: false, bodyBytes: 0, overflow: onOverflow };
+    const sock = toDuplex(nodeSocketSource(stream, ex));
     exchanges.set(sock, ex);
     sockets.add(sock);
     headTimers.set(
@@ -236,6 +271,16 @@ export function serveWithNodeServer(server: Server | RequestListener, ctx: Serve
       });
     });
     priv.emit("connection", sock);
+    // Added after Node's own 'data' listener, which parses each chunk synchronously,
+    // so `ex.bodyBytes` already includes it. Also bounds a body Node no longer
+    // pushes into a dumped `req` (the app finished its response).
+    let received = 0;
+    sock.on("data", (chunk: Buffer) => {
+      received += chunk.length;
+      // Until the head is dispatched, Node's own head cap (431) applies.
+      if (ex.overflowed || ex.answered || !ex.res) return;
+      if (received - ex.bodyBytes > framingLimit(ex.bodyBytes)) ex.overflow();
+    });
     return done;
   }) as NodeStreamServer;
   serve.destroyAll = () => {

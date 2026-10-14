@@ -27,7 +27,7 @@ export { SUBPROTOCOL };
 // asserts the two match, so a release bump that forgets this one fails CI
 // instead of silently going stale on the wire in hello.agent.sdk_version /
 // the User-Agent header).
-export const SDK_VERSION = "0.10.1";
+export const SDK_VERSION = "0.11.0";
 
 export type ClientState = "idle" | "dialing" | "connected" | "backoff" | "closed";
 
@@ -222,6 +222,24 @@ export interface ConnectOptions {
    * `code`/`name` to make it impossible to miss.
    */
   onDisconnect?: (reason: DisconnectPayload) => void;
+  /**
+   * @internal For mcpwarp's `onRetry`: called before every scheduled reconnect
+   * (including a drain's replacement dial), zero delays included, which the
+   * `reconnecting` event skips.
+   */
+  onReconnect?: (info: { attempt: number; delayMs: number; cause: string }) => void;
+  /**
+   * @internal For mcpwarp: `onApp` plus whether the message came from a drained
+   * connection whose replacement has received `welcome`.
+   */
+  onAppFrom?: (body: Record<string, unknown>, superseded: boolean) => void;
+  /**
+   * @internal For mcpwarp: `onDisconnect` plus whether the report is about a
+   * connection other than the serving one: a drained connection whose
+   * replacement has received `welcome`, or a replacement dial failing while
+   * the drained connection still serves.
+   */
+  onDisconnectFrom?: (reason: DisconnectPayload, superseded: boolean) => void;
 
   reconnect?: ReconnectOptions;
 
@@ -373,6 +391,8 @@ export class MixerClient extends Emitter {
    * non-fatal, without scheduling a reconnect.
    */
   private readonly supersededConns = new Set<MixerConn>();
+  /** Every connection that ever entered `supersededConns`; kept past its close for events flushed after it. */
+  private readonly replacedConns = new WeakSet<MixerConn>();
   /** `drain.deadline_ms` per draining connection, for retire()'s client-side deadline. */
   private readonly drainDeadlines = new WeakMap<MixerConn, number | undefined>();
 
@@ -629,6 +649,7 @@ export class MixerClient extends Emitter {
 
   private async connectOnce(delayMs: number, cause: string): Promise<void> {
     if (this.closing || this.isClosed()) return;
+    if (cause !== "initial") this.opts.onReconnect?.({ attempt: this.attempt, delayMs, cause });
     if (delayMs > 0) {
       this.state = "backoff";
       this.emit("reconnecting", { attempt: this.attempt, delayMs, cause });
@@ -685,6 +706,7 @@ export class MixerClient extends Emitter {
         // to close.
         if (this.closing || this.isClosed()) break;
         this.unauthorizedRetryUsed = true;
+        this.opts.onReconnect?.({ attempt: this.attempt, delayMs: 0, cause: "token-refresh" });
         continue;
       }
       break;
@@ -732,6 +754,7 @@ export class MixerClient extends Emitter {
         // and silently swallow the replacement's own later reconnect.
         this.drainReconnectScheduled = false;
         this.supersededConns.add(old);
+        this.replacedConns.add(old);
         const deadlineMs = this.drainDeadlines.get(old);
         // One second of slack past the server's own deadline, so the
         // server's RESET(CANCEL) + close 4012 normally arrives first.
@@ -933,6 +956,7 @@ export class MixerClient extends Emitter {
     });
     conn.on("app", (b) => {
       this.emit("app", b);
+      this.opts.onAppFrom?.(b, this.replacedConns.has(conn));
       return this.opts.onApp?.(b);
     });
     conn.on("pong", (p) => this.emit("pong", p));
@@ -1054,7 +1078,7 @@ export class MixerClient extends Emitter {
       // once, non-fatal, and never schedules a reconnect or touches the
       // stability timer: its replacement is already the active conn.
       if (this.supersededConns.delete(conn)) {
-        if (!this.closing && this.state !== "closed") this.notifyDisconnect(this.buildPayload(ctx, false));
+        if (!this.closing && this.state !== "closed") this.notifyDisconnect(this.buildPayload(ctx, false), true);
         return;
       }
 
@@ -1181,7 +1205,8 @@ export class MixerClient extends Emitter {
     });
   }
 
-  private notifyDisconnect(payload: DisconnectPayload): void {
+  private notifyDisconnect(payload: DisconnectPayload, superseded = false): void {
+    this.opts.onDisconnectFrom?.(payload, superseded);
     this.opts.onDisconnect?.(payload);
     this.emit("close", payload);
   }
@@ -1292,7 +1317,8 @@ export class MixerClient extends Emitter {
       this.giveUp(ctx, `max reconnect attempts (${this.reconnectOpts.maxAttempts}) exhausted: ${cause}`);
       return;
     }
-    this.notifyDisconnect(this.buildPayload(ctx, false));
+    // A failing dial is never the serving connection; a live connection that ended was detached before this.
+    this.notifyDisconnect(this.buildPayload(ctx, false), this.conn !== null);
     this.attempt++;
     const delay = computeDelay();
     void this.connectOnce(delay, cause);

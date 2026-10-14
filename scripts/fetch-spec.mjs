@@ -2,10 +2,12 @@
 // Shallow-clones github.com/mcpwarp/ws-mixer-spec at the tag pinned in
 // spec.pin into .spec/ (gitignored). No-op if .spec/ already checked out at
 // that pin. This is what CI runs before the fixture-reading test suites
-// (test/frame.test.ts, test/control.test.ts, test/sequence.test.ts); for
-// local dev, WSMIXER_SPEC_DIR (or an ../ws-mixer-spec sibling checkout,
-// as produced by the monorepo extraction) is tried first -- see the SPEC
-// resolver those test files share.
+// (test/frame.test.ts, test/control.test.ts, test/sequence.test.ts,
+// test/spec-envelope-fixtures.test.ts, test/spec-bridging-fixtures.test.ts,
+// test/spec-tunnel-fixtures.test.ts, test/spec-status-text-fixtures.test.ts).
+// The resolver those suites share (test/helpers/spec-dir.ts) tries
+// WSMIXER_SPEC_DIR, then .spec/ while its .pin equals spec.pin, then an
+// ../ws-mixer-spec sibling checkout while it is exactly at that tag.
 
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, rmSync } from "node:fs";

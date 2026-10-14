@@ -35,7 +35,7 @@ class FakeClock {
 function make(opts: { sendFails?: boolean } = {}) {
   const clock = new FakeClock();
   const sent: Array<Record<string, any>> = [];
-  const events: Array<[string, unknown]> = [];
+  const events: Array<[string, unknown, string?]> = [];
   const fatals: McpwarpError[] = [];
   const session = new Session({
     name: "anki",
@@ -46,15 +46,16 @@ function make(opts: { sendFails?: boolean } = {}) {
     },
     setTimeout: clock.setTimeout,
     clearTimeout: clock.clearTimeout,
-    emit: (event, payload) => events.push([event, payload]),
+    emit: (event, payload, detail) => events.push([event, payload, detail]),
     fatal: (err) => fatals.push(err),
   });
   const ops = () => sent.map((m) => m.op);
   const of = (name: string) => events.filter(([e]) => e === name).map(([, p]) => p);
+  const detailsOf = (name: string) => events.filter(([e]) => e === name).map(([, , d]) => d);
   const app = (env: Record<string, unknown>) => session.onApp({ mcpwarp: { v: 1, ...env } });
   const registered = (created = false) => app({ op: "registered", services: [{ name: "anki", id: "srv_anki", url: "https://anki-u.x/mcp", created }] });
   const regError = (code: string, extra: Record<string, unknown> = {}) => app({ op: "registered", errors: [{ name: "anki", code, message: code.toLowerCase(), ...extra }] });
-  return { clock, sent, events, fatals, session, ops, of, app, registered, regError };
+  return { clock, sent, events, fatals, session, ops, of, detailsOf, app, registered, regError };
 }
 
 describe("Session", () => {
@@ -83,7 +84,7 @@ describe("Session", () => {
   it("ignores registered entries and errors for other names, and non-mcpwarp bodies", () => {
     const t = make();
     t.session.onWelcome();
-    t.app({ op: "registered", services: [{ name: "other", id: "x" }], errors: [{ name: "other2", code: "CONFLICT" }] });
+    t.app({ op: "registered", services: [{ name: "other", id: "x", url: "https://other-u.x/mcp" }], errors: [{ name: "other2", code: "CONFLICT" }] });
     t.session.onApp({ hello: 1 });
     expect(t.session.state).toBe("registering");
     expect(t.fatals).toHaveLength(0);
@@ -140,10 +141,39 @@ describe("Session", () => {
     later.session.onDisconnect();
     later.session.onWelcome();
     later.regError("CONFLICT");
+    later.regError("SOMETHING_NEW");
     expect(later.fatals).toHaveLength(0);
-    expect(later.of("error")).toHaveLength(1);
+    expect(later.of("error").map((e) => (e as McpwarpError).code)).toEqual(["CONFLICT", "SOMETHING_NEW"]);
+    // Marked by origin, so createTunnel() can treat every refusal as terminal without parsing messages.
+    expect(later.detailsOf("error")).toEqual(["register_refusal", "register_refusal"]);
     later.clock.advance(60_000);
     expect(later.ops()).toEqual(["register", "register"]); // no retry until the next welcome
+  });
+
+  it("error origins: transient register error, app error, malformed envelope", () => {
+    const t = make();
+    t.session.onWelcome();
+    t.regError("INTERNAL");
+    t.app({ op: "error", code: "INTERNAL", message: "an app error that shares the name" });
+    t.app({ op: "disable" });
+    expect(t.of("error").map((e) => (e as McpwarpError).code)).toEqual(["INTERNAL", "INTERNAL", "MALFORMED_ENVELOPE"]);
+    expect(t.detailsOf("error")).toEqual(["register_transient", "app", "malformed"]);
+    expect(t.detailsOf("retry")).toEqual(["register"]);
+  });
+
+  it("a drain with reason replaced takes over like conflict: state conflict, event, never registers again; a second one changes nothing", () => {
+    const t = make();
+    t.session.onWelcome();
+    t.registered();
+    expect(t.session.onReplaced()).toBe(true);
+    expect(t.session.state).toBe("conflict");
+    expect(t.of("conflict")).toEqual([{ serverId: "srv_anki", name: "anki", reason: "replaced" }]);
+    expect(t.session.onReplaced()).toBe(false);
+    t.app({ op: "conflict", id: "srv_anki", name: "anki" });
+    expect(t.of("conflict")).toHaveLength(1);
+    t.session.onDisconnect();
+    t.session.onWelcome();
+    expect(t.ops()).toEqual(["register"]);
   });
 
   it("disable (matching id or before any id) -> disabled; enable re-registers", () => {
@@ -175,6 +205,9 @@ describe("Session", () => {
     t.session.onWelcome();
     t.app({ op: "error", code: "OVERLOADED", message: "busy" });
     t.app({ op: "error", code: "OVERLOADED", message: "busy" });
+    expect(t.of("retry")).toEqual([{ attempt: 1, delayMs: 1000, reason: "register failed: OVERLOADED: busy" }]);
+    expect(t.detailsOf("retry")).toEqual(["overloaded"]);
+    expect(t.of("error")).toEqual([]);
     t.clock.advance(999);
     expect(t.ops()).toEqual(["register"]);
     t.clock.advance(1);
@@ -183,6 +216,35 @@ describe("Session", () => {
     t.app({ op: "error", code: "OVERLOADED", message: "busy" });
     t.clock.advance(5000);
     expect(t.ops()).toEqual(["register", "register"]); // nothing outstanding
+  });
+
+  it("OVERLOADED retry attempt counts consecutive re-sends and resets on a successful register", () => {
+    const t = make();
+    t.session.onWelcome();
+    const overloaded = () => {
+      t.app({ op: "error", code: "OVERLOADED", message: "busy" });
+      t.clock.advance(1000);
+    };
+    overloaded();
+    overloaded();
+    overloaded();
+    t.registered();
+    t.app({ op: "disable", id: "srv_anki" });
+    t.app({ op: "enable", id: "srv_anki", name: "anki" });
+    overloaded();
+    expect(t.of("retry").map((r) => (r as { attempt: number }).attempt)).toEqual([1, 2, 3, 1]);
+    expect(t.ops()).toEqual(["register", "register", "register", "register", "register", "register"]);
+  });
+
+  it("a replaced drain with no known server id omits serverId", () => {
+    const t = make();
+    t.session.onWelcome();
+    t.regError("SERVER_DISABLED");
+    expect(t.session.state).toBe("disabled");
+    expect(t.session.onReplaced()).toBe(true);
+    const [conflict] = t.of("conflict");
+    expect(conflict).toEqual({ name: "anki", reason: "replaced" });
+    expect(Object.prototype.hasOwnProperty.call(conflict, "serverId")).toBe(false);
   });
 
   it("UNSUPPORTED_VERSION is fatal; CONNECTION_LIMIT, TOO_MANY_SERVICES, UNKNOWN_OP are non-fatal errors", () => {

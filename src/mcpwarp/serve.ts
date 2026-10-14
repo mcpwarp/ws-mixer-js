@@ -1,11 +1,12 @@
 /**
  * Serving one mcpwarp request per stream: parse the edge's HTTP/1.1
  * request, hand it to the integration (a fetch-style handler, or a local
- * HTTP server via fetch), write the response back. Only `MCP_PATH` is
- * served: any other path gets 404 right after the head, before the app and
- * ahead of the 503. Other error replies: 400/413/431 for a bad request, 500
- * for a failing handler, 502/504 for an unreachable/slow target, 503 while
- * disabled or closing. Never a 1xx.
+ * HTTP server via fetch), write the response back. Precedence (MCPWARP.md
+ * section 4.4): 404 for any path but `MCP_PATH`, then 503 while disabled or
+ * closing, both right after the head without reading the body; then 413/400
+ * for a body over the cap or malformed; then the app. Other error replies:
+ * 400/431 for a bad head, 500 for a failing handler, 502/504 for an
+ * unreachable/slow target. Never a 1xx.
  */
 import type { MixerStream } from "../stream.js";
 import { HttpParseError, StreamByteReader, UnexpectedEof } from "../http1/reader.js";
@@ -78,6 +79,11 @@ export async function serveHttp(stream: MixerStream, ctx: ServeContext, respond:
       discardRest(reader);
       return;
     }
+    if (!ctx.isAvailable()) {
+      await writeErrorResponse(stream, 503, ctx.unavailableReason?.() ?? "service unavailable", head.method);
+      discardRest(reader);
+      return;
+    }
     const { framing: _, ...fields } = head;
     req = { ...fields, body: await readRequestBody(reader, head, ctx.maxBodyBytes) };
   } catch (e) {
@@ -95,11 +101,6 @@ export async function serveHttp(stream: MixerStream, ctx: ServeContext, respond:
 
   let wrote = false;
   try {
-    if (!ctx.isAvailable()) {
-      wrote = true;
-      await writeErrorResponse(stream, 503, ctx.unavailableReason?.() ?? "service unavailable", req.method);
-      return;
-    }
     const ac = newAbortController();
     if (ac) {
       void stream.closed.then((r) => {
