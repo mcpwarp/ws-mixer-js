@@ -2,6 +2,14 @@
 
 All notable changes to `@mcpwarp/ws-mixer` (the JS/TypeScript client SDK) are documented here.
 
+## Unreleased
+
+### Docs
+
+- README "Status text": the `": "` to `"; "` rewrite applies only to the `INVALID_CONFIG` detail (a
+  code-less `lastError` is returned unchanged); state `conflict` (`TAKEN_OVER`) has no detail, state
+  `error` with `CONFLICT` shows "Name already in use".
+
 ## 0.10.1 - 2026-10-14
 
 ### Added

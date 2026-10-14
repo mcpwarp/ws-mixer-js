@@ -196,14 +196,17 @@ describeStatus(status, { locale: "de", messages: { states: { error: "Problem" } 
 
 `label` is the state; `detail` the code's sentence, or `lastError` when there is no code (your own
 host-side reasons included), and left out when empty or when it would repeat `label` (`disabled`,
-`conflict`). `INVALID_CONFIG` appends a colon (in French with a no-break space before the colon and
-a space after it, `"："` in Japanese and Chinese, `": "` otherwise) and `lastError`, which names the
-bad field and stays English in every locale ("Ungültige Einstellungen: The service name is not
-set."); the generic "The tunnel settings are invalid." is left out. A `lastError` equal to or
-starting with the localized sentence is shown alone. A `": "` inside `lastError` is rendered as
-`"; "`, so the detail has a single colon. A locale resolves by exact tag (case-insensitive, `_` read
-as `-`), then by language (`de-AT` is `de`), then to English; it never throws. Any `zh-*` (`zh-TW`,
-`zh-HK` and `zh-Hant` included) gets the Simplified Chinese `zh-CN` table.
+`conflict`). So state `conflict` (`TAKEN_OVER`) has no detail, while state `error` with `CONFLICT`
+does: "Name already in use". `INVALID_CONFIG` appends a colon (in French with a no-break space
+before the colon and a space after it, `"："` in Japanese and Chinese, `": "` otherwise) and
+`lastError`, which names the bad field and stays English in every locale ("Ungültige
+Einstellungen: The service name is not set."); the generic "The tunnel settings are invalid." is
+left out. A `lastError` equal to or starting with the localized sentence is shown alone. When the
+two are joined, a `": "` inside `lastError` is rendered as `"; "`, so the detail has a single
+colon; this applies only to `INVALID_CONFIG`, and a code-less `lastError` is returned unchanged. A
+locale resolves by exact tag (case-insensitive, `_` read as `-`), then by language (`de-AT` is
+`de`), then to English; it never throws. Any `zh-*` (`zh-TW`, `zh-HK` and `zh-Hant` included) gets
+the Simplified Chinese `zh-CN` table.
 
 ## Three adapters
 
