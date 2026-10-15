@@ -27,7 +27,7 @@ export { SUBPROTOCOL };
 // asserts the two match, so a release bump that forgets this one fails CI
 // instead of silently going stale on the wire in hello.agent.sdk_version /
 // the User-Agent header).
-export const SDK_VERSION = "0.11.0";
+export const SDK_VERSION = "0.11.1";
 
 export type ClientState = "idle" | "dialing" | "connected" | "backoff" | "closed";
 
@@ -541,7 +541,16 @@ export class MixerClient extends Emitter {
     return this.closeImpl(opts);
   }
 
-  private async closeImpl(opts?: CloseOptions): Promise<void> {
+  /**
+   * @internal mcpwarp's take-over close (MCPWARP.md section 6.8): like
+   * `close()`, but the live connection gets `error{NO_ERROR}` + WS close
+   * `1000` at once, with no `drain{client_requested}` and no grace.
+   */
+  closeNow(): Promise<void> {
+    return this.closeImpl(undefined, true);
+  }
+
+  private async closeImpl(opts?: CloseOptions, immediate = false): Promise<void> {
     // Marked closing/closed FIRST, before either connection is touched, so
     // nothing below -- the 'close' handler's own reconnect-scheduling
     // branches -- ever schedules a reconnect for this shutdown.
@@ -577,7 +586,7 @@ export class MixerClient extends Emitter {
       dialing.fail(closeErr);
     }
     if (this.conn) {
-      if (opts?.message !== undefined) {
+      if (opts?.message !== undefined || immediate) {
         this.conn.fail(closeErr);
       } else {
         await this.conn.close();
@@ -834,6 +843,8 @@ export class MixerClient extends Emitter {
         unauthorized: false,
       };
     }
+    // close() while the token resolved (a zero-delay drain dial cancelled in the same tick): never start the upgrade.
+    if (this.closing || this.isClosed()) return { ok: false, cancelled: true };
 
     const detected = detectRuntime();
     const runtime = { runtime: this.opts.agent?.runtime ?? detected.runtime, os: this.opts.agent?.os ?? detected.os };

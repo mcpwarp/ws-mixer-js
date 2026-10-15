@@ -112,6 +112,25 @@ describe("decodeEnvelope", () => {
     }
   });
 
+  it("registered.services[] entry: a multi-defect entry reports the first of name, id, url, created (MCPWARP.md section 2.8 rule 10)", () => {
+    const cases: Array<[Record<string, unknown>, string]> = [
+      [{ name: 7, url: "", created: "yes" }, "registered.services[].name must be a string"],
+      [{ name: "anki", id: 7, url: "", created: "yes" }, "registered.services[].id must be a string"],
+      [{ name: "anki", id: "srv_anki", url: "", created: "yes" }, "registered.services[].url must be a non-empty string"],
+      [{ name: "anki", id: "srv_anki", url: "https://x", created: "yes" }, "registered.services[].created must be a boolean"],
+    ];
+    for (const [svc, message] of cases) {
+      try {
+        decodeEnvelope({ mcpwarp: { v: 1, op: "registered", services: [svc] } });
+        expect.unreachable(JSON.stringify(svc));
+      } catch (e) {
+        expect(e).toBeInstanceOf(McpwarpError);
+        expect((e as McpwarpError).code).toBe("MALFORMED_ENVELOPE");
+        expect((e as McpwarpError).message).toBe(message);
+      }
+    }
+  });
+
   it("registered with no services/errors arrays defaults both to []", () => {
     expect(decodeEnvelope({ mcpwarp: { v: 1, op: "registered" } })).toEqual({ op: "registered", services: [], errors: [] });
   });

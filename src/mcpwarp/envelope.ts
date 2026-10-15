@@ -151,11 +151,11 @@ export function decodeEnvelope(body: Record<string, unknown>): InboundEnvelope |
       return {
         op: "registered",
         services: list(env, "services", "registered").map((s) => {
-          const created = s.created ?? false;
-          if (typeof created !== "boolean") throw malformed("registered.services[].created must be a boolean");
           const name = reqString(s, "name", "registered.services[]");
           const id = reqString(s, "id", "registered.services[]");
           if (typeof s.url !== "string" || s.url === "") throw malformed("registered.services[].url must be a non-empty string");
+          const created = s.created ?? false;
+          if (typeof created !== "boolean") throw malformed("registered.services[].created must be a boolean");
           return { name, id, url: s.url, created };
         }),
         errors: list(env, "errors", "registered").map((e) => {

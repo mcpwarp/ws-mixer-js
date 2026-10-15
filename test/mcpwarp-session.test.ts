@@ -296,6 +296,34 @@ describe("Session", () => {
     await p;
   });
 
+  it("beginClose: a conflict for our name during the unregister wait ends the wait and marks the session taken over, with no conflict event", async () => {
+    const t = make();
+    t.session.onWelcome();
+    t.registered();
+    const p = t.session.beginClose();
+    t.app({ op: "conflict", id: "srv_other", name: "other", reason: "taken_over" });
+    expect(t.session.takenOver).toBe(false);
+    t.app({ op: "conflict", id: "srv_anki", name: "anki", reason: "taken_over" });
+    await p;
+    expect(t.session.takenOver).toBe(true);
+    expect(t.session.state).toBe("closing");
+    expect(t.of("conflict")).toEqual([]);
+    expect(t.clock.pending()).toBe(0);
+  });
+
+  it("beginClose: a replaced drain during the unregister wait ends the wait the same way", async () => {
+    const t = make();
+    t.session.onWelcome();
+    t.registered();
+    const p = t.session.beginClose();
+    expect(t.session.onReplaced()).toBe(false);
+    await p;
+    expect(t.session.takenOver).toBe(true);
+    expect(t.session.state).toBe("closing");
+    expect(t.of("conflict")).toEqual([]);
+    expect(t.clock.pending()).toBe(0);
+  });
+
   it("conflict for our name or id -> conflict state, event, timers cancelled; never registers again, across reconnects and enable", async () => {
     const t = make();
     t.session.onWelcome();

@@ -1,9 +1,9 @@
 # The mcpwarp control plane, as this SDK implements it
 
-Status: descriptive of `src/mcpwarp/*` and `src/http1/*` (0.11.0). The **normative** specification
+Status: descriptive of `src/mcpwarp/*` and `src/http1/*` (0.11.1). The **normative** specification
 of this layer is ws-mixer-spec's
-[`docs/MCPWARP.md`](https://github.com/mcpwarp/ws-mixer-spec/blob/v0.6.1/docs/MCPWARP.md) at the tag in
-`spec.pin` (v0.6.1); where the two disagree, the spec wins. Its envelope, bridging, tunnel and
+[`docs/MCPWARP.md`](https://github.com/mcpwarp/ws-mixer-spec/blob/v0.6.2/docs/MCPWARP.md) at the tag in
+`spec.pin` (v0.6.2); where the two disagree, the spec wins. Its envelope, bridging, tunnel and
 status-text fixtures run in this repo's CI (`test/spec-envelope-fixtures.test.ts`,
 `test/spec-bridging-fixtures.test.ts`, `test/spec-tunnel-fixtures.test.ts`,
 `test/spec-status-text-fixtures.test.ts`). The
@@ -136,9 +136,10 @@ the loser is told with `conflict` (section 9).
 | State | Event | Action / next state |
 |---|---|---|
 | any but closing/closed/conflict | `welcome` (first connect, reconnect, drain replacement) | send `register` -> `registering` |
-| any but closing/closed/conflict | `conflict` with our name or our id | `conflict` (sticky), `conflict` event `{serverId, name, reason}`, timers and the outstanding op dropped; before `expose()` has settled (the `conflict` overtook the first `registered`): **fatal** instead, `expose()` rejects with `McpwarpError` `TAKEN_OVER` and the client closes |
-| any but closing/closed/conflict | ws-mixer `drain` with reason `replaced` | a take-over, not a hand-over: as `conflict` above (`conflict` event `{serverId, name, reason: "replaced"}`, `serverId` absent when none is known), and the client is closed, so no replacement is dialed; before `expose()` has settled: `TAKEN_OVER` rejection. During `close()` the client is closed at once as well |
-| `conflict` | `welcome`, disconnect, `enable`, `disable`, `registered` | ignored: no register, state stays `conflict`; inbound streams are RESET `CANCEL` |
+| any but closing/closed/conflict | `conflict` with our name or our id | `conflict` (sticky), `conflict` event `{serverId, name, reason}`, timers and the outstanding op dropped, then the client is closed at once (`error{NO_ERROR}` + close 1000, no `drain{client_requested}`, no grace, no `unregister`; nothing reconnects); before `expose()` has settled (the `conflict` overtook the first `registered`): **fatal** instead, `expose()` rejects with `McpwarpError` `TAKEN_OVER` and the client closes |
+| closing | `conflict` with our name or our id | no `conflict` event; the `unregistered` wait ends and the client is closed as on a take-over (`error{NO_ERROR}` + close 1000), not gracefully |
+| any but closing/closed/conflict | ws-mixer `drain` with reason `replaced` | a take-over, not a hand-over: as `conflict` above (`conflict` event `{serverId, name, reason: "replaced"}`, `serverId` absent when none is known), and the client is closed the same way, so no replacement is dialed (a replacement from an earlier hand-over that already sent `hello` is closed `error{NO_ERROR}` + 1000 before any `welcome` handling); before `expose()` has settled: `TAKEN_OVER` rejection. During `close()` the client is closed at once as well and the `unregistered` wait ends (no `conflict` event) |
+| `conflict` | `welcome`, disconnect, `enable`, `disable`, `registered` | ignored: no register, state stays `conflict`; a stream that still arrives before the close is RESET `CANCEL` |
 | `registering` | `registered` with our name | `registered`, `registered` event `{url, serverId, created}`, also kept as `handle.registration` |
 | `registering` | error `SERVER_DISABLED` | `disabled` |
 | `registering` | transient error | stay, retry with backoff |
@@ -147,7 +148,7 @@ the loser is told with `conflict` (section 9).
 | any but conflict | `enable` with our name | `enabled` event, send `register` -> `registering` |
 | any but closing/closed/conflict | disconnect leaving no active connection | `connecting`, retry timers cancelled (the end of a drain-superseded connection, or of the drain's parallel dial, does not count: the registration lives on the active connection; decided by connection identity, so a drained connection ending after its replacement already died still does not count) |
 | any | app message from a drained connection after its replacement's `welcome` | ignored |
-| any | `close()` | `closing`: if a register went out on the live connection (never after `conflict`), send `unregister` and wait for `unregistered` (2 s budget; any `unregistered` ends the wait, since the tunnel answers `services: []` for a name this connection does not hold); then the transport closes (`drain{client_requested}`, up to 5 s grace, close 1000) -> `closed` |
+| any | `close()` | `closing`: if a register went out on the live connection (never after `conflict`), send `unregister` and wait for `unregistered` (2 s budget; any `unregistered` ends the wait, since the tunnel answers `services: []` for a name this connection does not hold); then the transport closes (`drain{client_requested}`, up to 5 s grace, close 1000; in state `conflict`, or after a `conflict` or `drain{replaced}` during the wait, at once: `error{NO_ERROR}` + close 1000) -> `closed` |
 
 Before the first registration, `expose()` retries non-fatal failures (dial errors, refused upgrades,
 transient register errors) without limit unless `reconnect.maxAttempts` is set. `onRetry({attempt,
@@ -185,7 +186,7 @@ reports one `status` (`off`/`connecting`/`online`/`disabled`/`conflict`/`error`)
   `express.json({ limit: "8mb" })` never sees a body over 4 MiB, so raise `maxRequestBodyBytes` to
   match when the app accepts more. `handler` and `target` read the whole body into memory before
   calling the app, so the cap also bounds per-request memory, and an over-cap body is always `413`.
-  `server` streams the body to the app as it arrives (spec v0.6.1 allows it): the cap still applies,
+  `server` streams the body to the app as it arrives (spec v0.6.2 allows it): the cap still applies,
   counted on the decoded body, and the chunk that crosses it is withheld, so the app never reads a
   byte past the cap. When it trips, the reply is `413` if no response byte was written yet, else
   RESET `CANCEL` (a response the app already finished ends with CLOSE instead).
@@ -196,7 +197,9 @@ reports one `status` (`off`/`connecting`/`online`/`disabled`/`conflict`/`error`)
   response headers, answers a head over 64 KiB with `431` and a body over the cap with `413`
   (`Content-Length` is checked up front; a chunked body is cut off at the cap, as above). A malformed body after a complete response (an SDK refusal or the
   app's finished one) ends the stream with CLOSE; during an unfinished response, with RESET.
-- Error replies (JSON `{"error": "..."}`): `400` malformed request, `413` body too large, `431` head
+- Error replies (JSON `{"error": "..."}`): `400` malformed request (also, under `handler` and
+  `target`, a request the web `Request`/`Headers` API rejects, e.g. a NUL in a header value or the
+  method `TRACE`: `request cannot be represented as a web Request`), `413` body too large, `431` head
   too large, `500` the integration's handler failed, `502` local target unreachable / no request
   handler, `503` disabled or closing, `504` local target sent no headers within `targetTimeoutMs`
   (default 30 s; also without an `AbortController` global, where the fetch itself is left to
@@ -207,7 +210,13 @@ reports one `status` (`off`/`connecting`/`online`/`disabled`/`conflict`/`error`)
   after the authority; never normalised, so dot-segments, `\` and percent-encoding do not match;
   under `server` Node's parser answers a `\` with `400`) exactly and case-sensitively against
   `/mcp` (`/mcp?x=1` matches, `/mcp/` and `/MCP` do not). `OPTIONS *` and authority-form targets
-  are `400`. Any other request is answered `404` with only `Content-Type: application/json` and
+  are `400`. `handler` and `target` drop the fragment (the first `#` and everything after it, in
+  origin-form and absolute-form) before the path check, then percent-encode raw bytes in the
+  request-target once (`%` escapes are kept, never decoded); `target` appends the request's query
+  to the target URL's after `&` verbatim, never decoded or re-encoded (except `'`, which the
+  WHATWG URL parser sends as `%27` in target mode and in handler-mode `request.url`;
+  `ParsedRequest.target` keeps it). Under `server`, Node's
+  parser answers raw non-ASCII and control bytes with `400`. Any other request is answered `404` with only `Content-Type: application/json` and
   `Content-Length` (to `HEAD`: the same length, no body), right after the head is read: the handler, target or
   `http.Server` never sees it, and the rest of the body is read and dropped. Not configurable.
 - Precedence, in every adapter: `404` (path) > `503` (disabled/closing) > `413` (body cap) > the
@@ -239,7 +248,10 @@ the replacement's re-register.
 A `drain` with reason `replaced` is different: the tunnel gave the name to another connection, so
 it is a take-over, not a hand-over. Before `expose()` settles it rejects `TAKEN_OVER`; after, the
 handle goes to `conflict` and emits `conflict` with `reason: "replaced"`. Either way the client is
-closed and no replacement is dialed (also during `close()`), and no `onRetry` fires for it.
+closed at once, as on a `conflict` op (`error{NO_ERROR}` + close 1000, no `drain{client_requested}`,
+no grace), no replacement is dialed (also during `close()`), and no `onRetry` fires for it. A
+replacement from an earlier hand-over that already sent `hello` is closed the same way before any
+`welcome` handling; one still upgrading is closed on open without a `hello`.
 `createTunnel()` shows `conflict`/`TAKEN_OVER` until the next `configure()`.
 
 ## 8. Known limitations
@@ -271,9 +283,10 @@ What changed on the tunnel side, and how this SDK follows it:
   The tunnel RESETs the old holder's streams for that server first, then sends the frame; on the
   same pod at register time, from another pod at that pod's next presence heartbeat (up to ~30 s
   later). A connection being drained never receives it. On receipt the session (matching our name,
-  or our server id) goes to state `conflict` and emits `conflict { serverId, name, reason }`. The
-  state is sticky for the handle: no register on later `welcome`s (reconnect, drain replacement) or
-  on `enable`, and any stream that still arrives is RESET with `CANCEL` instead of being served (a
+  or our server id) goes to state `conflict`, emits `conflict { serverId, name, reason }` and closes
+  the client at once (`error{NO_ERROR}` + close 1000, in-flight streams cut, no `unregister`,
+  nothing reconnects). The state is sticky for the handle: it never registers again, and any
+  stream that still arrives before the close is RESET with `CANCEL` instead of being served (a
   `503` would claim the service is ours and merely unavailable; the tunnel has already moved it, so
   the request is cancelled as one the edge should not have routed here). `close()` still works and
   sends no `unregister`. Restarting the losing instance is left to a human or the app: an automatic

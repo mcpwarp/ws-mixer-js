@@ -371,11 +371,11 @@ on every disconnect, then `closing` -> `closed`. `conflict` is sticky: see below
 Two instances exposing the same `name` under one account: the newer register wins. The tunnel
 RESETs the older instance's open requests and sends it `conflict` (right away on the same tunnel
 pod, up to ~30 s later from another pod). The older handle goes to state `conflict` and stays
-there: it stops serving (any request that still reaches it is RESET), and it never registers
-again, not after a reconnect, a drain or an `enable`. The SDK does not fight for the name; restarting
+there: its connection is closed at once (in-flight requests are cut, nothing reconnects) and it
+never registers again. The SDK does not fight for the name; restarting
 the losing instance (or calling `close()` and `expose()` again) is a human's or the app's call, so
-log or surface the event. `close()` still works and skips the unregister (the name is no longer
-held). `url`/`serverId`/`registration` keep their last values, which now belong to the winner. A
+log or surface the event. `close()` still works, skips the unregister (the name is no longer
+held) and returns at once. `url`/`serverId`/`registration` keep their last values, which now belong to the winner. A
 `conflict` that overtakes the first `registered` reply makes `expose()` reject with a fatal
 `McpwarpError` `TAKEN_OVER` instead (the client is closed; no handle, no `conflict` event).
 

@@ -154,8 +154,12 @@ export class Session {
         return;
       case "conflict":
         // onApp carries no connection: safe because the tunnel never sends `conflict` to a connection it is draining.
-        if (this.isEnding() || this.takenOver) return;
+        if (this.state === "closed" || this.takenOver) return;
         if (env.name !== this.deps.name && (this.serverId === undefined || env.id !== this.serverId)) return;
+        if (this.state === "closing") {
+          this.takeOverWhileClosing();
+          return;
+        }
         this.takeOver({ serverId: env.id, name: env.name, reason: env.reason });
         return;
       case "error":
@@ -168,9 +172,13 @@ export class Session {
 
   /**
    * @internal A ws-mixer drain with reason "replaced": the edge handed the name to another connection, like `conflict`.
-   * False when it changes nothing (closing, or already taken over).
+   * False when it emits nothing (closing: it only ends close()'s unregister wait; or already taken over).
    */
   onReplaced(): boolean {
+    if (this.state === "closing" && !this.takenOver) {
+      this.takeOverWhileClosing();
+      return false;
+    }
     if (this.isEnding() || this.takenOver) return false;
     this.takeOver(this.serverId === undefined ? { name: this.deps.name, reason: "replaced" } : { serverId: this.serverId, name: this.deps.name, reason: "replaced" });
     return true;
@@ -284,6 +292,15 @@ export class Session {
     this.cancelTimers();
     this.setState("conflict");
     this.deps.emit("conflict", Object.freeze(conflict));
+  }
+
+  /** close() is waiting for `unregistered`, which will not come: stop waiting; expose.ts then closes at once. No `conflict` event. */
+  private takeOverWhileClosing(): void {
+    this.takenOver = true;
+    this.outstanding = undefined;
+    const waiter = this.unregisteredWaiter;
+    this.unregisteredWaiter = null;
+    waiter?.();
   }
 
   private sendRegister(): void {

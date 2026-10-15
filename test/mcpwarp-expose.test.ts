@@ -12,6 +12,10 @@ import { ErrorCode, WsMixerError } from "../src/errors.js";
 import { StreamByteReader } from "../src/http1/reader.js";
 import { readResponse } from "../src/http1/response.js";
 import { latin1Encode } from "../src/http1/headers.js";
+import { FrameType, decodeFrame, encodeData, encodeOpen } from "../src/frame.js";
+import { encodeControl, parseControl, type ControlMessage } from "../src/control.js";
+import type { WebSocketFactory, WebSocketLike } from "../src/socket.js";
+import { FakeWS } from "./helpers/fake-ws.js";
 
 const INTEGRATION = "0f6c2a8e-4c1b-4b7e-9a4e-2f1d9b7c3a10";
 const cleanups: Array<() => Promise<void> | void> = [];
@@ -199,7 +203,7 @@ describe("expose({handler})", () => {
     ]);
   });
 
-  it("conflict: streams are RESET first, the conflict event fires, stray streams are RESET without reaching the handler, no register after a reconnect, close() skips unregister", async () => {
+  it("conflict after registration: the conflict event fires, the connection closes at once and nothing redials; the handle stays readable; close() skips unregister", async () => {
     const edge = await startEdge();
     let calls = 0;
     let release!: () => void;
@@ -217,6 +221,8 @@ describe("expose({handler})", () => {
       conflicts.push(e);
       states.push(handle.state);
     });
+    const url = handle.url;
+    const registration = handle.registration;
 
     const inflight = edge.fetch(edge.publicUrl("notes")).catch((e: Error) => e);
     await waitFor(() => calls === 1);
@@ -226,33 +232,23 @@ describe("expose({handler})", () => {
     release();
     expect(conflicts).toEqual([{ serverId: "srv_notes", name: "notes", reason: "taken_over" }]);
     expect(states).toEqual(["conflict"]);
-    expect(handle.state).toBe("conflict");
 
-    // A stray stream (the edge should route nothing here any more) is RESET with CANCEL.
-    const conn = edge.connections[edge.connections.length - 1] as EdgeConnection;
-    const stray = conn.openStream();
-    await stray.write(latin1Encode("GET /mcp HTTP/1.1\r\nHost: notes-tester.mcpwarp.test\r\n\r\n")).catch(() => {});
-    await stray.closeWrite().catch(() => {});
-    expect(await stray.closed).toMatchObject({ kind: "reset", name: "CANCEL", byPeer: true });
+    await waitFor(() => edge.connections.length === 0);
+    await new Promise((r) => setTimeout(r, 200));
+    expect(edge.upgrades).toHaveLength(1);
+    expect(handle.client.currentState()).toBe("closed");
+    expect(handle.state).toBe("conflict");
+    expect(handle.url).toBe(url);
+    expect(handle.serverId).toBe("srv_notes");
+    expect(handle.registration).toBe(registration);
     expect(calls).toBe(1);
-
-    // A forced reconnect: the SDK dials and welcomes again but never re-registers.
-    edge.closeConnection({ wsCode: 1006 });
-    await waitFor(() => edge.hellos.length === 2 && edge.connections.length === 1);
-    await new Promise((r) => setTimeout(r, 50));
-    expect(handle.state).toBe("conflict");
-    expect(edge.appLog.map((b) => (b.mcpwarp as { op: string }).op)).toEqual(["register"]);
-
-    // And a drain hand-over does not either.
-    await edge.drain({ deadlineMs: 25000 });
-    await waitFor(() => edge.hellos.length === 3);
-    await new Promise((r) => setTimeout(r, 50));
-    expect(edge.appLog.map((b) => (b.mcpwarp as { op: string }).op)).toEqual(["register"]);
+    expect(conflicts).toHaveLength(1);
 
     const started = Date.now();
     await handle.close();
     expect(Date.now() - started).toBeLessThan(1000);
     expect(handle.state).toBe("closed");
+    expect(conflicts).toHaveLength(1);
     expect(edge.appLog.map((b) => (b.mcpwarp as { op: string }).op)).toEqual(["register"]);
   });
 
@@ -526,15 +522,17 @@ describe("expose({handler})", () => {
     expect("serverId" in conflicts[0]!).toBe(false);
   });
 
-  it("a replaced drain during close()'s unregister wait dials no replacement", async () => {
+  it("a replaced drain during close()'s unregister wait ends the wait at once and dials no replacement", async () => {
     const edge = await startEdge();
     const handle = await exposeOn(edge, { handler: () => new Response() });
-    // No `unregistered` reply: close() sits out its 2 s unregister budget.
+    // No `unregistered` reply: without the take-over, close() would sit out its 2 s unregister budget.
     (edge as unknown as { onUnregister: () => void }).onUnregister = () => {};
     const closing = handle.close();
     await edge.waitForApp("unregister");
+    const t0 = Date.now();
     await edge.drain({ reason: "replaced", deadlineMs: 25000 });
     await closing;
+    expect(Date.now() - t0).toBeLessThan(1000);
     await new Promise((r) => setTimeout(r, 100));
     expect(edge.upgrades).toHaveLength(1);
     expect(handle.state).toBe("closed");
@@ -550,6 +548,275 @@ describe("expose({handler})", () => {
       return new Response("done");
     };
   }
+
+  /** What the SDK wrote to one socket: stream-0 control messages in order, and the codes it closed with. */
+  interface WireLog {
+    control: Array<Record<string, unknown>>;
+    closes: Array<number | undefined>;
+  }
+
+  /** Wraps `factory` and records every socket's WireLog; `override(n)` may supply the n-th socket (0-based) instead. */
+  function wireRecorder(factory: WebSocketFactory, override?: (n: number) => WebSocketLike | undefined) {
+    const sockets: WireLog[] = [];
+    const webSocket: WebSocketFactory = (url, init) => {
+      const ws = override?.(sockets.length) ?? factory(url, init);
+      const log: WireLog = { control: [], closes: [] };
+      sockets.push(log);
+      const send = ws.send.bind(ws);
+      ws.send = (data) => {
+        const f = decodeFrame(data);
+        if (f.streamId === 0 && f.type === FrameType.DATA) log.control.push(parseControl(f.payload) as unknown as Record<string, unknown>);
+        send(data);
+      };
+      const close = ws.close.bind(ws);
+      ws.close = (code, reason) => {
+        log.closes.push(code);
+        close(code, reason);
+      };
+      return ws;
+    };
+    return { webSocket, sockets };
+  }
+
+  /** MCPWARP.md section 6.8 Take-over close: error{NO_ERROR} last, close 1000, never drain{client_requested}. */
+  function expectTakeOverClose(log: WireLog): void {
+    expect(log.control.filter((m) => m.t === "drain")).toEqual([]);
+    expect(log.control.at(-1)).toMatchObject({ t: "error", code: ErrorCode.NO_ERROR });
+    expect(log.closes).toEqual([1000]);
+  }
+
+  /** A handler that holds every request until cleanup, counting calls. */
+  function heldHandler() {
+    let calls = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    cleanups.push(() => release());
+    return {
+      calls: () => calls,
+      handler: async () => {
+        calls++;
+        await gate;
+        return new Response("late");
+      },
+    };
+  }
+
+  const ops = (edge: FakeEdge) => edge.appLog.map((b) => (b.mcpwarp as { op: string }).op);
+  const fireOpen = (ws: FakeWS) => (ws as unknown as { dispatch(type: string, ev: unknown): void }).dispatch("open", {});
+
+  it("take-over after registration (drain replaced) with a request in flight: error{NO_ERROR} + close 1000 at once, no drain{client_requested}, no unregister", async () => {
+    shortDrainJitter();
+    const edge = await startEdge();
+    const rec = wireRecorder(edge.webSocket);
+    const held = heldHandler();
+    const handle = await exposeOn(edge, { handler: held.handler, webSocket: rec.webSocket });
+    const inflight = edge.fetch(edge.publicUrl("notes")).catch((e: Error) => e);
+    await waitFor(() => held.calls() === 1);
+    const t0 = Date.now();
+    await edge.drain({ reason: "replaced", deadlineMs: 25000 });
+    await waitFor(() => rec.sockets[0]!.closes.length > 0);
+    expect(Date.now() - t0).toBeLessThan(1000);
+    expectTakeOverClose(rec.sockets[0]!);
+    expect(handle.state).toBe("conflict");
+    await inflight;
+    await new Promise((r) => setTimeout(r, 100));
+    expect(rec.sockets).toHaveLength(1);
+    expect(ops(edge)).toEqual(["register"]);
+  });
+
+  it("take-over after registration (conflict) with a request in flight: error{NO_ERROR} + close 1000 at once, no drain{client_requested}, no unregister; close() then adds nothing", async () => {
+    const edge = await startEdge();
+    const rec = wireRecorder(edge.webSocket);
+    const held = heldHandler();
+    const handle = await exposeOn(edge, { handler: held.handler, webSocket: rec.webSocket });
+    void edge.fetch(edge.publicUrl("notes")).catch(() => {});
+    await waitFor(() => held.calls() === 1);
+    const t0 = Date.now();
+    await edge.conflict("notes");
+    await waitFor(() => rec.sockets[0]!.closes.length > 0);
+    expect(Date.now() - t0).toBeLessThan(1000);
+    expect(handle.state).toBe("conflict");
+    expectTakeOverClose(rec.sockets[0]!);
+    await handle.close();
+    expectTakeOverClose(rec.sockets[0]!);
+    expect(rec.sockets).toHaveLength(1);
+    expect(ops(edge)).toEqual(["register"]);
+  });
+
+  it("an OPEN queued behind a conflict in the same delivery batch is RESET CANCEL and never reaches the handler", async () => {
+    const edge = await startEdge();
+    const inject: Array<(ev: { data: ArrayBuffer }) => void> = [];
+    const webSocket: WebSocketFactory = (url, init) => {
+      const ws = edge.webSocket(url, init);
+      const add = ws.addEventListener.bind(ws);
+      ws.addEventListener = ((type: Parameters<typeof add>[0], fn: (ev: any) => void) => {
+        if (type === "message") inject.push(fn);
+        add(type, fn);
+      }) as typeof ws.addEventListener;
+      return ws;
+    };
+    let calls = 0;
+    const handle = await exposeOn(edge, {
+      handler: () => {
+        calls++;
+        return new Response();
+      },
+      webSocket,
+    });
+    const resets: Array<[number, unknown[]]> = [];
+    handle.client.on("stream", (s) => {
+      const reset = s.reset.bind(s);
+      s.reset = (...a: Parameters<typeof reset>) => {
+        resets.push([s.id, a]);
+        reset(...a);
+      };
+    });
+    const deliver = (frame: Uint8Array) => inject[0]!({ data: frame.slice().buffer });
+    const conflict = encodeControl({ t: "app", body: { mcpwarp: { v: 1, op: "conflict", id: "srv_notes", name: "notes", reason: "taken_over" } } } as ControlMessage);
+    // The first OPEN is delivered at once and leaves the delivery loop awaiting, so the next two queue behind it.
+    deliver(encodeOpen(101));
+    deliver(encodeData(0, conflict));
+    deliver(encodeOpen(103));
+    await waitFor(() => handle.client.currentState() === "closed");
+    await new Promise((r) => setTimeout(r, 50));
+    expect(handle.state).toBe("conflict");
+    expect(resets).toContainEqual([103, ["CANCEL", "service taken over by another connection"]]);
+    expect(calls).toBe(0);
+  });
+
+  it("a conflict during close()'s unregister wait switches to the take-over close: error{NO_ERROR} + close 1000 at once, no drain{client_requested}", async () => {
+    const edge = await startEdge();
+    const rec = wireRecorder(edge.webSocket);
+    const held = heldHandler();
+    const handle = await exposeOn(edge, { handler: held.handler, webSocket: rec.webSocket });
+    const conflicts: unknown[] = [];
+    handle.on("conflict", (e) => conflicts.push(e));
+    void edge.fetch(edge.publicUrl("notes")).catch(() => {});
+    await waitFor(() => held.calls() === 1);
+    (edge as unknown as { onUnregister: () => void }).onUnregister = () => {};
+    const closing = handle.close();
+    await edge.waitForApp("unregister");
+    const t0 = Date.now();
+    await edge.conflict("notes");
+    await closing;
+    expect(Date.now() - t0).toBeLessThan(1000);
+    expectTakeOverClose(rec.sockets[0]!);
+    expect(handle.state).toBe("closed");
+    expect(conflicts).toEqual([]);
+    await new Promise((r) => setTimeout(r, 100));
+    expect(rec.sockets).toHaveLength(1);
+    expect(ops(edge)).toEqual(["register", "unregister"]);
+  });
+
+  it("take-over before registration (conflict, drain replaced) with a request in flight: TAKEN_OVER, error{NO_ERROR} + close 1000 at once, no drain{client_requested}, no unregister", async () => {
+    shortDrainJitter();
+    for (const trigger of ["conflict", "replaced"] as const) {
+      const edge = await startEdge();
+      edge.withholdRegistered("notes");
+      const rec = wireRecorder(edge.webSocket);
+      const held = heldHandler();
+      const outcome = expose({ url: edge.url, webSocket: rec.webSocket, token: "t", name: "notes", integration: INTEGRATION, handler: held.handler, reconnect: { base: 5, cap: 10 } }).catch(
+        (e: unknown) => e,
+      );
+      await edge.waitForApp("register");
+      const stream = (edge.connections[0] as EdgeConnection).openStream();
+      await stream.write(latin1Encode("GET /mcp HTTP/1.1\r\nHost: notes-tester.mcpwarp.test\r\n\r\n"));
+      await stream.closeWrite();
+      await waitFor(() => held.calls() === 1);
+      const t0 = Date.now();
+      if (trigger === "conflict") await edge.conflict("notes");
+      else await edge.drain({ reason: "replaced", deadlineMs: 25000 });
+      expect(await outcome).toMatchObject({ code: "TAKEN_OVER", fatal: true });
+      await waitFor(() => rec.sockets[0]!.closes.length > 0);
+      expect(Date.now() - t0).toBeLessThan(1000);
+      expectTakeOverClose(rec.sockets[0]!);
+      await new Promise((r) => setTimeout(r, 100));
+      expect(rec.sockets).toHaveLength(1);
+      expect(ops(edge)).toEqual(["register"]);
+    }
+  });
+
+  it("drain replaced with a zero drain jitter: the replacement dial never reaches the factory", async () => {
+    const random = vi.spyOn(Math, "random").mockReturnValue(0);
+    cleanups.push(() => random.mockRestore());
+    const edge = await startEdge();
+    const rec = wireRecorder(edge.webSocket);
+    const retries: string[] = [];
+    const handle = await exposeOn(edge, { handler: () => new Response(), webSocket: rec.webSocket, onRetry: (i) => retries.push(i.reason) });
+    await edge.drain({ reason: "replaced", deadlineMs: 25000 });
+    await waitFor(() => rec.sockets[0]!.closes.length > 0);
+    await new Promise((r) => setTimeout(r, 100));
+    expect(rec.sockets).toHaveLength(1);
+    expect(retries).toEqual([]);
+    expect(handle.state).toBe("conflict");
+  });
+
+  /**
+   * Forces MCPWARP.md section 3.3's window: a hand-over drain starts a replacement, whose socket opens and
+   * sends hello; the drained connection then gets drain{replaced} before the replacement's welcome.
+   */
+  async function handOverThenReplaced(openReplacementFirst: boolean) {
+    const random = vi.spyOn(Math, "random").mockReturnValue(0);
+    cleanups.push(() => random.mockRestore());
+    const edge = await startEdge();
+    const replacement = new FakeWS();
+    const rec = wireRecorder(edge.webSocket, (n) => (n === 1 ? replacement : undefined));
+    const retries: string[] = [];
+    const held = heldHandler();
+    const handle = await exposeOn(edge, { handler: held.handler, webSocket: rec.webSocket, onRetry: (i) => retries.push(i.reason) });
+    let welcomes = 0;
+    handle.client.on("welcome", () => welcomes++);
+    void edge.fetch(edge.publicUrl("notes")).catch(() => {});
+    await waitFor(() => held.calls() === 1);
+    const old = edge.connections[0] as EdgeConnection;
+    await edge.drain({ deadlineMs: 25000 });
+    await waitFor(() => rec.sockets.length === 2);
+    expect(retries).toEqual(["drain"]);
+    if (openReplacementFirst) {
+      fireOpen(replacement);
+      await waitFor(() => rec.sockets[1]!.control.some((m) => m.t === "hello"));
+    }
+    old.sendControl({ t: "drain", reason: "replaced", last_stream_id: 1, deadline_ms: 25000 });
+    await waitFor(() => handle.state === "conflict" && rec.sockets[0]!.closes.length > 0);
+    return { edge, replacement, rec, retries, handle, welcomes: () => welcomes };
+  }
+
+  it("drain replaced after a hand-over replacement sent hello, before its welcome: the replacement gets error{NO_ERROR} + close 1000, is never connected and never registers; no onRetry for it", async () => {
+    const { edge, replacement, rec, retries, handle, welcomes } = await handOverThenReplaced(true);
+    expectTakeOverClose(rec.sockets[0]!);
+    expectTakeOverClose(rec.sockets[1]!);
+    expect(rec.sockets[1]!.control.map((m) => m.t)).toEqual(["hello", "error"]);
+    // A welcome landing after the close is never handled.
+    replacement.receive(
+      encodeData(
+        0,
+        encodeControl({ t: "welcome", v: 1, session: "late", window: 262144, max_streams: 64, ping_interval: 30000, ping_timeout: 90000, server: { name: "fake-edge" } } as ControlMessage),
+      ),
+    );
+    await new Promise((r) => setTimeout(r, 100));
+    expect(welcomes()).toBe(0);
+    expect(handle.client.currentState()).toBe("closed");
+    expect(handle.state).toBe("conflict");
+    expect(rec.sockets[1]!.control.map((m) => m.t)).toEqual(["hello", "error"]);
+    expect(rec.sockets).toHaveLength(2);
+    expect(retries).toEqual(["drain"]);
+    expect(ops(edge)).toEqual(["register"]);
+  });
+
+  it("drain replaced while a hand-over replacement is still upgrading: the dial is abandoned, closed 1000 on open without a hello; no onRetry for it", async () => {
+    const { edge, replacement, rec, retries, handle, welcomes } = await handOverThenReplaced(false);
+    expectTakeOverClose(rec.sockets[0]!);
+    fireOpen(replacement);
+    await waitFor(() => replacement.closedWith !== null);
+    expect(replacement.closedWith!.code).toBe(1000);
+    expect(rec.sockets[1]!.control).toEqual([]);
+    await new Promise((r) => setTimeout(r, 100));
+    expect(welcomes()).toBe(0);
+    expect(handle.state).toBe("conflict");
+    expect(rec.sockets).toHaveLength(2);
+    expect(retries).toEqual(["drain"]);
+    expect(ops(edge)).toEqual(["register"]);
+  });
 
   it("after a drain hand-over, app messages from the drained connection are ignored", async () => {
     const edge = await startEdge();
@@ -945,6 +1212,19 @@ describe("expose({target})", () => {
     expect(seen[1]!.url).toBe("/mcp?token=abc&gz=1");
   });
 
+  it("the request's raw query is appended to the target's verbatim; no request query leaves the target's untouched", async () => {
+    const edge = await startEdge();
+    const seen: string[] = [];
+    const host = await localServer((req, res) => {
+      seen.push(req.url!);
+      res.end("ok");
+    });
+    await exposeOn(edge, { target: `http://${host}/mcp?x=1` });
+    const get = (target: string) => rawRequest(edge, `GET ${target} HTTP/1.1\r\nHost: notes-tester.mcpwarp.test\r\n\r\n`);
+    for (const t of ["/mcp?y=2", "/mcp", "/mcp?", "/mcp?a[]=1&c=%41"]) expect((await get(t)).status).toBe(200);
+    expect(seen).toEqual(["/mcp?x=1&y=2", "/mcp?x=1", "/mcp?x=1", "/mcp?x=1&a[]=1&c=%41"]);
+  });
+
   it("a target that dies mid-body: the stream is RESET and the error reported", async () => {
     const edge = await startEdge();
     const host = await localServer((_req, res) => {
@@ -1061,7 +1341,7 @@ describe("expose(): path allowlist", () => {
         opts: {
           handler: (req) => {
             const u = new URL(req.url);
-            seen.push(u.pathname + u.search);
+            seen.push(u.pathname + u.search + u.hash);
             return new Response("served");
           },
         },
@@ -1116,6 +1396,45 @@ describe("expose(): path allowlist", () => {
         await waitFor(() => handle.client.currentConn()!.liveStreamCount() === 0);
       });
 
+      it("raw UTF-8 in the request-target reaches the app percent-encoded once; an escape is kept; raw bytes in the path still 404", async () => {
+        const edge = await startEdge();
+        const app = await counting(kind);
+        await exposeOn(edge, app.opts);
+        const host = "notes-tester.mcpwarp.test";
+        const raw = (s: string) => String.fromCharCode(...new TextEncoder().encode(s));
+        const get = (target: string) => rawRequest(edge, `GET ${target} HTTP/1.1\r\nHost: ${host}\r\n\r\n`);
+        expect((await get(`/mcp?q=${raw("café")}`)).status).toBe(200);
+        expect((await get("/mcp?q=caf%C3%A9")).status).toBe(200);
+        expect(app.seen).toEqual(["/mcp?q=caf%C3%A9", "/mcp?q=caf%C3%A9"]);
+        for (const p of [`/${raw("mcpé")}`, `/mcp${raw("é")}`, "/m\tcp", "/mcp\x7f"]) expect((await get(p)).status).toBe(404);
+        expect(app.calls()).toBe(2);
+      });
+
+      it("the fragment is dropped before the /mcp check and forwarding; [ ] and escapes in the query pass verbatim", async () => {
+        const edge = await startEdge();
+        const app = await counting(kind);
+        await exposeOn(edge, app.opts);
+        const host = "notes-tester.mcpwarp.test";
+        const get = (target: string) => rawRequest(edge, `GET ${target} HTTP/1.1\r\nHost: ${host}\r\n\r\n`);
+        for (const t of ["/mcp#f", "/mcp?x=1#f", `https://${host}/mcp#f`, "/mcp?a[]=1&c=%41", "/mcp??a=1", "/mcp??"]) expect((await get(t)).status).toBe(200);
+        expect(app.seen).toEqual(["/mcp", "/mcp?x=1", "/mcp", "/mcp?a[]=1&c=%41", "/mcp??a=1", "/mcp??"]);
+      });
+
+      it("a request the web Request/Headers API rejects (NUL in a header value, a forbidden method) gets 400 without reaching the app", async () => {
+        const edge = await startEdge();
+        const app = await counting(kind);
+        const errors: unknown[] = [];
+        const handle = await exposeOn(edge, app.opts);
+        handle.on("error", (e) => errors.push(e));
+        const host = "notes-tester.mcpwarp.test";
+        const expected = { status: 400, body: '{"error":"request cannot be represented as a web Request"}' };
+        expect(await rawRequest(edge, `GET /mcp HTTP/1.1\r\nHost: ${host}\r\nX-Bad: a\x00b\r\n\r\n`)).toEqual(expected);
+        expect(await rawRequest(edge, `TRACE /mcp HTTP/1.1\r\nHost: ${host}\r\n\r\n`)).toEqual(expected);
+        expect(app.calls()).toBe(0);
+        expect(errors).toEqual([]);
+        expect((await rawRequest(edge, `GET /mcp HTTP/1.1\r\nHost: ${host}\r\n\r\n`)).status).toBe(200);
+      });
+
       it("HEAD to an unknown path: the GET Content-Length, no body", async () => {
         const edge = await startEdge();
         const app = await counting(kind);
@@ -1132,6 +1451,21 @@ describe("expose(): path allowlist", () => {
       });
     });
   }
+
+  it("handler: request.url carries raw UTF-8 from the request-target percent-encoded once", async () => {
+    const edge = await startEdge();
+    const urls: string[] = [];
+    await exposeOn(edge, {
+      handler: (req) => {
+        urls.push(req.url);
+        return new Response("ok");
+      },
+    });
+    const host = "notes-tester.mcpwarp.test";
+    const target = `/mcp?q=caf${String.fromCharCode(0xc3, 0xa9)}`;
+    expect((await rawRequest(edge, `GET ${target} HTTP/1.1\r\nHost: ${host}\r\n\r\n`)).status).toBe(200);
+    expect(urls).toEqual([`https://${host}/mcp?q=caf%C3%A9`]);
+  });
 
   it("an absolute-form request target is matched on its path component", async () => {
     const edge = await startEdge();

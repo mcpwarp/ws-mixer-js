@@ -37,6 +37,9 @@ type Responder = (
 
 export const DEFAULT_TARGET_TIMEOUT_MS = 30_000;
 
+/** Methods the Fetch standard refuses to send (the `Request` constructor throws). */
+const FORBIDDEN_METHODS = new Set(["CONNECT", "TRACE", "TRACK"]);
+
 function newAbortController(): AbortController | undefined {
   const AC = (globalThis as Record<string, any>).AbortController as typeof AbortController | undefined;
   return typeof AC === "function" ? new AC() : undefined;
@@ -145,25 +148,35 @@ export function serveWithHandler(handler: FetchHandler, ctx: ServeContext): Stre
 
 /**
  * Each request is forwarded with `fetch` to a local HTTP server (mirrors the
- * Go CLI's forwarder): `/mcp` maps onto the target URL (queries merged; no
+ * Go CLI's forwarder): `/mcp` maps onto the target URL (the request's raw query
+ * appended to the target's after "&", never decoded or re-encoded; no
  * other path gets this far); Host becomes the target's,
  * `x-forwarded-host`/`x-forwarded-proto` carry the public ones;
  * `accept-encoding: identity`. 504 after `timeoutMs` (default 30 s)
- * without response headers, 502 when the target is unreachable.
+ * without response headers, 502 when the target is unreachable, 400 when
+ * the request cannot be built (as for `handler`).
  */
 export function serveWithTarget(target: string | URL, ctx: ServeContext, timeoutMs = DEFAULT_TARGET_TIMEOUT_MS): StreamServer {
   const t = new URL(String(target));
   return (stream) =>
     serveHttp(stream, ctx, async (req, edgeSignal) => {
       const url = new URL(t.href);
-      new URL(req.target, "http://placeholder").searchParams.forEach((v, k) => url.searchParams.append(k, v));
       const headers = new Headers();
-      for (const [name, value] of forwardableHeaders(req.headers)) {
-        if (name.toLowerCase() !== "host") headers.append(name, value);
+      try {
+        const q = req.target.indexOf("?");
+        const query = q < 0 ? "" : req.target.slice(q + 1);
+        if (query) url.search = "?" + (url.search ? url.search.slice(1) + "&" : "") + query;
+        for (const [name, value] of forwardableHeaders(req.headers)) {
+          if (name.toLowerCase() !== "host") headers.append(name, value);
+        }
+        headers.set("accept-encoding", "identity");
+        headers.set("x-forwarded-host", req.host);
+        headers.set("x-forwarded-proto", "https");
+        // fetch() would reject these with a TypeError indistinguishable from a network failure.
+        if (FORBIDDEN_METHODS.has(req.method.toUpperCase())) throw new TypeError(`forbidden method ${req.method}`);
+      } catch {
+        return { error: 400, message: "request cannot be represented as a web Request" };
       }
-      headers.set("accept-encoding", "identity");
-      headers.set("x-forwarded-host", req.host);
-      headers.set("x-forwarded-proto", "https");
 
       const ac = newAbortController();
       let timedOut = false;

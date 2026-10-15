@@ -2,6 +2,56 @@
 
 All notable changes to `@mcpwarp/ws-mixer` (the JS/TypeScript client SDK) are documented here.
 
+## 0.11.1 - 2026-10-14
+
+Aligned with ws-mixer-spec v0.6.2 (`spec.pin`): MCPWARP.md §11 rows 18–19 (take-over close, envelope
+defect order), conditional T32/T33 upgrade-401 (`httpStatus` on `dial_failed`), R7 replacement dial.
+
+### Fixed
+
+- `handler`/`target`: raw non-ASCII bytes in the request-target were UTF-8-encoded twice
+  (`?q=café` reached the app as `caf%C3%83%C2%A9`). Bytes outside RFC 3986's unreserved, sub-delims,
+  `:` `@` `/` `?` `[` `]` set, plus `%`, are now percent-encoded exactly once (`caf%C3%A9`); existing
+  `%XX` escapes are passed as is, never decoded. ASCII characters outside that set are encoded as
+  well, so `request.url` now carries `{` `}` `|` `^` `\` `"` `` ` `` as `%7B`, `%7D`, ... (PHP-style
+  `?a[]=1` is passed unchanged). The `/mcp` check sees the same target, so a path with raw bytes is
+  still `404`.
+- `handler`/`target`: the fragment (the first `#` and everything after it) is dropped from the
+  request-target in origin-form too, not only absolute-form, before the `/mcp` check: `/mcp#f` is
+  served, `/mcp?x=1#f` arrives as `/mcp?x=1`.
+- `target`: the request's query was decoded and re-serialised through `URLSearchParams`
+  (`?a[]=1&c=%41` reached the local server as `?a%5B%5D=1&c=A`). It is now appended to the target
+  URL's own query after `&` verbatim, never decoded or re-encoded (except `'`, which the WHATWG URL
+  parser sends as `%27` in target mode and in handler-mode `request.url`; `ParsedRequest.target`
+  keeps it).
+- `target`: a request the web `Request`/`Headers` API rejects (a NUL in a header value, a forbidden
+  method such as `TRACE`) is answered `400` `{"error":"request cannot be represented as a web Request"}`,
+  as under `handler`, instead of `500 internal error` or `502 local server unreachable`.
+- A `drain{replaced}` while a hand-over's replacement has already sent `hello` closes that
+  replacement with `error{NO_ERROR}` + `1000` before any `welcome` handling: it is never reported
+  connected, never registers and gets no `onRetry`. A replacement dial still before its upgrade is
+  abandoned (with a zero drain jitter it no longer reaches the WebSocket factory).
+- A connection no longer handles inbound frames after it has closed (a late `welcome` on a
+  closing socket used to be applied and emitted).
+
+### Changed
+
+- Take-over close (§11 row 18): on a `conflict` or a `drain` with reason `replaced`, before or after
+  registration, the connection is closed at once with `error{NO_ERROR}` + close `1000`: no
+  `drain{client_requested}`, no grace wait for open streams, no `unregister`. This includes the
+  tunnel's close after `conflict`, `handle.close()` in state `conflict`, and a `conflict` or
+  `drain{replaced}` that arrives while `close()` waits for `unregistered` (that wait now ends at
+  once instead of running out its 2 s budget). A plain `close()` is unchanged.
+- `expose()`: a `conflict` op after registration now closes the connection at once (`error{NO_ERROR}`
+  + close `1000`, in-flight requests cut, nothing reconnects), as a `drain` with reason `replaced`
+  already did (MCPWARP.md §3.3 Sticky). The handle stays in state `conflict`, emits `conflict`, keeps
+  `url`/`serverId`/`registration` readable and never registers again; `close()` still works. Before,
+  the connection stayed up and kept reconnecting until the app called `close()`. `createTunnel()` is
+  unaffected (it already closed on `conflict`).
+- `registered.services[]` entries are checked in the order `name`, `id`, `url`, `created` (§11
+  row 19, §2.8 rule 10): an entry with several defects reports the first of these (it used to report
+  `created` first).
+
 ## 0.11.0 - 2026-10-14
 
 Aligned with ws-mixer-spec v0.6.1 (`spec.pin`).

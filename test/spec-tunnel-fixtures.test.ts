@@ -37,6 +37,7 @@ class EdgeSocket implements WebSocketLike {
   /** The service name this connection registered. */
   name: string | undefined;
   held = false;
+  upgradeFailure?: { status: number };
   private readonly listeners = new Map<string, Set<(ev: any) => void>>();
 
   addEventListener(type: string, listener: (ev: any) => void): void {
@@ -78,7 +79,9 @@ class EdgeSocket implements WebSocketLike {
     this.dispatch("open", {});
   }
 
-  failDial(): void {
+  /** `httpStatus`: a refused upgrade whose status the factory reports (MCPWARP.md section 1 Upgrade-status mapping). */
+  failDial(httpStatus?: number): void {
+    if (httpStatus !== undefined) this.upgradeFailure = { status: httpStatus };
     this.readyState = 3;
     this.dispatch("error", { message: "connection refused" });
     this.dispatch("close", { code: 1006, reason: "" });
@@ -176,7 +179,7 @@ async function run(fx: TunnelFixture): Promise<{ snapshots: TunnelStatus[]; dial
         sock(payload).open();
         break;
       case "dial_failed":
-        sock(payload).failDial();
+        sock(payload).failDial(payload.httpStatus);
         break;
       case "welcome":
         sock(payload).control({

@@ -91,6 +91,33 @@ describe("readRequest", () => {
     expect(p.target).toBe("/p/q?z=2");
   });
 
+  it("raw bytes in the target are percent-encoded exactly once; escapes are kept, never decoded", async () => {
+    const raw = (s: string) => String.fromCharCode(...enc(s));
+    const target = async (t: string) => (await parse(`GET ${t} HTTP/1.1\r\nHost: h\r\n\r\n`)).target;
+    expect(await target(`/mcp?q=${raw("café")}`)).toBe("/mcp?q=caf%C3%A9");
+    expect(await target("/mcp?q=caf%C3%A9")).toBe("/mcp?q=caf%C3%A9");
+    expect(await target("/mcp?q=%e9%zz%")).toBe("/mcp?q=%e9%zz%");
+    expect(await target(`/${raw("é")}\t\x7f"<>\\^\`{|}`)).toBe("/%C3%A9%09%7F%22%3C%3E%5C%5E%60%7B%7C%7D");
+    expect(await target("/a-z_A.Z~0!$&'()*+,;=:@/?x=/?#f")).toBe("/a-z_A.Z~0!$&'()*+,;=:@/?x=/?");
+    expect(await target(`https://other.example/${raw("ü")}?${raw("ß")}`)).toBe("/%C3%BC?%C3%9F");
+    expect(await target("/mcp?a[]=1")).toBe("/mcp?a[]=1");
+  });
+
+  it("the fragment is dropped with everything after it, in origin-form and absolute-form", async () => {
+    const target = async (t: string) => (await parse(`GET ${t} HTTP/1.1\r\nHost: h\r\n\r\n`)).target;
+    expect(await target("/mcp#f")).toBe("/mcp");
+    expect(await target("/mcp?x=1#f?y=2#g")).toBe("/mcp?x=1");
+    expect(await target("https://other.example/mcp#f")).toBe("/mcp");
+    expect(await target("https://other.example/mcp?x=1#f")).toBe("/mcp?x=1");
+    expect(toWebRequest(await parse("GET /mcp?x=1#f HTTP/1.1\r\nHost: h\r\n\r\n")).url).toBe("https://h/mcp?x=1");
+  });
+
+  it("allowed set, one byte per class: kept; anything else -> %XX; the fragment is dropped", async () => {
+    const p = await parse(`GET https://other.example/~!:@[]%41%?/\x01${String.fromCharCode(0xc3, 0xa9)}#frag HTTP/1.1\r\nHost: h\r\n\r\n`);
+    expect(p.target).toBe("/~!:@[]%41%?/%01%C3%A9");
+    expect(toWebRequest(p).url).toBe("https://h/~!:@[]%41%?/%01%C3%A9");
+  });
+
   it("strips Expect and records 100-continue", async () => {
     const p = await parse("POST / HTTP/1.1\r\nHost: h\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\nhi");
     expect(p.expectContinue).toBe(true);
@@ -174,6 +201,15 @@ describe("toWebRequest", () => {
     for (const h of ["connection", "keep-alive", "x-hop", "te", "content-length", "expect"]) expect(req.headers.has(h)).toBe(false);
     expect(req.headers.get("accept")).toBe("text/event-stream");
     expect(await req.text()).toBe("hi");
+  });
+
+  it("raw UTF-8 in the target reaches the URL encoded once", async () => {
+    const req = toWebRequest(await parse(`GET /mcp?q=caf${String.fromCharCode(0xc3, 0xa9)} HTTP/1.1\r\nHost: h\r\n\r\n`));
+    expect(req.url).toBe("https://h/mcp?q=caf%C3%A9");
+  });
+
+  it("[ ] in the query reach the URL unchanged", async () => {
+    expect(toWebRequest(await parse("GET /mcp?a[]=1 HTTP/1.1\r\nHost: h\r\n\r\n")).url).toBe("https://h/mcp?a[]=1");
   });
 
   it("GET drops a body", async () => {

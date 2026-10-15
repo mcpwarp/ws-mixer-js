@@ -4244,3 +4244,47 @@ describe("MixerClient 0x0e APPLICATION_CLOSE", () => {
     }
   });
 });
+
+describe("MixerClient close() while the token provider is pending", () => {
+  const outcomes = {
+    resolves: (gate: { resolve(v: string): void; reject(e: unknown): void }) => gate.resolve("late-token"),
+    "throws TokenUnavailableError": (gate: { resolve(v: string): void; reject(e: unknown): void }) => gate.reject(new TokenUnavailableError("still down")),
+    "throws a fatal error": (gate: { resolve(v: string): void; reject(e: unknown): void }) => gate.reject(new Error("provider broke")),
+  };
+  for (const how of ["close", "closeNow"] as const) {
+    for (const [name, settle] of Object.entries(outcomes)) {
+      it(`${how}() before the provider ${name}: no dial, no fatal/reconnecting/close/error event or onDisconnect, start() rejects`, async () => {
+        let gate!: { resolve(v: string): void; reject(e: unknown): void };
+        const pending = new Promise<string>((resolve, reject) => (gate = { resolve, reject }));
+        let dials = 0;
+        const events: string[] = [];
+        const client = new MixerClient("wss://x/tunnel", {
+          token: () => pending,
+          webSocket: () => {
+            dials++;
+            throw new Error("must not dial");
+          },
+          onDisconnect: () => events.push("onDisconnect"),
+        });
+        client.on("fatal", () => events.push("fatal"));
+        client.on("reconnecting", () => events.push("reconnecting"));
+        client.on("close", () => events.push("close"));
+        client.on("error", () => events.push("error"));
+        const started = client.start().then(
+          () => null,
+          (e: Error) => e,
+        );
+        await new Promise((r) => setTimeout(r, 0));
+        await (how === "close" ? client.close() : client.closeNow());
+        settle(gate);
+        const err = await started;
+        await new Promise((r) => setTimeout(r, 20));
+        expect(err).toBeInstanceOf(Error);
+        expect(err!.message).toMatch(/closed before/);
+        expect(dials).toBe(0);
+        expect(events).toEqual([]);
+        expect(client.currentState()).toBe("closed");
+      });
+    }
+  }
+});

@@ -137,10 +137,10 @@ export interface ExposeHandle {
    * Another connection of the same account registered this name and the
    * tunnel moved the service there (it can arrive up to ~30 s later when the
    * other connection is on another tunnel pod), or the tunnel drained this
-   * connection with reason "replaced" (reason "replaced"; the client is then
-   * closed, no replacement is dialed). State becomes "conflict" for
-   * good: the SDK stops serving (stray streams are RESET with CANCEL) and
-   * never registers again, also across reconnects. Restarting the loser is
+   * connection with reason "replaced" (reason "replaced"). Either way the
+   * connection is closed at once (error{NO_ERROR}, close 1000, in-flight
+   * requests cut) and nothing reconnects or registers again. State becomes
+   * "conflict" for good; the handle stays readable. Restarting the loser is
    * up to a human (or the app); `close()` still works.
    */
   on(event: "conflict", listener: (e: ExposeConflict) => void): this;
@@ -152,7 +152,11 @@ export interface ExposeHandle {
   on(event: "close", listener: (e: { error?: Error }) => void): this;
   once(event: string, listener: (...args: any[]) => void): this;
   off(event: string, listener: (...args: any[]) => void): this;
-  /** unregister (2 s budget), then client.close() (drain{client_requested}, 5 s grace, close 1000). Idempotent. */
+  /**
+   * unregister (2 s budget), then client.close() (drain{client_requested}, 5 s grace, close 1000). Idempotent.
+   * In state "conflict" there is nothing to unregister and the connection closes at once (error{NO_ERROR}, close 1000);
+   * so does a `conflict` or drain{replaced} that arrives during the unregister wait.
+   */
   close(): Promise<void>;
 }
 
@@ -370,9 +374,10 @@ export function exposeWithServer(
     }
   };
 
-  // Closes the client outside handle.close() (abort, early conflict, fatal); onClientClose lets the caller await it.
-  const closeClient = (): void => {
-    const closed = client.close().catch(() => {});
+  // Closes the client outside handle.close() (abort, take-over, fatal); onClientClose lets the caller await it.
+  // A take-over skips the drain and the grace (MCPWARP.md section 6.8 Take-over close).
+  const closeClient = (takeOver = false): void => {
+    const closed = (takeOver ? client.closeNow() : client.close()).catch(() => {});
     hooks?.onClientClose?.(closed);
   };
 
@@ -413,9 +418,10 @@ export function exposeWithServer(
         return;
       }
       // Taken over before `registered` arrived: the handle could never serve, so fail like any other first-registration fatal.
+      // Settled first: the take-over close ends the connection synchronously, and its disconnect must not read as a lost connection.
       if (event === "conflict" && !settled) {
-        closeClient();
         finish(new McpwarpError("TAKEN_OVER", `mcpwarp: service ${JSON.stringify(opts.name)} was taken over by another connection before it registered`, { fatal: true, serviceName: opts.name }));
+        closeClient(true);
         return;
       }
       if (event === "error") {
@@ -426,6 +432,8 @@ export function exposeWithServer(
         else if (event === "enabled" || event === "conflict") observe({ event });
         emitSafely(event, payload);
       }
+      // A take-over after settling (a `conflict` op or a drain{replaced}): the handle stays, the connection goes now.
+      if (event === "conflict" && !finished) closeClient(true);
       if (!settled && (event === "registered" || event === "disabled")) {
         settled = true;
         resolveStart(handle);
@@ -493,7 +501,8 @@ export function exposeWithServer(
   handle = new Handle(client, session);
   handle.closeImpl = async () => {
     await session.beginClose();
-    await client.close().catch(() => {});
+    // Read after the wait: a `conflict` op or drain{replaced} during the unregister wait also sets it.
+    await (session.takenOver ? client.closeNow() : client.close()).catch(() => {});
     finish();
   };
   client.on("drain", (d: { reason: string }) => {
@@ -503,14 +512,14 @@ export function exposeWithServer(
       if (retry) onRetry(retry, "drain");
       return;
     }
-    // A take-over, not a hand-over: closing the client cancels the replacement dial before it starts.
-    // Before settling, the TAKEN_OVER path closes it; a close() started by a conflict listener closes it
-    // too. One already running is still in its unregister wait, so the client is closed here.
+    // A take-over, not a hand-over: the client is closed in this same tick, which cancels the replacement
+    // dial (still in its jitter wait or token resolution) and fails a replacement from an earlier hand-over
+    // that is still waiting for its welcome. A take-over closes it from the `conflict` emit; a close()
+    // already running only gets there after its unregister wait, so it is closed here.
     const closingAlready = handle.closePromise !== null;
-    const wasSettled = settled;
-    const tookOver = session.onReplaced();
+    session.onReplaced();
     if (finished) return;
-    if (closingAlready || (tookOver && wasSettled && !handle.closePromise)) closeClient();
+    if (closingAlready) closeClient(true);
   });
   client.on("fatal", (err: Error) => finish(fatalMcpwarpError(err, opts.name)));
   signal?.addEventListener("abort", onAbort, { once: true });

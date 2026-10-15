@@ -390,6 +390,8 @@ export class MixerConn extends Emitter {
   // --- read dispatch (never blocks on application code) ------------------------
 
   private onMessage(data: unknown): void {
+    // After teardown nothing inbound is handled: a socket can still deliver while closing (e.g. a late welcome).
+    if (this.closed) return;
     try {
       if (isArrayBufferAnyRealm(data)) {
         this.counters.bytesIn += data.byteLength;

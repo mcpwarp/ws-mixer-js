@@ -14,6 +14,8 @@ import {
 import { FakeEdge } from "../src/testing/index.js";
 import { ErrorCode } from "../src/errors.js";
 import type { WebSocketFactory, WebSocketLike } from "../src/socket.js";
+import { FrameType, decodeFrame } from "../src/frame.js";
+import { parseControl } from "../src/control.js";
 
 // Real expose by default; a test can put a fake behind exposeWithServer.
 type ExposeHooks = Parameters<typeof import("../src/mcpwarp/expose.js").exposeWithServer>[2];
@@ -332,6 +334,51 @@ describe("createTunnel", () => {
     expect(history.map((s) => s.state)).toEqual(["off", "connecting", "online", "conflict", "connecting", "online"]);
   });
 
+  it("conflict after registration closes the connection at once: error{NO_ERROR} + close 1000, no drain{client_requested}, no unregister (MCPWARP.md section 6.8)", async () => {
+    const edge = await startEdge();
+    const sent: Array<Record<string, unknown>> = [];
+    const closes: Array<number | undefined> = [];
+    const recording: WebSocketFactory = (url, init) => {
+      const ws = edge.webSocket(url, init);
+      const send = ws.send.bind(ws);
+      ws.send = (data) => {
+        const f = decodeFrame(data);
+        if (f.streamId === 0 && f.type === FrameType.DATA) sent.push(parseControl(f.payload) as unknown as Record<string, unknown>);
+        send(data);
+      };
+      const close = ws.close.bind(ws);
+      ws.close = (code, reason) => {
+        closes.push(code);
+        close(code, reason);
+      };
+      return ws;
+    };
+    let calls = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    cleanups.push(() => release());
+    const handler = async () => {
+      calls++;
+      await gate;
+      return new Response("late");
+    };
+    const { tunnel } = tunnelOn(edge, { webSocket: recording, handler });
+    await tunnel.configure(cfg(edge));
+    await waitFor(() => tunnel.status.state === "online");
+    void edge.fetch(edge.publicUrl("notes")).catch(() => {});
+    await waitFor(() => calls === 1);
+    const t0 = Date.now();
+    await edge.conflict("notes");
+    await waitFor(() => closes.length > 0);
+    expect(Date.now() - t0).toBeLessThan(1000);
+    expect(sent.filter((m) => m.t === "drain")).toEqual([]);
+    expect(sent.at(-1)).toMatchObject({ t: "error", code: ErrorCode.NO_ERROR });
+    expect(closes).toEqual([1000]);
+    expect(tunnel.status.state).toBe("conflict");
+    await sleep(100);
+    expect(edge.appLog.map((b) => (b.mcpwarp as { op: string }).op)).toEqual(["register"]);
+  });
+
   it("a conflict before the first registration (expose() rejects TAKEN_OVER) is state conflict", async () => {
     const edge = await startEdge();
     const { tunnel } = tunnelOn(edge);
@@ -589,6 +636,30 @@ describe("createTunnel", () => {
       await tunnel.stop();
     }
     expect(edge.connections).toHaveLength(0);
+  });
+
+  it("an HTTP 401 at the upgrade the factory cannot observe (no upgradeFailure) is a failed dial: connecting/RETRYING, never error, then online (T27)", async () => {
+    const edge = await startEdge();
+    const unobservable: WebSocketFactory = (url, init) =>
+      new Proxy(edge.webSocket(url, init), {
+        get(target, prop) {
+          if (prop === "upgradeFailure") return undefined;
+          const v: unknown = Reflect.get(target, prop);
+          return typeof v === "function" ? v.bind(target) : v;
+        },
+        set(target, prop, value) {
+          return Reflect.set(target, prop, value);
+        },
+      });
+    const retries: string[] = [];
+    const { tunnel, history } = tunnelOn(edge, { webSocket: unobservable, onRetry: (i) => retries.push(i.reason) });
+    edge.rejectNextUpgrade(401);
+    await tunnel.configure(cfg(edge));
+    await waitFor(() => tunnel.status.state === "online");
+    expect(history).toContainEqual({ state: "connecting", code: TunnelStatusCode.RETRYING, lastError: "Can't reach mcpwarp; retrying." });
+    expect(history.some((s) => s.state === "error")).toBe(false);
+    expect(retries).toHaveLength(1);
+    expect(edge.upgrades).toHaveLength(2);
   });
 
   it("createTunnel validates integration, agent and handler/target up front", () => {

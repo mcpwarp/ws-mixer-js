@@ -8,7 +8,7 @@ import { HttpParseError, UnexpectedEof, type StreamByteReader } from "./reader.j
 
 export interface ParsedRequest {
   method: string;
-  /** Origin-form path + query, e.g. "/mcp?x=1"; absolute-form is cut to that, not normalised. */
+  /** Origin-form path + query, e.g. "/mcp?x=1"; absolute-form is cut to that, not normalised; the fragment dropped; raw bytes percent-encoded (percentEncodeTarget). */
   target: string;
   /** In order, names as received; `Expect` already removed. */
   headers: [string, string][];
@@ -43,6 +43,23 @@ function parseTarget(raw: string): string {
     return rest.startsWith("/") ? rest : `/${rest}`;
   }
   throw bad("unsupported request target form");
+}
+
+/** RFC 3986 unreserved, sub-delims, ":" "@" (pchar), "/" "?" (query), "[" "]" and "%" (an escape is kept, never decoded). */
+const TARGET_SAFE = /[A-Za-z0-9\-._~!$&'()*+,;=:@/?[\]%]/;
+
+/**
+ * The head is decoded as latin1, so each char of `target` is one received
+ * byte. Any byte outside TARGET_SAFE (raw UTF-8, controls, ...) becomes
+ * `%XX`, exactly once, so later URL parsing never UTF-8-encodes it again.
+ */
+export function percentEncodeTarget(target: string): string {
+  let out = "";
+  for (const ch of target) {
+    if (TARGET_SAFE.test(ch)) out += ch;
+    else out += "%" + ch.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0");
+  }
+  return out;
 }
 
 /**
@@ -127,7 +144,7 @@ export async function readRequestHead(r: StreamByteReader, opts?: { onHead?: () 
   const m = /^([^ ]+) ([^ ]+) HTTP\/1\.([01])$/.exec(start);
   if (!m || !isToken(m[1]!)) throw bad("malformed request line");
   const method = m[1]!;
-  const target = parseTarget(m[2]!);
+  const target = percentEncodeTarget(parseTarget(m[2]!).split("#", 1)[0]!);
   const all = parseHeaderLines(lines);
 
   const hosts = all.filter(([n]) => n.toLowerCase() === "host");
